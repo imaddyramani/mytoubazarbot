@@ -19,8 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python dependencies first for better Docker caching
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --root-user-action=ignore --no-cache-dir -r requirements.txt
 
 # Copy the complete bot project
 COPY . /app
