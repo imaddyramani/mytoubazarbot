@@ -30,7 +30,7 @@ from flight_print import generate_flight_ticket
 from watermark_overlay import add_watermark_to_pdf
 from bus_ticket import extract_bus_ticket, generate_bus_ticket
 from editor import apply_edit
-from smart_assistant import classify as ai_classify, chat as ai_chat, enhance_package_itinerary, agent_plan
+from smart_assistant import classify as ai_classify, chat as ai_chat, enhance_package_itinerary, agent_plan, generate_package_from_brief
 from reference_manager import create_reference, save_record, load_record, list_records, update_record, import_existing_pdfs
 from footer_overlay import add_footer_to_pdf
 from footer_bar_overlay import add_contact_bar_to_pdf
@@ -1432,7 +1432,12 @@ async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception: pass
         return
 
-    await msg.reply_text('🎙️ Voice editing is ready after you tap *Modify & Regenerate* on a generated PDF, or use *Auto Creation* to include a voice note in a new Tour batch.', parse_mode='Markdown', reply_markup=main_keyboard())
+    # V168: when AI Assistant is active, a normal voice note is a free-form
+    # create/edit request. No prefix and no separate voice button is required.
+    if context.user_data.get("smart_mode"):
+        return await smart_voice(update, context)
+
+    await msg.reply_text('🎙️ Voice editing is ready after you tap *Modify & Regenerate* on a generated PDF, or press *🤖 AI Assistant / New Request* and speak naturally.', parse_mode='Markdown', reply_markup=main_keyboard())
     return
 def voucher_keyboard():
     return ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
@@ -2447,11 +2452,78 @@ async def smart_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✈️ If you do not mention a flight/train/bus, I will NOT add one.\n"
         "🏨 If you do not give a hotel name, I will NOT invent one; I can show only the requested hotel category.\n\n"
         "📥 *Drop anything here* — one or multiple supplier PDFs, screenshots or text — and I will automatically recognize Tour, Air, Bus or Hotel and create the correct MyTourBazar output.\n\n"
+        "🎙️ *Voice also works here:* after pressing AI Assistant, simply send a voice note and ask naturally — no prefix or command is required.\n\n"
         "Or use the quick Air / Hotel / Bus buttons below when you want to force a specific type.",
         parse_mode="Markdown",
         reply_markup=smart_source_keyboard(),
     )
     return SMART_INPUT
+
+
+def _smart_mtb_edit_request(text):
+    """Return (reference, instruction) for a natural MTB edit request, else ("","")."""
+    raw = str(text or "").strip()
+    ref_match = re.search(r"\bMTB\s*[-#]?\s*(\d+)\b", raw, re.I)
+    if not ref_match:
+        return "", ""
+    has_edit = bool(re.search(
+        r"\b(edit|modify|change|update|replace|remove|delete|add|revise|correct|fix)\b",
+        raw, re.I
+    ))
+    if not has_edit:
+        return "", ""
+    return f"MTB{int(ref_match.group(1)):02d}", raw
+
+
+def _looks_like_new_tour_brief(text):
+    """Deterministically catch owner-written new Tour/quotation briefs with no prefix."""
+    t = str(text or "").strip()
+    low = t.lower()
+    if not low:
+        return False
+
+    # Existing-reference edits must never become new Tours.
+    if _smart_mtb_edit_request(t)[0]:
+        return False
+
+    create_word = bool(re.search(
+        r"\b(make|create|prepare|plan|build|design|draft|quote|quotation|itinerary|package|tour|holiday|trip|voucher)\b",
+        low, re.I
+    ))
+    duration = bool(
+        re.search(r"\b\d+\s*(?:night|nights|n)\s*[/&+\- ]*\s*\d+\s*(?:day|days|d)\b", low, re.I)
+        or re.search(r"\b\d+\s*(?:days?|nights?)\b", low, re.I)
+    )
+    pax = bool(re.search(r"\b\d+\s*(?:adult|adults|pax|person|persons|couple|child|children)\b", low, re.I))
+    hotel = bool(re.search(r"\b[1-5]\s*(?:star|\*)\b|\b(?:hotel|hotels|resort|accommodation)\b", low, re.I))
+    travel_service = bool(re.search(
+        r"\b(breakfast|dinner|meal|cab|vehicle|transfer|sightseeing|pickup|drop|private|shared)\b",
+        low, re.I
+    ))
+
+    # Common no-prefix form:
+    # "Goa 4N 5D, Mr Amit, 2 adults, 3 star, breakfast, private cab..."
+    strong_structure = duration and (pax or hotel or travel_service)
+
+    return bool(create_word and (duration or pax or hotel or travel_service) or strong_structure)
+
+
+def _smart_requested_tour_mode(text):
+    low = str(text or "").lower()
+    if re.search(r"\b(?:tour\s+)?voucher\b", low):
+        return "voucher"
+    if re.search(r"\bquotation\b|\bquote\b", low):
+        return "quotation"
+    return ""
+
+
+def _smart_requested_tour_detail(text):
+    low = str(text or "").lower()
+    if re.search(r"\b(detailed|detail|full[- ]?length|elaborate)\b", low):
+        return "detailed"
+    if re.search(r"\b(basic|short|brief)\b", low):
+        return "basic"
+    return "basic"
 
 
 def _looks_like_supplier_material(text):
@@ -2511,16 +2583,33 @@ async def smart_process(update, context):
         elif parts or supplier_text:
             result = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_classify, parts, text, GEMINI_API_KEY, GEMINI_MODEL), ["🤖 AI is identifying the supplier document type...", "🔎 Reading the supplied material..."], 20, 48)
         else:
-            plan = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(agent_plan, text, text, GEMINI_API_KEY, GEMINI_MODEL), ["🧠 AI is understanding what you want...", "🧭 Selecting the correct MyTourBazar workflow..."], 10, 30)
-            action = str(plan.get("action", "ask_user"))
-            if action == "edit_document" and plan.get("reference"):
-                result = {"kind":"edit", "confidence":0.99, "reason":plan.get("reason","Existing document change requested."), "reference":plan.get("reference",""), "instruction":plan.get("instruction") or text}
-            elif action == "generate_brief":
-                result = {"kind":"package", "confidence":0.99, "reason":plan.get("reason","New tour itinerary requested."), "reference":"", "instruction":plan.get("instruction") or text}
-            elif action == "chat":
-                result = {"kind":"chat", "confidence":0.99, "reason":plan.get("reason","Normal assistant request."), "reference":"", "instruction":text}
+            # V168: deterministic no-prefix routing before Gemini planning.
+            # This prevents natural Tour briefs such as "Goa 4N/5D..." from being
+            # incorrectly redirected to Tour Guide, while MTB edits still win.
+            direct_ref, direct_instruction = _smart_mtb_edit_request(text)
+            if direct_ref:
+                result = {
+                    "kind": "edit", "confidence": 1.0,
+                    "reason": "Existing MyTourBazar reference edit detected.",
+                    "reference": direct_ref, "instruction": direct_instruction or text,
+                }
+            elif _looks_like_new_tour_brief(text):
+                result = {
+                    "kind": "package", "confidence": 1.0,
+                    "reason": "New Tour itinerary/quotation brief detected.",
+                    "reference": "", "instruction": text,
+                }
             else:
-                result = {"kind":"unknown", "confidence":0.0, "reason":plan.get("needs_user_input") or "I need more information.", "reference":"", "instruction":text}
+                plan = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(agent_plan, text, text, GEMINI_API_KEY, GEMINI_MODEL), ["🧠 AI is understanding what you want...", "🧭 Selecting the correct MyTourBazar workflow..."], 10, 30)
+                action = str(plan.get("action", "ask_user"))
+                if action == "edit_document" and plan.get("reference"):
+                    result = {"kind":"edit", "confidence":0.99, "reason":plan.get("reason","Existing document change requested."), "reference":plan.get("reference",""), "instruction":plan.get("instruction") or text}
+                elif action == "generate_brief":
+                    result = {"kind":"package", "confidence":0.99, "reason":plan.get("reason","New tour itinerary requested."), "reference":"", "instruction":plan.get("instruction") or text}
+                elif action == "chat":
+                    result = {"kind":"chat", "confidence":0.99, "reason":plan.get("reason","Normal assistant request."), "reference":"", "instruction":text}
+                else:
+                    result = {"kind":"unknown", "confidence":0.0, "reason":plan.get("needs_user_input") or "I need more information.", "reference":"", "instruction":text}
         kind = str(result.get("kind", "unknown")).lower()
         conf = float(result.get("confidence", 0) or 0)
         reason = result.get("reason", "")
@@ -2573,15 +2662,65 @@ async def smart_process(update, context):
                     "Infer outward/connection/return direction from dates and route sequence without requiring Onward/Return labels.\n\nOWNER NOTES:\n"
                     + smart_text_value
                 ).strip()
-            # V162: free-form new-package builder removed; Tour handling here is supplier-source only.
+            # V168: AI Assistant can create a brand-new Tour directly from a natural
+            # owner brief. Supplier extraction remains a separate path.
             if not auto_creation and not smart_files and smart_text_value and not _looks_like_supplier_material(smart_text_value):
+                requested_detail = _smart_requested_tour_detail(smart_text_value)
+                requested_mode = _smart_requested_tour_mode(smart_text_value)
+
                 await safe_status_edit(
                     status,
                     update.message,
-                    "🗺️ For Tour itinerary extraction, tap *🗺️ Tour Guide* and send the supplier PDF/image/text.",
+                    "🗺️ *New Tour brief understood.*\n\n████████░░░░░░░░ 55%\n\n✨ Building a professional day-wise itinerary from your instructions...",
                     parse_mode="Markdown",
                 )
-                await update.message.reply_text("Choose Tour Guide or another print option.", reply_markup=main_keyboard())
+
+                data = await _run_with_progress(
+                    status,
+                    update.message,
+                    lambda: asyncio.to_thread(
+                        generate_package_from_brief,
+                        smart_text_value,
+                        GEMINI_API_KEY,
+                        GEMINI_MODEL,
+                        requested_detail,
+                    ),
+                    [
+                        "🧭 Planning the destination flow...",
+                        "🏨 Applying your hotel category, meals and vehicle...",
+                        "🗺️ Building the requested day-wise sightseeing plan...",
+                    ],
+                    55,
+                    92,
+                )
+
+                data = _normalize_guest_counts(data or {})
+                data["detail_level"] = requested_detail
+                data["document_mode"] = requested_mode or "itinerary"
+                data["show_cost"] = bool(data.get("package_costs"))
+
+                # Convert the Smart Assistant request into the normal simplified
+                # Tour draft/output workflow. No Tour Guide prefix/button is needed.
+                context.user_data.clear()
+                context.user_data["tour_v2"] = True
+                context.user_data["tour_v2_phase"] = "choose_output"
+                context.user_data["smart_owner_brief"] = True
+                context.user_data["smart_requested_document_mode"] = requested_mode
+                context.user_data["smart_requested_detail"] = requested_detail
+                context.user_data["source_text"] = smart_text_value
+                context.user_data["itinerary"] = data
+                context.user_data["_source_status_message"] = status
+
+                if requested_mode:
+                    context.user_data["pending_tour_document_mode"] = requested_mode
+
+                await safe_status_edit(
+                    status,
+                    update.message,
+                    "✅ *Tour itinerary created from your brief.*\n\n████████████████ 100%\n\nReview the draft and choose WhatsApp or PDF below.",
+                    parse_mode="Markdown",
+                )
+                await _tour_v2_after_initial_extract(update.message, context, data)
                 return ConversationHandler.END
 
             # Supplier package material goes directly into the authoritative source
@@ -2684,6 +2823,74 @@ async def smart_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg=await _source_ack_message(update, context, '📝 Source text received.\n\nSend another source to reset the timer, or tap ⚡ Process Now.',reply_markup=smart_source_keyboard())
         _schedule_source_auto_process(update,context,'smart',lambda: smart_process(_SyntheticUpdate(_BotMessageProxy(context.bot,update.effective_chat.id),update.effective_user.id),context),prompt_message=msg)
     return SMART_INPUT
+
+
+async def smart_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """No-prefix AI Assistant voice request.
+
+    Press AI Assistant, send a voice note, and the transcript is routed through the
+    exact same free-form text planner used by smart_text/smart_process.
+    """
+    if not is_allowed(update):
+        return ConversationHandler.END
+    msg = update.message
+    if not msg or not msg.voice:
+        return SMART_INPUT
+    if not GEMINI_API_KEY:
+        await msg.reply_text("❌ GEMINI_API_KEY is not configured.", reply_markup=main_keyboard())
+        return ConversationHandler.END
+
+    tg_file = await context.bot.get_file(msg.voice.file_id)
+    path = TEMP_DIR / f"voice_ai_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.ogg"
+    status = await msg.reply_text(
+        "🎙️ *Listening to your AI Assistant request...*\\n\\nYou can speak naturally — no command or prefix is required.",
+        parse_mode="Markdown",
+    )
+    try:
+        await tg_file.download_to_drive(path)
+        transcript = await _run_ai_with_retry_status(
+            msg,
+            lambda: asyncio.to_thread(
+                transcribe_voice_note,
+                path,
+                GEMINI_API_KEY,
+                GEMINI_MODEL,
+                msg.voice.mime_type or "audio/ogg",
+            ),
+            status=status,
+        )
+        transcript = str(transcript or "").strip()
+        if not transcript:
+            raise RuntimeError("Voice transcription was empty.")
+
+        await safe_status_edit(
+            status,
+            msg,
+            "✅ *Voice request understood.*\\n\\n🧠 Sending it to AI Assistant now...",
+            parse_mode="Markdown",
+        )
+        await msg.reply_text("🎙️ *I understood:*\\n" + transcript, parse_mode="Markdown")
+
+        context.user_data["smart_mode"] = True
+        context.user_data.setdefault("smart_files", [])
+        context.user_data["smart_text"] = transcript
+        context.user_data["_source_status_message"] = status
+        return await smart_process(update, context)
+
+    except Exception as exc:
+        logger.exception("AI Assistant voice request failed")
+        await safe_status_edit(
+            status,
+            msg,
+            f"⚠️ *Voice request could not be completed.*\\n\\nReason: `{str(exc)[:600]}`\\n\\nYou can resend the voice note or type the same request.",
+            parse_mode="Markdown",
+        )
+        return SMART_INPUT
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 async def smart_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3466,8 +3673,13 @@ async def _tour_v2_after_initial_extract(message, context, data):
     costing/transit can be added later from the single Modify & Regenerate action.
     """
     data=copy.deepcopy(data or {})
-    # Supplier/internal cost is never exposed unless the owner later adds customer costing.
-    data['show_cost']=False
+    # Supplier/internal cost is hidden by default. For a Tour created directly from
+    # the owner's AI Assistant brief, any explicitly supplied price is customer-authored
+    # and may remain visible.
+    if context.user_data.get('smart_owner_brief'):
+        data['show_cost']=bool(data.get('package_costs'))
+    else:
+        data['show_cost']=False
     context.user_data['itinerary']=data
     context.user_data['tour_v2_phase']='choose_output'
     context.user_data.pop('tour_v2_missing',None)
@@ -5689,11 +5901,20 @@ I will show the detailed Transit text I understood before regenerating the PDF."
                     await query.message.reply_text("✅ WhatsApp itinerary generated. You can choose another format below.",reply_markup=_tour_v2_output_keyboard())
                     return
                 if output=="pdf":
-                    await safe_callback_edit(
-                        query,
-                        f"📄 *{detail.title()} PDF selected.*\n\nNow choose whether this should be a Tour Voucher or Tour Quotation.",
-                        parse_mode="Markdown", reply_markup=tour_pdf_mode_keyboard(detail)
-                    )
+                    requested_mode = str(context.user_data.get("smart_requested_document_mode") or "").lower()
+                    if requested_mode in ("quotation", "voucher"):
+                        await safe_callback_edit(
+                            query,
+                            f"📄 *{detail.title()} {'Tour Quotation' if requested_mode=='quotation' else 'Tour Voucher'} selected from your AI Assistant request.*\n\nGenerating now...",
+                            parse_mode="Markdown",
+                        )
+                        await _prepare_tour_pdf_request(query.message, context, detail, requested_mode)
+                    else:
+                        await safe_callback_edit(
+                            query,
+                            f"📄 *{detail.title()} PDF selected.*\n\nNow choose whether this should be a Tour Voucher or Tour Quotation.",
+                            parse_mode="Markdown", reply_markup=tour_pdf_mode_keyboard(detail)
+                        )
                     return
             except Exception as exc:
                 logger.exception("Tour V2 output failed")

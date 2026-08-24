@@ -64,9 +64,17 @@ into one instruction. Never invent confirmed travel facts.
 
 Actions:
 generate_supplier = supplier source must be extracted as Air/Bus/Hotel/Tour.
-generate_brief = owner wants a new itinerary from a natural-language brief.
-edit_document = owner wants an existing generated document changed. Convert the request into a precise
-instruction for the document editor; it may contain multiple changes.
+generate_brief = owner wants a NEW tour/package/itinerary/quotation/voucher from natural language.
+This includes short unstructured travel briefs with destination + duration/pax/services even when the
+owner does NOT write "make", "create", "tour", "package" or any command prefix.
+Examples:
+- "Goa 4N 5D, Mr Amit, 2 adults, 3 star, breakfast, private cab, North and South Goa"
+- "Kashmir quotation 5N/6D, 4 adults, 3 star hotels, breakfast, private vehicle"
+- "Prepare detailed itinerary for Bali, 6 days, couple, breakfast, private transfers"
+edit_document = owner wants an existing generated document changed. A real MTB reference such as MTB12
+plus a change request must route here. Convert the request into a precise instruction for the document
+editor; it may contain multiple changes.
+generate_supplier = ONLY when actual supplier/source material must be extracted.
 chat = normal question.
 ask_user = only when an essential missing fact cannot reasonably be inferred.
 
@@ -236,6 +244,92 @@ def classify(parts, text, api_key, model):
         try:
             if work_dir.exists() and not any(work_dir.iterdir()): work_dir.rmdir()
         except:pass
+
+
+NEW_TOUR_BRIEF_PROMPT = """
+You are MyTourBazar's senior tour planner.
+
+The OWNER is asking you to CREATE a brand-new customer itinerary from a natural-language brief.
+This is NOT supplier extraction.
+
+Build a polished, practical day-wise tour plan using the owner's stated requirements and normal
+destination knowledge. Return ONLY JSON matching the itinerary schema.
+
+STRICT FACT RULES:
+- Preserve every explicit owner fact exactly: client name, destination, duration, dates, passenger
+  counts, hotel/star category, meals, vehicle, pickup/drop, sightseeing, room type, and any price.
+- If travel dates are not supplied, leave travel_dates and each day.date empty.
+- If a hotel NAME is not supplied, NEVER invent one. hotel_name must stay empty.
+- If a hotel CATEGORY is requested (3 star, 3 star premium, 4 star, etc.), preserve it.
+- You may create an accommodation row with an empty hotel_name so the requested category/meal plan
+  still appears in the itinerary.
+- If number of rooms or room type is not supplied, leave it empty. Do not invent it.
+- Do NOT create flight/train/bus transit unless the owner explicitly asks for or supplies it.
+  If no public transport is mentioned, transit must be [].
+- A private cab/vehicle requested for local transfers/sightseeing belongs in vehicle/inclusions,
+  not in public transit.
+- Never invent PNRs, airline numbers, ticket details, confirmed hotels, booking references or prices.
+- package_costs must be [] unless the owner explicitly gives customer rates/costing.
+- When the owner explicitly gives a selling price/rate, preserve it as customer-facing costing.
+
+DAY PLAN:
+- Create exactly the number of days requested.
+- Use a sensible route and sightseeing sequence for the destination.
+- Explicitly include every sightseeing/place the owner requested.
+- When the owner gives broad sightseeing such as "North & South Goa sightseeing", create a sensible,
+  client-ready day plan around that request using normal travel knowledge.
+- Basic day plans should normally be about 60-110 words per day: useful but not bloated.
+- Do not state optional/paid attractions as included unless the owner explicitly included them.
+- optional_activities may contain 0-2 clearly optional, at-own-cost suggestions.
+
+INCLUSIONS:
+- Build inclusions from the services requested by the owner: requested hotel category/accommodation,
+  stated meals, private vehicle/transfers, and specified sightseeing.
+- Do not add airfare, rail or bus tickets unless explicitly requested.
+
+EXCLUSIONS:
+- Add sensible standard exclusions such as personal expenses, optional activities/entry fees not
+  specifically included, and anything not expressly included. Keep them professional and concise.
+
+GUEST COUNTS:
+- Populate adult_count, child_count, child_cwb_count, child_cnb_count and extra_bed_count from the
+  brief when stated; otherwise use 0 for unspecified categories.
+- guests should be a readable summary.
+
+HOTELS:
+- When only a general category is given (e.g. "3-star hotels"), create appropriate accommodation
+  row(s) for overnight destination(s) with hotel_name="" and hotel_category set to the requested
+  category. Preserve meal plan in meal_plan.
+- Do not invent property names.
+
+OWNER BRIEF:
+"""
+
+def generate_package_from_brief(brief, api_key, model, detail_level="basic"):
+    """Create a new Tour itinerary from the owner's natural-language brief."""
+    client = genai.Client(api_key=api_key)
+    mode = "DETAILED" if str(detail_level).lower() == "detailed" else "BASIC"
+    prompt = (
+        NEW_TOUR_BRIEF_PROMPT
+        + "\nREQUESTED DETAIL LEVEL: " + mode
+        + "\n\n" + str(brief or "").strip()
+    )
+    response = call_with_high_demand_retry(lambda: client.models.generate_content(
+        model=model,
+        contents=[prompt],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ITINERARY_SCHEMA,
+            temperature=0.22,
+        ),
+    ))
+    if not response.text:
+        raise RuntimeError("AI Assistant returned an empty Tour itinerary.")
+    data = json.loads(response.text)
+    data["detail_level"] = str(detail_level).lower()
+    for day in data.get("days", []):
+        day.setdefault("optional_activities", [])
+    return data
 
 
 def chat(text, api_key, model):
