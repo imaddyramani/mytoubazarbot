@@ -1,0 +1,50 @@
+MYTOURBAZAR V167 - BACK4APP FULL PDF FIX
+
+WHY THIS FIX:
+The current Docker container can start Python, but WeasyPrint cannot load
+its Linux Pango libraries. That prevents PDF workflows from working.
+
+DO THIS EXACTLY:
+
+1. Extract this ZIP.
+
+2. In the ROOT of your GitHub repository (same place as bot.py):
+   - Replace Dockerfile with this Dockerfile.
+   - Replace start.py with this start.py.
+   - Replace .dockerignore with this .dockerignore.
+   - Replace/add .gitignore with this .gitignore.
+
+3. IMPORTANT:
+   Do NOT upload __pycache__.
+
+4. Confirm these paths exist in GitHub:
+   assets/mytourbazar_footer2_clean.png
+   assets/mytourbazar_footer.png
+   assets/mytourbazar_watermark.png
+   assets/mytourbazar_contact_bar_orange.png
+
+   data/T&C NON GOOGLE.pdf
+   data/B2B.pdf
+   data/without_footer.pdf
+   data/logo_default.png
+
+5. Commit/push the changes.
+
+6. In Back4App, deploy the LATEST commit.
+
+7. During build, this Dockerfile tests WeasyPrint.
+   If the PDF stack is healthy, build continues.
+   If not, deployment stops with the real library error.
+
+8. After deployment, look for:
+      [BOOT] WeasyPrint OK
+      [BOOT] Required V167 PDF assets found.
+      [BOOT] Starting MyTourBazar Telegram bot...
+
+9. Then test one Air Print, one Hotel Print, and one Tour PDF.
+
+Environment variables stay in Back4App:
+   BOT_TOKEN
+   GEMINI_API_KEY
+
+Do not put the real .env file on GitHub.

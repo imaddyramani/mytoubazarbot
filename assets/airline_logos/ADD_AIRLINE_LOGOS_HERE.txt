@@ -1,0 +1,4 @@
+Place airline logo files in this folder.
+Examples: indigo.png, air_india.png, air_india_express.png, akasa_air.png, spicejet.png, vistara.png, emirates.png, qatar_airways.png
+The bot tries airline name first, then flight code like 6E, AI, IX, QP, SG, UK.
+If no matching logo is found, it automatically uses assets/flight_takeoff.png

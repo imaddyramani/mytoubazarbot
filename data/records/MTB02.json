@@ -1,0 +1,84 @@
+{
+  "type": "flight",
+  "filename": "Air_Mr_Vijay_Kumar_Delhi.pdf",
+  "data": {
+    "booking_id": "OT2430094",
+    "booking_date": "22 August, 2026",
+    "airline_pnr": "S6J7RY",
+    "gds_pnr": "S6J7RY",
+    "status": "Vouchered",
+    "mobile": "91-9425259086",
+    "segments": [
+      {
+        "flight": "IndiGo",
+        "flight_number": "6E 5134",
+        "aircraft": "",
+        "cabin": "Economy",
+        "dep_time": "09:40 AM",
+        "dep_city": "Srinagar",
+        "dep_code": "SXR",
+        "dep_date": "23 Aug 2026",
+        "dep_airport": "Srinagar airport, srinagar",
+        "dep_terminal": "",
+        "arr_time": "11:20 AM",
+        "arr_city": "Delhi",
+        "arr_code": "DEL",
+        "arr_date": "23 Aug 2026",
+        "arr_airport": "Delhi indira gandhi international, delhi",
+        "arr_terminal": "Terminal 3",
+        "duration": "1h 0m",
+        "stops": "0"
+      }
+    ],
+    "passengers": [
+      {
+        "name": "Vijay Kumar",
+        "title": "Mr.",
+        "ticket_number": "S6J7RY",
+        "type": "Adult",
+        "dob": "",
+        "baggage": "15kgs"
+      }
+    ],
+    "base_fare": 6000,
+    "taxes": 2566,
+    "gross_total": 8954.0,
+    "payment_items": [
+      {
+        "label": "Air Fare Charges",
+        "amount": 6000.0
+      },
+      {
+        "label": "Fuel Surcharge (YQ)",
+        "amount": 400.0
+      },
+      {
+        "label": "Fees and Taxes",
+        "amount": 2554.0
+      }
+    ],
+    "_extraction_pages_optimized": true,
+    "adult_count": 0,
+    "child_count": 0,
+    "child_cwb_count": 0,
+    "child_cnb_count": 0,
+    "extra_bed_count": 0,
+    "guest_profile": "0 Adult(s) • 0 Child • 0 Child CWB • 0 Child CNB • 0 Extra Bed(s)"
+  },
+  "fare": 8954,
+  "footer": true,
+  "footer_mode": "footer2",
+  "logo_enabled": true,
+  "logo_scale": 1.0,
+  "page_size": "Legal",
+  "text_scale": 0.9,
+  "reference": "MTB02",
+  "created_at": "2026-08-22T16:02:24",
+  "updated_at": "2026-08-22T16:06:51",
+  "telegram_message_keys": [
+    "920929625:6010",
+    "920929625:6020"
+  ],
+  "terms_choice": null,
+  "legacy": false
+}

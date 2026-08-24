@@ -1,0 +1,259 @@
+{
+  "type": "package",
+  "filename": "Tour- Nepal_Expedition__Gorakhpur___Chitwan___Kathmandu___Pokhara___Lumbini_Ms._Shweta_Chaubey_&_Friends_Nepal_0910.pdf",
+  "data": {
+    "client_name": "Ms. Shweta Chaubey & Friends",
+    "tour_title": "Nepal Expedition: Gorakhpur – Chitwan – Kathmandu – Pokhara – Lumbini",
+    "destination": "Nepal",
+    "travel_dates": "02 October – 09 October 2026",
+    "duration": "7 Nights / 8 Days",
+    "guests": "Mr. Jujhar Singh & Family",
+    "adult_count": 8,
+    "child_cwb_count": 0,
+    "child_count": 0,
+    "child_cnb_count": 0,
+    "extra_bed_count": 0,
+    "vehicle": "AC 13-Seater Tempo Traveller",
+    "pickup": "Gorakhpur Airport (GOP)",
+    "drop": "Gorakhpur Railway Station (GKP)",
+    "transit": [
+      {
+        "date": "02 Oct 2026",
+        "segment_mode": "Flight",
+        "journey_type": "Onward",
+        "carrier": "IndiGo",
+        "flight_number": "6E-669 / 6E-6309",
+        "route": "Raipur (RPR) ➝ Kolkata (CCU) ➝ Gorakhpur (GOP)",
+        "from": "Raipur",
+        "to": "Gorakhpur",
+        "departure": "05:20 PM",
+        "arrival": "12:00 PM"
+      },
+      {
+        "date": "09 Oct 2026",
+        "segment_mode": "Train",
+        "journey_type": "Return",
+        "carrier": "NTV DURG EXP",
+        "flight_number": "18202",
+        "route": "Gorakhpur (GKP) ➝ Raipur (R)",
+        "from": "Gorakhpur",
+        "to": "Raipur",
+        "departure": "01:30 PM",
+        "arrival": "11:55 AM (10-Oct)",
+        "pnr": "2741616625"
+      }
+    ],
+    "hotels": [
+      {
+        "dates": "02 Oct - 03 Oct",
+        "destination": "Gorakhpur",
+        "hotel_name": "Hotel Manas Continental",
+        "room_category": "Standard",
+        "hotel_category": "3 Star Premium",
+        "rooms": "Not specified",
+        "room_type": "Standard",
+        "meal_plan": "Breakfast & Dinner",
+        "option": "Option 1"
+      },
+      {
+        "dates": "03 Oct - 04 Oct",
+        "destination": "Chitwan",
+        "hotel_name": "Hotel Green Mansion or similar",
+        "room_category": "Resort",
+        "hotel_category": "3 Star Premium",
+        "rooms": "Not specified",
+        "room_type": "Resort",
+        "meal_plan": "All Meals (1L, 1B, 1D)",
+        "option": "Option 1"
+      },
+      {
+        "dates": "04 Oct - 06 Oct",
+        "destination": "Kathmandu",
+        "hotel_name": "Norling Lords Prime",
+        "room_category": "Hotel",
+        "hotel_category": "3 Star Premium",
+        "rooms": "Not specified",
+        "room_type": "Hotel",
+        "meal_plan": "Breakfast & Dinner",
+        "option": "Option 1"
+      },
+      {
+        "dates": "06 Oct - 08 Oct",
+        "destination": "Pokhara",
+        "hotel_name": "Hotel Queens Park",
+        "room_category": "Hotel",
+        "hotel_category": "3 Star Premium",
+        "rooms": "Not specified",
+        "room_type": "Hotel",
+        "meal_plan": "Breakfast & Dinner",
+        "option": "Option 1"
+      },
+      {
+        "dates": "08 Oct - 09 Oct",
+        "destination": "Bhairahawa / Lumbini",
+        "hotel_name": "Hotel Asian Buddha or similar",
+        "room_category": "Hotel",
+        "hotel_category": "3 Star Premium",
+        "rooms": "Not specified",
+        "room_type": "Hotel",
+        "meal_plan": "Breakfast & Dinner",
+        "option": "Option 1"
+      }
+    ],
+    "days": [
+      {
+        "day": "Day 01",
+        "date": "02 Oct 2026",
+        "title": "Arrival in Gorakhpur",
+        "description": "Welcome to the start of your journey. Upon arrival at Gorakhpur Airport, our representative will greet you and facilitate a smooth transfer to your hotel. As you settle into the comfortable surroundings of Hotel Manas Continental, take the opportunity to refresh after your travels. The hotel's prime location offers easy access to the city's transport hubs, ensuring a stress-free start to your expedition. Spend the remainder of the day at your own pace, perhaps enjoying a quiet evening meal at the hotel or taking a gentle walk to acclimatize to the local atmosphere. Your overnight stay in Gorakhpur is arranged to ensure you are well-rested for the exciting road journey ahead into Nepal. Enjoy a delicious dinner at the hotel before retiring for the night.",
+        "stay": "Hotel Manas Continental, Gorakhpur",
+        "meal_plan": "Dinner",
+        "optional_activities": [
+          "OPTIONAL / AT OWN COST: Local market walk",
+          "OPTIONAL / AT OWN COST: Visit to Gorakhnath Temple"
+        ]
+      },
+      {
+        "day": "Day 02",
+        "date": "03 Oct 2026",
+        "title": "Transfer to Chitwan National Park",
+        "description": "After a hearty breakfast, your adventure truly begins as you board your private AC Tempo Traveller for a scenic drive toward the lush landscapes of Chitwan National Park in Nepal. This journey, spanning approximately 9 hours, includes the necessary border crossing formalities. As you transition from the plains into the heart of Nepal's wilderness, enjoy the changing vistas. Upon arrival at your resort, check in and take a moment to unwind in the serene environment. In the evening, you are invited to experience the rich local heritage with a vibrant Tharu Cultural Show. This performance features traditional folk music and rhythmic dances that offer a fascinating glimpse into the lives of the indigenous Tharu people. Conclude your day with a wholesome dinner at the resort, surrounded by the sounds of the jungle, before settling in for a peaceful overnight stay.",
+        "stay": "Hotel Green Mansion, Chitwan",
+        "meal_plan": "All Meals (Breakfast, Lunch, Dinner)",
+        "optional_activities": [
+          "OPTIONAL / AT OWN COST: Nature walk near the resort"
+        ]
+      },
+      {
+        "day": "Day 03",
+        "date": "04 Oct 2026",
+        "title": "Chitwan Jeep Safari & Journey to Kathmandu",
+        "description": "Awaken to the sounds of nature and prepare for an exhilarating 2-hour Jeep Safari deep into the heart of Chitwan National Park. This UNESCO World Heritage site is a haven for wildlife enthusiasts; keep your camera ready as you traverse the dense forests and grasslands, where you may spot the majestic one-horned rhinoceros, deer, and a variety of exotic bird species. After your safari, enjoy a refreshing breakfast before setting off on a scenic drive toward the vibrant capital city, Kathmandu. En route, you will make a stop at the sacred Manakamana Temple. Perched high on a hill-ridge, this temple is a significant pilgrimage site, believed to grant the wishes of those who visit. You will reach Kathmandu by evening, where you will check into the Norling Lords Prime. After a long day of exploration, enjoy a relaxing dinner at the hotel and reflect on the day's experiences.",
+        "stay": "Norling Lords Prime, Kathmandu",
+        "meal_plan": "Breakfast & Dinner",
+        "optional_activities": [
+          "OPTIONAL / AT OWN COST: Cable car ride to Manakamana Temple"
+        ]
+      },
+      {
+        "day": "Day 04",
+        "date": "05 Oct 2026",
+        "title": "Kathmandu City Sightseeing",
+        "description": "Today is dedicated to uncovering the rich cultural and spiritual tapestry of Kathmandu. Your guided tour begins with a visit to the sacred Pashupatinath Temple, one of the most significant Hindu temples in the world, situated on the banks of the Bagmati River. Next, explore the historic Kathmandu Durbar Square, an architectural marvel showcasing ancient palaces and courtyards. You will also visit the revered Guheswori Temple, known for its deep spiritual significance. Later, continue to the iconic Jal Narayan, also known as Budhanilkantha, where you will see the magnificent floating Vishnu idol carved from a single block of stone. Your day concludes at the Swayambhunath Stupa, famously known as the 'Monkey Temple.' Perched atop a hill, this ancient religious complex offers breathtaking panoramic views of the entire Kathmandu Valley. After a day filled with history and spirituality, return to your hotel for a comfortable evening and a delicious dinner.",
+        "stay": "Norling Lords Prime, Kathmandu",
+        "meal_plan": "Breakfast & Dinner",
+        "optional_activities": [
+          "OPTIONAL / AT OWN COST: Shopping in Thamel",
+          "OPTIONAL / AT OWN COST: Café experience in Kathmandu"
+        ]
+      },
+      {
+        "day": "Day 05",
+        "date": "06 Oct 2026",
+        "title": "Kathmandu to Pokhara",
+        "description": "After a nourishing breakfast, depart from Kathmandu for a picturesque drive to the lakeside city of Pokhara. The journey takes you through stunning river valleys and winding mountain roads, offering spectacular views of the Nepalese landscape. Upon arrival in Pokhara, check into Hotel Queens Park, your home for the next two nights. The remainder of the day is yours to enjoy at leisure. You might choose to take a relaxing walk along the vibrant Phewa Lakeside market, where you can browse local handicrafts or simply soak in the tranquil atmosphere by the serene waters of Phewa Lake. The reflection of the Annapurna range on the lake's surface is a sight to behold. Enjoy a quiet evening, perhaps with a drink by the water, followed by a delicious dinner at your hotel. This is the perfect time to relax and prepare for the adventures that await you in the mountains.",
+        "stay": "Hotel Queens Park, Pokhara",
+        "meal_plan": "Breakfast & Dinner",
+        "optional_activities": [
+          "OPTIONAL / AT OWN COST: Boating on Phewa Lake",
+          "OPTIONAL / AT OWN COST: Evening lakeside stroll"
+        ]
+      },
+      {
+        "day": "Day 06",
+        "date": "07 Oct 2026",
+        "title": "Pokhara Sightseeing & Sarangkot Sunrise",
+        "description": "Start your day early with an unforgettable experience: witnessing the sunrise over the majestic Annapurna range from the viewpoint at Sarangkot. The sight of the peaks glowing in the morning light is truly magical. After returning for breakfast, continue your exploration of Pokhara. Visit the dramatic Devi's Fall, where the water vanishes into an underground tunnel, and the nearby Gupteshwor Mahadev Cave, a sacred site featuring impressive limestone formations. Afterward, head to the tranquil Fewa Lake to visit the island temple of Taal Barahi, a peaceful sanctuary accessible by boat. Your final stop for the day is the historic Bindabasini Temple, dedicated to the Goddess Durga, which offers a glimpse into the local religious traditions. Return to your hotel in the evening to enjoy a well-deserved dinner and relax after a day of sightseeing. The beauty of Pokhara is sure to leave you with lasting memories.",
+        "stay": "Hotel Queens Park, Pokhara",
+        "meal_plan": "Breakfast & Dinner",
+        "optional_activities": [
+          "OPTIONAL / AT OWN COST: Paragliding",
+          "OPTIONAL / AT OWN COST: Visit to World Peace Pagoda"
+        ]
+      },
+      {
+        "day": "Day 07",
+        "date": "08 Oct 2026",
+        "title": "Pokhara to Bhairahawa & Lumbini Excursion",
+        "description": "Following breakfast, check out and embark on a drive toward Bhairahawa, located near the Indian border. The highlight of today is a visit to Lumbini, the UNESCO World Heritage site and the sacred birthplace of Lord Buddha. Upon arrival, you will explore the serene temple grounds. Visit the Maya Devi Temple, which marks the exact spot of Buddha's birth, and spend time reflecting by the Sacred Pond. You will also see the historic Ashokan Pillar, erected by Emperor Ashoka to commemorate his visit to this holy site. As motorized vehicles are restricted within the main garden area to maintain the sanctity of the place, you will explore the expansive temple grounds via E-Rickshaw, allowing for a peaceful and immersive experience. After your visit, proceed to your hotel in Bhairahawa to check in. Enjoy a quiet dinner and a comfortable overnight stay as you prepare for your return journey the following day.",
+        "stay": "Hotel Asian Buddha, Bhairahawa",
+        "meal_plan": "Breakfast & Dinner",
+        "optional_activities": [
+          "OPTIONAL / AT OWN COST: Meditation at Lumbini Garden"
+        ]
+      },
+      {
+        "day": "Day 08",
+        "date": "09 Oct 2026",
+        "title": "Departure from Gorakhpur",
+        "description": "On your final day, enjoy a leisurely breakfast at your hotel in Bhairahawa before checking out. Your private vehicle will then transfer you across the border back to Gorakhpur Railway Station. This drive marks the end of your wonderful Nepal expedition. Upon reaching the station, you will board the 18202 NTV DURG EXP train, scheduled to depart at 13:30 hrs for your return journey to Raipur. As you settle into your seat, take a moment to look back on the incredible experiences, from the wildlife of Chitwan to the spiritual serenity of Lumbini and the breathtaking mountain views of Pokhara. We hope this journey has provided you with beautiful memories that will last a lifetime. Thank you for choosing MyTourBazar for your travel needs, and we look forward to assisting you with your future adventures.",
+        "stay": "Not applicable",
+        "meal_plan": "Breakfast",
+        "optional_activities": []
+      }
+    ],
+    "inclusions": [
+      "Pick up and drop from Gorakhpur by AC 13-Seater Tempo Traveller",
+      "Onward Flights: RPR ➝ CCU ➝ GOP via IndiGo (02 Oct 2026)",
+      "Return Train: Gorakhpur (GKP) ➝ Raipur (R) via 18202 NTV Durg Exp (09 Oct 2026)",
+      "Daily Breakfast and Dinner at Hotels",
+      "Hotel stay as per the 3-star premium plan (7 Nights total)",
+      "All sightseeing and transfers as per itinerary",
+      "Tharu Cultural show and All meals in Chitwan (1L, 1B, 1D)",
+      "Jungle Entrance Fee & 2-Hour Jeep Safari in Chitwan",
+      "Tour Guide during Kathmandu and Pokhara sightseeing only"
+    ],
+    "exclusions": [
+      "Train tickets",
+      "Water bottles",
+      "Laundry fees",
+      "E-Rickshaw for Lumbini sightseeing",
+      "Monument entrance fees",
+      "Cable Car ticket",
+      "Boat ride",
+      "Medical and travelling insurance",
+      "Extra activities / Meals other than specified",
+      "Vehicle disposal use (charged point-to-point only)"
+    ],
+    "policies": "No refund will be made for any unused accommodation, missed meals, transportation segments, sightseeing tours or any other service. All changes must be communicated in writing. 50% of the total package is compulsory to confirm the booking. Remaining 50% must be paid before check-in. Cancellation policy applies based on the number of days prior to arrival.",
+    "greeting": "Dear Ms. Shweta Chaubey & Friends,\n\nGreetings from MyTourBazar! Thank you for choosing us for your journey. Please find below your official tour voucher containing the confirmed travel plan, accommodation schedule, services and day-wise arrangements. Kindly keep this voucher available during your journey and review the included services and travel instructions before departure.\n\nWe wish you a smooth, comfortable and memorable trip.",
+    "accommodation_heading": "ACCOMMODATION SCHEDULE",
+    "package_costs": [
+      {
+        "option": "Package",
+        "currency": "INR",
+        "per_adult": "43,700",
+        "calculated_total": 349600.0,
+        "supplier_total": 349600.0,
+        "final_total": 349600.0
+      }
+    ],
+    "detail_level": "detailed",
+    "show_cost": true,
+    "document_mode": "voucher",
+    "guest_profile": "8 Adult(s) • 0 Child • 0 Child CWB • 0 Child CNB • 0 Extra Bed(s)",
+    "document_title": "OFFICIAL TOUR VOUCHER"
+  },
+  "fare": 349600,
+  "source_text": "",
+  "detail_level": "detailed",
+  "terms_choice": "tc_non_google",
+  "document_mode": "voucher",
+  "b2b": false,
+  "footer": true,
+  "footer_mode": "footer2",
+  "logo_enabled": true,
+  "page_size": "A4",
+  "agency_removed": false,
+  "text_scale": 1.0,
+  "logo_scale": 1.0,
+  "auto_creation": false,
+  "reference": "MTB01",
+  "created_at": "2026-08-20T11:33:48",
+  "updated_at": "2026-08-20T12:17:22",
+  "telegram_message_keys": [
+    "920929625:5933",
+    "920929625:5942"
+  ],
+  "legacy": false
+}

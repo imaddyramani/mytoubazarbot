@@ -1,0 +1,34 @@
+{
+  "font": "Liberation Serif Bold",
+  "text_scale": 1.0,
+  "watermark_opacity": 0.04,
+  "watermark_scale": 1.5,
+  "default_terms": "tc2",
+  "footer_defaults": {
+    "flight": "footer2",
+    "bus": "footer2",
+    "hotel": "footer2",
+    "package": "footer2"
+  },
+  "buttons": {
+    "make_changes": true,
+    "add_cost": true,
+    "print_without_fare": true,
+    "print_original_fare": true,
+    "footer_bar": true,
+    "footer_design": true,
+    "footer2": true,
+    "print_clean": true,
+    "page_size_controls": true,
+    "watermark": true,
+    "main_tour": true,
+    "main_air": true,
+    "main_bus": true,
+    "main_hotel": true,
+    "main_ai": true,
+    "main_edit": false,
+    "main_files": false,
+    "main_settings": true
+  },
+  "tour_last_page": "tc_default"
+}

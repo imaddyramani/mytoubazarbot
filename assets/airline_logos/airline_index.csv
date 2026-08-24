@@ -1,0 +1,111 @@
+﻿company_name,png_filename,iata_code,country,service_status,logo_status
+IndiGo,indigo.png,6E,India,active/current pack,ok
+Air India,air_india.png,AI,India,active/current pack,ok
+Air India Express,air_india_express.png,IX,India,active/current pack,ok
+Akasa Air,akasa_air.png,QP,India,active/current pack,ok
+SpiceJet,spicejet.png,SG,India,active/current pack,ok
+Alliance Air,alliance_air.png,9I,India,active/current pack,ok
+Star Air,star_air.png,S5,India,active/current pack,ok
+FLY91,fly91.png,IC,India,active/current pack,ok
+IndiaOne Air,indiaone_air.png,I7,India,active/current pack,ok
+flybig,flybig.png,S9,India,active/current pack,ok
+Air Arabia,air_arabia.png,G9,United Arab Emirates,active/current pack,ok
+Air Arabia Abu Dhabi,air_arabia_abu_dhabi.png,3L,United Arab Emirates,active/current pack,ok
+Emirates,emirates.png,EK,United Arab Emirates,active/current pack,ok
+Etihad Airways,etihad_airways.png,EY,United Arab Emirates,active/current pack,ok
+flydubai,flydubai.png,FZ,United Arab Emirates,active/current pack,ok
+Wizz Air Abu Dhabi,wizz_air_abu_dhabi.png,5W,United Arab Emirates,active/current pack,ok
+Qatar Airways,qatar_airways.png,QR,Qatar,active/current pack,ok
+Gulf Air,gulf_air.png,GF,Bahrain,active/current pack,ok
+Oman Air,oman_air.png,WY,Oman,active/current pack,ok
+SalamAir,salamair.png,OV,Oman,active/current pack,ok
+Kuwait Airways,kuwait_airways.png,KU,Kuwait,active/current pack,ok
+Jazeera Airways,jazeera_airways.png,J9,Kuwait,active/current pack,ok
+Saudia,saudia.png,SV,Saudi Arabia,active/current pack,ok
+flynas,flynas.png,XY,Saudi Arabia,active/current pack,ok
+flyadeal,flyadeal.png,F3,Saudi Arabia,active/current pack,ok
+Iraqi Airways,iraqi_airways.png,IA,Iraq,active/current pack,ok
+EL AL,el_al.png,LY,Israel,active/current pack,ok
+Royal Jordanian,royal_jordanian.png,RJ,Jordan,active/current pack,ok
+Mahan Air,mahan_air.png,W5,Iran,active/current pack,ok
+Iran Air,iran_air.png,IR,Iran,active/current pack,ok
+Biman Bangladesh Airlines,biman_bangladesh.png,BG,Bangladesh,active/current pack,ok
+US-Bangla Airlines,us_bangla_airlines.png,BS,Bangladesh,active/current pack,ok
+NOVOAIR,novoair.png,VQ,Bangladesh,active/current pack,ok
+Nepal Airlines,nepal_airlines.png,RA,Nepal,active/current pack,ok
+Buddha Air,buddha_air.png,U4,Nepal,active/current pack,ok
+Himalaya Airlines,himalaya_airlines.png,H9,Nepal,active/current pack,ok
+Drukair,drukair.png,KB,Bhutan,active/current pack,ok
+Bhutan Airlines,bhutan_airlines.png,B3,Bhutan,active/current pack,ok
+SriLankan Airlines,srilankan_airlines.png,UL,Sri Lanka,active/current pack,ok
+Maldivian,maldivian.png,Q2,Maldives,active/current pack,ok
+Manta Air,manta_air.png,NR,Maldives,active/current pack,ok
+AirAsia,airasia.png,AK,Malaysia,active/current pack,ok
+AirAsia X,airasia_x.png,D7,Malaysia,active/current pack,ok
+Malaysia Airlines,malaysia_airlines.png,MH,Malaysia,active/current pack,ok
+Batik Air Malaysia,batik_air_malaysia.png,OD,Malaysia,active/current pack,ok
+Singapore Airlines,singapore_airlines.png,SQ,Singapore,active/current pack,ok
+Scoot,scoot.png,TR,Singapore,active/current pack,ok
+Thai Airways,thai_airways.png,TG,Thailand,active/current pack,ok
+Thai AirAsia,thai_airasia.png,FD,Thailand,active/current pack,ok
+Thai Lion Air,thai_lion_air.png,SL,Thailand,active/current pack,ok
+VietJet Air,vietjet_air.png,VJ,Vietnam,active/current pack,ok
+Vietnam Airlines,vietnam_airlines.png,VN,Vietnam,active/current pack,ok
+Cambodia Angkor Air,cambodia_angkor_air.png,K6,Cambodia,active/current pack,ok
+Myanmar Airways International,myanmar_airways_international.png,8M,Myanmar,active/current pack,ok
+Garuda Indonesia,garuda_indonesia.png,GA,Indonesia,active/current pack,ok
+Citilink,citilink.png,QG,Indonesia,active/current pack,ok
+Cathay Pacific,cathay_pacific.png,CX,Hong Kong,active/current pack,ok
+Hong Kong Airlines,hong_kong_airlines.png,HX,Hong Kong,active/current pack,ok
+China Southern Airlines,china_southern.png,CZ,China,active/current pack,ok
+China Eastern Airlines,china_eastern.png,MU,China,active/current pack,ok
+Air China,air_china.png,CA,China,active/current pack,ok
+Sichuan Airlines,sichuan_airlines.png,3U,China,active/current pack,ok
+Shandong Airlines,shandong_airlines.png,SC,China,active/current pack,ok
+Korean Air,korean_air.png,KE,South Korea,active/current pack,ok
+Asiana Airlines,asiana_airlines.png,OZ,South Korea,active/current pack,ok
+Japan Airlines,japan_airlines.png,JL,Japan,active/current pack,ok
+All Nippon Airways (ANA),ana.png,NH,Japan,active/current pack,ok
+Air Astana,air_astana.png,KC,Kazakhstan,active/current pack,ok
+Uzbekistan Airways,uzbekistan_airways.png,HY,Uzbekistan,active/current pack,ok
+Qazaq Air,qazaq_air.png,IQ,Kazakhstan,active/current pack,ok
+Azerbaijan Airlines,azerbaijan_airlines.png,J2,Azerbaijan,active/current pack,ok
+Georgian Airways,georgian_airways.png,A9,Georgia,active/current pack,ok
+Turkmenistan Airlines,turkmenistan_airlines.png,T5,Turkmenistan,active/current pack,ok
+Somon Air,somon_air.png,SZ,Tajikistan,active/current pack,ok
+Aeroflot,aeroflot.png,SU,Russia,active/current pack,ok
+Turkish Airlines,turkish_airlines.png,TK,Turkey,active/current pack,ok
+Lufthansa,lufthansa.png,LH,Germany,active/current pack,ok
+SWISS,swiss.png,LX,Switzerland,active/current pack,ok
+Austrian Airlines,austrian_airlines.png,OS,Austria,active/current pack,ok
+British Airways,british_airways.png,BA,United Kingdom,active/current pack,ok
+Virgin Atlantic,virgin_atlantic.png,VS,United Kingdom,active/current pack,ok
+Air France,air_france.png,AF,France,active/current pack,ok
+KLM,klm.png,KL,Netherlands,active/current pack,ok
+LOT Polish Airlines,lot_polish_airlines.png,LO,Poland,active/current pack,ok
+ITA Airways,ita_airways.png,AZ,Italy,active/current pack,ok
+Finnair,finnair.png,AY,Finland,active/current pack,ok
+Air Serbia,air_serbia.png,JU,Serbia,active/current pack,ok
+Aegean Airlines,aegean_airlines.png,A3,Greece,active/current pack,ok
+Ethiopian Airlines,ethiopian_airlines.png,ET,Ethiopia,active/current pack,ok
+Kenya Airways,kenya_airways.png,KQ,Kenya,active/current pack,ok
+Air Tanzania,air_tanzania.png,TC,Tanzania,active/current pack,ok
+RwandAir,rwandair.png,WB,Rwanda,active/current pack,ok
+Air Mauritius,air_mauritius.png,MK,Mauritius,active/current pack,ok
+EgyptAir,egyptair.png,MS,Egypt,active/current pack,ok
+Air Seychelles,air_seychelles.png,HM,Seychelles,active/current pack,ok
+United Airlines,united_airlines.png,UA,United States,active/current pack,ok
+American Airlines,american_airlines.png,AA,United States,active/current pack,ok
+Air Canada,air_canada.png,AC,Canada,active/current pack,ok
+Qantas,qantas.png,QF,Australia,active/current pack,ok
+Batik Air,batik_air.png,ID,Indonesia,active/current pack,ok
+Vistara,vistara.png,UK,India,legacy/merged,ok
+Go First / GoAir,go_first.png,G8,India,legacy/merged,ok
+Jet Airways,jet_airways.png,9W,India,legacy/merged,ok
+AirAsia India,airasia_india.png,I5,India,legacy/merged,ok
+TruJet,trujet.png,2T,India,legacy/merged,ok
+Kingfisher Airlines,kingfisher_airlines.png,IT,India,legacy/merged,ok
+JetLite,jetlite.png,S2,India,legacy/merged,ok
+Air Costa,air_costa.png,LB,India,legacy/merged,ok
+Zoom Air,zoom_air.png,ZO,India,legacy/merged,ok
+Air Pegasus,air_pegasus.png,OP,India,legacy/merged,ok
