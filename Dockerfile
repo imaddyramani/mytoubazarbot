@@ -26,4 +26,4 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY . /app
 
 # Start the bot. Change BOT_ENTRY if your main file is not bot.py.
-CMD ["sh", "-c", "python "$BOT_ENTRY""]
+CMD ["python", "start.py"]
