@@ -869,7 +869,11 @@ async def reply_reference_edit(update: Update, context: ContextTypes.DEFAULT_TYP
         if replied_id in draft_ids:
             instruction = (msg.text or '').strip()
             if instruction:
-                await perform_draft_edit(update, context, instruction)
+                variant = _tour_reply_variant_command(instruction)
+                if variant:
+                    await _reply_draft_tour_variant(msg, context, variant)
+                else:
+                    await perform_draft_edit(update, context, instruction)
                 raise ApplicationHandlerStop
 
     # V154: the editable Tour draft is a one-shot final submission. This global
@@ -989,6 +993,13 @@ async def reply_reference_edit(update: Update, context: ContextTypes.DEFAULT_TYP
     # handled before the general Smart Edit path so a simple reply like +10000 or
     # Start Date: 20/09/2026 does exactly the requested action.
     if record.get("type") == "package":
+        # V170 Smart Reply: replying to a generated Tour PDF with only a
+        # detail/output request is an output conversion, not a generic content edit.
+        variant = _tour_reply_variant_command(instruction)
+        if variant:
+            await _reply_saved_tour_variant(msg, context, reference, record, variant)
+            raise ApplicationHandlerStop
+
         data = dict(record.get("data") or {})
         low = instruction.lower()
         # Detect an explicit start-date reply before using the parsed match.
@@ -1043,7 +1054,10 @@ async def _begin_edit(update, context, reference):
         f"• `Keep adult at 43700, child without bed 26000, and change Munnar room to Premium Valley View.`\n"
         f"• `Change Day 2 sightseeing to include Dwarkadhish Temple and Bet Dwarka.`\n"
         f"• `Raipur to Nagpur by Vande Bharat, Nagpur to Goa by flight, and Delhi to Raipur by bus.`\n"
-        f"• `Change passenger name to Mr. Amit Sharma.`\n\n"
+        f"• `Change passenger name to Mr. Amit Sharma.`\n"
+        f"• `Detailed itinerary` → reply to a Tour PDF to get the detailed PDF directly.\n"
+        f"• `Detailed WhatsApp` → get only the detailed WhatsApp version.\n"
+        f"• `Detailed draft` → return to an editable detailed draft first.\n\n"
         f"For Tour costing, tell me the final customer rate naturally - there is no separate markup system. "
         f"Gemini will understand the intent, preserve the rest, and regenerate the PDF.",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
@@ -1332,7 +1346,7 @@ async def perform_saved_edit(update, context, instruction):
                 reply_markup=generated_document_keyboard(reference, doc_type),
             )
         _register_reference_message(reference, sent_pdf)
-        if doc_type == "package" and requested_detail:
+        if doc_type == "package" and requested_detail and package_whatsapp:
             await update.message.reply_text(build_whatsapp_itinerary(new_data, requested_detail), parse_mode="Markdown")
         context.user_data.pop("editing_reference", None)
     except Exception as exc:
@@ -1371,7 +1385,11 @@ async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             await safe_status_edit(status,msg,'✅ *Voice note understood.* Applying it to this draft...',parse_mode='Markdown')
             await msg.reply_text('🎙️ *I understood:*\n' + transcript, parse_mode='Markdown')
-            await perform_draft_edit(update, context, transcript)
+            variant = _tour_reply_variant_command(transcript)
+            if variant:
+                await _reply_draft_tour_variant(msg, context, variant)
+            else:
+                await perform_draft_edit(update, context, transcript)
         except Exception as exc:
             logger.exception('Voice draft reply edit failed')
             await safe_status_edit(status,msg,f'⚠️ Voice draft edit could not be completed. Resend it or type the same change.\n\nReason: {str(exc)[:500]}')
@@ -1396,8 +1414,14 @@ async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             await safe_status_edit(status,msg,'✅ *Voice note understood.*\n\nApplying the changes now...',parse_mode='Markdown')
             await msg.reply_text('🎙️ *I understood:*\n' + transcript, parse_mode='Markdown')
-            context.user_data['editing_reference']=reference
-            await perform_saved_edit(update, context, transcript)
+            saved = load_record(reference) or {}
+            variant = _tour_reply_variant_command(transcript) if saved.get('type') == 'package' else None
+            if variant:
+                context.user_data.pop('editing_reference', None)
+                await _reply_saved_tour_variant(msg, context, reference, saved, variant)
+            else:
+                context.user_data['editing_reference']=reference
+                await perform_saved_edit(update, context, transcript)
         except Exception as exc:
             logger.exception('Voice edit failed')
             context.user_data['editing_reference']=reference
@@ -4630,12 +4654,403 @@ async def process_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _itinerary_detail_command(text):
     """Return basic/detailed when the owner explicitly requests an itinerary detail level."""
-    low = str(text or "").lower().strip()
-    if re.search(r"\b(basic|short|brief)\s+(itinerary|plan)\b", low) or low in {"basic itinerary", "basic plan", "short itinerary", "basic"}:
+    low = re.sub(r"\s+", " ", str(text or "").lower().strip())
+    basic_patterns = (
+        r"\b(?:basic|short|brief)\s+(?:day[- ]?wise\s+)?(?:day\s+)?(?:itinerary|plan)\b",
+        r"\b(?:basic|short|brief)\s+(?:pdf|whatsapp|draft)\b",
+    )
+    detailed_patterns = (
+        r"\b(?:detailed|detail|full|expanded|more\s+detailed|more\s+detail)\s+(?:day[- ]?wise\s+)?(?:day\s+)?(?:itinerary|plan)\b",
+        r"\b(?:detailed|detail|full|expanded)\s+(?:pdf|whatsapp|draft|quotation|quote|voucher)\b",
+    )
+    if any(re.search(p, low, re.I) for p in basic_patterns) or low in {
+        "basic itinerary", "basic plan", "basic day plan", "short itinerary", "basic"
+    }:
         return "basic"
-    if re.search(r"\b(detailed|detail|full|expanded|more detail)\s+(itinerary|plan)\b", low) or low in {"detailed itinerary", "detailed plan", "more details", "make it detailed", "detailed"}:
+    if any(re.search(p, low, re.I) for p in detailed_patterns) or low in {
+        "detailed itinerary", "detailed plan", "detailed day plan",
+        "more details", "make it detailed", "detailed"
+    }:
         return "detailed"
     return None
+
+
+def _tour_reply_variant_command(text):
+    """Parse a *pure* Tour output/detail reply.
+
+    This intentionally activates only for commands such as:
+      detailed itinerary
+      detailed day plan
+      detailed draft
+      detailed whatsapp
+      detailed pdf
+      detailed quotation
+      basic itinerary
+
+    A normal edit such as "change Day 3 and make it detailed" is left to the
+    existing Modify & Regenerate AI editor.
+    """
+    low = re.sub(r"\s+", " ", str(text or "").lower().strip())
+    if not low:
+        return None
+
+    detail = _itinerary_detail_command(low)
+    if not detail:
+        if re.search(r"\b(?:detailed|detail|expanded|full)\b", low):
+            detail = "detailed"
+        elif re.search(r"\b(?:basic|short|brief)\b", low):
+            detail = "basic"
+
+    output = None
+    if re.search(r"\b(?:whatsapp|whats\s*app|text\s+version|text\s+itinerary)\b", low):
+        output = "whatsapp"
+    elif re.search(r"\b(?:pdf|print)\b", low):
+        output = "pdf"
+    elif re.search(r"\bdraft\b", low):
+        output = "draft"
+
+    mode = None
+    if re.search(r"\b(?:quotation|quote)\b", low):
+        mode = "quotation"
+    elif re.search(r"\bvoucher\b", low):
+        mode = "voucher"
+
+    if not (detail or output or mode):
+        return None
+
+    # Strip the small command vocabulary. If meaningful edit words remain, this
+    # is not just an output/detail request and should use the normal AI editor.
+    cleaned = low
+    removable = [
+        r"\bplease\b", r"\bkindly\b", r"\bgive\b", r"\bsend\b", r"\bshow\b",
+        r"\bmake\b", r"\bcreate\b", r"\bgenerate\b", r"\bconvert\b",
+        r"\bchange\b", r"\bturn\b", r"\bregenerate\b",
+        r"\bme\b", r"\bit\b", r"\bthis\b", r"\bthe\b", r"\ba\b", r"\ban\b",
+        r"\bto\b", r"\binto\b", r"\bas\b", r"\bversion\b", r"\bof\b",
+        r"\bbasic\b", r"\bshort\b", r"\bbrief\b",
+        r"\bdetailed\b", r"\bdetail\b", r"\bexpanded\b", r"\bfull\b",
+        r"\bmore\b", r"\bdetails\b",
+        r"\bday[- ]?wise\b", r"\bday\b", r"\bplan\b", r"\bitinerary\b",
+        r"\bpdf\b", r"\bprint\b", r"\bwhatsapp\b", r"\bwhats\s*app\b",
+        r"\btext\b", r"\bdraft\b", r"\bquotation\b", r"\bquote\b", r"\bvoucher\b",
+    ]
+    for pat in removable:
+        cleaned = re.sub(pat, " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"[^a-z0-9]+", "", cleaned)
+
+    if cleaned:
+        return None
+
+    return {"detail": detail, "output": output, "mode": mode}
+
+
+async def _tour_variant_data(message, data, detail, status=None):
+    """Return the requested Basic/Detailed variant while preserving saved metadata."""
+    old = copy.deepcopy(data or {})
+    desired = detail or str(old.get("detail_level") or "basic").lower()
+    desired = "detailed" if desired == "detailed" else "basic"
+
+    if str(old.get("detail_level") or "").lower() == desired:
+        new_data = copy.deepcopy(old)
+    else:
+        new_data = await _run_ai_with_retry_status(
+            message,
+            lambda: asyncio.to_thread(
+                enhance_package_itinerary,
+                old,
+                GEMINI_API_KEY,
+                GEMINI_MODEL,
+                desired,
+            ),
+            status=status,
+        )
+        # The enhancement schema intentionally contains itinerary fields only.
+        # Merge it over the old object so customer costing / document metadata
+        # that are outside the AI schema are never lost.
+        merged = copy.deepcopy(old)
+        merged.update(new_data or {})
+        new_data = merged
+
+    new_data["detail_level"] = desired
+    if str(old.get("client_name") or "").strip():
+        new_data["client_name"] = old.get("client_name")
+    if "package_costs" in old:
+        new_data["package_costs"] = copy.deepcopy(old.get("package_costs"))
+    if "show_cost" in old:
+        new_data["show_cost"] = old.get("show_cost")
+    if old.get("document_mode"):
+        new_data["document_mode"] = old.get("document_mode")
+    return _normalize_guest_counts(new_data)
+
+
+def _apply_tour_document_mode_fields(data, mode):
+    """Apply the same title/greeting rules used by normal Tour PDF printing."""
+    d = copy.deepcopy(data or {})
+    mode = str(mode or d.get("document_mode") or "itinerary").lower()
+    if mode not in ("quotation", "voucher", "itinerary"):
+        mode = "itinerary"
+    d["document_mode"] = mode
+    guest = d.get("client_name") or "Guest"
+
+    if mode == "quotation":
+        d["document_title"] = "OFFICIAL TOUR QUOTATION"
+        d["greeting"] = (
+            f"Dear {guest},\\n\\nGreetings from MyTourBazar! We are delighted to present this official "
+            "tour quotation prepared especially for your travel requirements. The following proposal "
+            "summarizes the planned destinations, accommodation, transportation, sightseeing experiences, "
+            "inclusions and exclusions for your consideration. We look forward to arranging a comfortable "
+            "and memorable journey for you and your family.\\n\\nPlease review the itinerary and package "
+            "details carefully, and feel free to contact us for any clarification or amendment before confirmation."
+        )
+    elif mode == "voucher":
+        d["document_title"] = "OFFICIAL TOUR VOUCHER"
+        d["greeting"] = (
+            f"Dear {guest},\\n\\nGreetings from MyTourBazar! Thank you for choosing us for your journey. "
+            "Please find below your official tour voucher containing the confirmed travel plan, accommodation "
+            "schedule, services and day-wise arrangements. Kindly keep this voucher available during your "
+            "journey and review the included services and travel instructions before departure.\\n\\n"
+            "We wish you a smooth, comfortable and memorable trip."
+        )
+    else:
+        d["document_title"] = "OFFICIAL TOUR ITINERARY"
+        d["greeting"] = (
+            f"Dear {guest},\\n\\nGreetings from MyTourBazar! We are pleased to present your carefully planned "
+            "travel itinerary. This document brings together the accommodation schedule, transportation "
+            "arrangements, sightseeing experiences, inclusions and exclusions so that you have a clear "
+            "day-by-day plan for your journey.\\n\\nWe look forward to assisting you throughout your travel "
+            "and making your trip comfortable, smooth and memorable."
+        )
+    return d
+
+
+async def _reply_saved_tour_variant(message, context, reference, record, command):
+    """Reply to a generated Tour PDF with Basic/Detailed PDF/WhatsApp/Draft."""
+    old_data = copy.deepcopy(record.get("data") or {})
+    if not old_data:
+        return False
+
+    detail = command.get("detail") or record.get("detail_level") or old_data.get("detail_level") or "basic"
+    detail = "detailed" if str(detail).lower() == "detailed" else "basic"
+    output = command.get("output") or "pdf"   # PDF reply defaults to another PDF.
+    mode = command.get("mode") or record.get("document_mode") or old_data.get("document_mode") or "itinerary"
+
+    status = await message.reply_text(
+        f"🤖 *Preparing {detail.title()} Tour {output.title()}...*\\n\\n"
+        "████████░░░░░░░ 55%\\n\\n"
+        "Expanding or shortening only the day plan while preserving the confirmed Tour facts.",
+        parse_mode="Markdown",
+    )
+
+    try:
+        new_data = await _tour_variant_data(message, old_data, detail, status=status)
+        new_data["document_mode"] = mode
+
+        if output == "draft":
+            context.user_data["itinerary"] = new_data
+            context.user_data["source_text"] = record.get("source_text", "")
+            await safe_status_edit(
+                status, message,
+                f"✅ *{detail.title()} draft ready.*\\n\\n████████████████ 100%\\n\\n"
+                "Use the normal Tour buttons below for WhatsApp or PDF.",
+                parse_mode="Markdown",
+            )
+            await _send_draft_review(
+                message, context, new_data,
+                prefix=f"📝 *{detail.title()} draft created from the replied PDF.*",
+            )
+            return True
+
+        # Keep the richer data in the saved reference even when only WhatsApp is requested.
+        record["data"] = copy.deepcopy(new_data)
+        record["detail_level"] = detail
+        record["document_mode"] = mode
+
+        if output == "whatsapp":
+            update_record(reference, record)
+            context.user_data["itinerary"] = new_data
+            await safe_status_edit(
+                status, message,
+                f"✅ *{detail.title()} WhatsApp itinerary ready.*\\n\\n████████████████ 100%",
+                parse_mode="Markdown",
+            )
+            await reply_text_chunked(
+                message,
+                build_whatsapp_itinerary(new_data, detail),
+                parse_mode="Markdown",
+            )
+            await message.reply_text(
+                "You can reply again with `detailed PDF`, `basic PDF`, `detailed draft`, or another request.",
+                parse_mode="Markdown",
+            )
+            return True
+
+        # PDF: preserve the exact saved print personality of the replied PDF.
+        stored_data = _apply_tour_document_mode_fields(new_data, mode)
+        render_data = copy.deepcopy(stored_data)
+
+        if "no_cost" in record:
+            no_cost = bool(record.get("no_cost"))
+        else:
+            no_cost = not bool(
+                stored_data.get("show_cost") and stored_data.get("package_costs")
+            )
+        if no_cost:
+            render_data["show_cost"] = False
+            render_data.pop("package_costs", None)
+
+        clean = bool(record.get("agency_removed", False) or record.get("b2b", False))
+        footer_mode = "none" if clean else (
+            record.get("footer_mode") or _default_footer_mode("package")
+        )
+        page_size = record.get("page_size") or "A4"
+        logo_enabled = bool(record.get("logo_enabled", True)) and not clean
+        text_scale = float(record.get("text_scale") or load_settings().get("text_scale", 1.0))
+        logo_scale = float(record.get("logo_scale") or get_logo_scale("package"))
+        last_page = record.get("terms_choice") or get_tour_last_page()
+
+        render_record = copy.deepcopy(record)
+        render_record["_clean_agency"] = clean
+
+        final_pdf, selected_scale, filename = await _render_saved_pdf(
+            reference,
+            render_record,
+            render_data,
+            "package",
+            None,
+            page_size,
+            footer_mode,
+            logo_enabled,
+            text_scale_override=text_scale,
+            logo_scale_override=logo_scale,
+            auto_fit=False,
+            last_page=last_page,
+        )
+
+        record.update({
+            "filename": filename,
+            "data": stored_data,
+            "detail_level": detail,
+            "document_mode": mode,
+            "page_size": page_size,
+            "footer": footer_mode != "none",
+            "footer_mode": footer_mode,
+            "logo_enabled": logo_enabled,
+            "text_scale": selected_scale if selected_scale is not None else text_scale,
+            "logo_scale": logo_scale,
+            "terms_choice": last_page,
+            "agency_removed": clean,
+            "no_cost": no_cost,
+        })
+        update_record(reference, record)
+
+        await safe_status_edit(
+            status, message,
+            f"✅ *{detail.title()} PDF ready.*\\n\\n████████████████ 100%\\n\\n"
+            f"The replied PDF has been regenerated as a {detail.lower()} "
+            f"{'quotation' if mode == 'quotation' else 'voucher' if mode == 'voucher' else 'itinerary'}.",
+            parse_mode="Markdown",
+        )
+
+        title = (
+            "Tour Quotation" if mode == "quotation"
+            else "Tour Voucher" if mode == "voucher"
+            else "Tour Itinerary"
+        )
+        with open(final_pdf, "rb") as fh:
+            sent_pdf = await message.reply_document(
+                document=fh,
+                filename=filename,
+                caption=f"📄 {detail.title()} MyTourBazar {title}",
+                reply_markup=generated_document_keyboard(reference, "package"),
+            )
+        _register_reference_message(reference, sent_pdf)
+        return True
+    except Exception as exc:
+        logger.exception("Reply Tour variant generation failed")
+        await safe_status_edit(
+            status, message,
+            f"❌ *Could not create the requested Tour version.*\\n\\nReason: `{str(exc)[:900]}`",
+            parse_mode="Markdown",
+        )
+        return True
+
+
+async def _reply_draft_tour_variant(message, context, command):
+    """Reply to a Tour draft: default is another draft; explicit WhatsApp/PDF is honored."""
+    old_data = copy.deepcopy(context.user_data.get("itinerary") or {})
+    if not old_data:
+        return False
+
+    detail = command.get("detail") or old_data.get("detail_level") or "basic"
+    detail = "detailed" if str(detail).lower() == "detailed" else "basic"
+    output = command.get("output") or "draft"  # Draft reply defaults to draft first.
+    mode = command.get("mode")
+
+    status = await message.reply_text(
+        f"🤖 *Preparing {detail.title()} version from this draft...*\\n\\n"
+        "████████░░░░░░░ 55%",
+        parse_mode="Markdown",
+    )
+    try:
+        new_data = await _tour_variant_data(message, old_data, detail, status=status)
+        context.user_data["itinerary"] = new_data
+
+        if output == "whatsapp":
+            await safe_status_edit(
+                status, message,
+                f"✅ *{detail.title()} WhatsApp itinerary ready.*\\n\\n████████████████ 100%",
+                parse_mode="Markdown",
+            )
+            await reply_text_chunked(
+                message,
+                build_whatsapp_itinerary(new_data, detail),
+                parse_mode="Markdown",
+            )
+            await message.reply_text(
+                "🧭 *Tour draft actions*",
+                parse_mode="Markdown",
+                reply_markup=draft_review_keyboard(),
+            )
+            return True
+
+        if output == "pdf":
+            await safe_status_edit(
+                status, message,
+                f"✅ *{detail.title()} day plan ready for PDF.*\\n\\n████████████████ 100%",
+                parse_mode="Markdown",
+            )
+            if mode in ("quotation", "voucher"):
+                await _prepare_tour_pdf_request(message, context, detail, mode)
+            else:
+                await message.reply_text(
+                    f"📄 *{detail.title()} PDF selected.*\\n\\n"
+                    "Choose whether this should be a Tour Quotation or Tour Voucher.",
+                    parse_mode="Markdown",
+                    reply_markup=tour_pdf_mode_keyboard(detail),
+                )
+            return True
+
+        # Default for a reply to a draft: show the updated draft first.
+        await safe_status_edit(
+            status, message,
+            f"✅ *{detail.title()} draft ready.*\\n\\n████████████████ 100%\\n\\n"
+            "Now choose Modify & Regenerate, WhatsApp, Basic PDF or Detailed PDF.",
+            parse_mode="Markdown",
+        )
+        await _send_draft_review(
+            message, context, new_data,
+            prefix=f"📝 *{detail.title()} day plan prepared.*",
+        )
+        return True
+    except Exception as exc:
+        logger.exception("Draft reply Tour variant failed")
+        context.user_data["itinerary"] = old_data
+        await safe_status_edit(
+            status, message,
+            f"❌ *Could not prepare the requested draft version.*\\n\\nReason: `{str(exc)[:900]}`",
+            parse_mode="Markdown",
+        )
+        return True
 
 
 def build_whatsapp_itinerary(data, detail_level=None):
@@ -5082,7 +5497,7 @@ async def generate_tour_pdf_final(message, context, data, detail='basic', no_cos
     await asyncio.to_thread(_apply_footer_mode, wm_pdf, final_pdf, footer_mode)
     wm_pdf.unlink(missing_ok=True)
     ref = reference or create_reference()
-    save_record(ref, {'type':'package','filename':filename,'data':stored_data,'fare':None,'source_text':context.user_data.get('source_text',''),'detail_level':detail,'terms_choice':last_page,'document_mode':document_mode,'b2b':bool(context.user_data.get('pending_b2b')),'footer':footer_mode!='none','footer_mode':footer_mode,'logo_enabled':not clean,'page_size':size,'agency_removed':clean,'text_scale':float(load_settings().get('text_scale',1.0)),'logo_scale':float(get_logo_scale('package')),'auto_creation':bool(context.user_data.get('auto_creation'))})
+    save_record(ref, {'type':'package','filename':filename,'data':stored_data,'fare':None,'source_text':context.user_data.get('source_text',''),'detail_level':detail,'terms_choice':last_page,'document_mode':document_mode,'b2b':bool(context.user_data.get('pending_b2b')),'footer':footer_mode!='none','footer_mode':footer_mode,'logo_enabled':not clean,'page_size':size,'agency_removed':clean,'text_scale':float(load_settings().get('text_scale',1.0)),'logo_scale':float(get_logo_scale('package')),'auto_creation':bool(context.user_data.get('auto_creation')),'no_cost':bool(no_cost)})
     caption_prefix = "🤖 Auto-Created MyTourBazar" if context.user_data.get('auto_creation') else "📄 MyTourBazar"
     caption = f"{caption_prefix} {data.get('document_title','OFFICIAL TOUR ITINERARY').title()}\n\n📜 Last page: {terms_label(last_page)}"
     with open(final_pdf,'rb') as fh:
