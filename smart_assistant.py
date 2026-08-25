@@ -249,8 +249,8 @@ def classify(parts, text, api_key, model):
 NEW_TOUR_BRIEF_PROMPT = """
 You are MyTourBazar's senior tour planner.
 
-The OWNER is asking you to CREATE a brand-new customer itinerary from a natural-language brief.
-This is NOT supplier extraction.
+The OWNER is asking you to CREATE a brand-new CLIENT-READY customer itinerary from a natural-language brief.
+This is a QUICK ITINERARY request, NOT supplier extraction. Build the itinerary yourself from the destination, duration and services supplied by the owner, using normal travel-planning knowledge while never inventing confirmed booking facts.
 
 Build a polished, practical day-wise tour plan using the owner's stated requirements and normal
 destination knowledge. Return ONLY JSON matching the itinerary schema.
@@ -273,7 +273,7 @@ STRICT FACT RULES:
 - When the owner explicitly gives a selling price/rate, preserve it as customer-facing costing.
 
 DAY PLAN:
-- Create exactly the number of days requested.
+- Create exactly the number of days requested. For example, 4N/5D must produce exactly 5 day-plan entries.
 - Use a sensible route and sightseeing sequence for the destination.
 - Explicitly include every sightseeing/place the owner requested.
 - When the owner gives broad sightseeing such as "North & South Goa sightseeing", create a sensible,

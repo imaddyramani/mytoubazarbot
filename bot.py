@@ -2442,8 +2442,9 @@ async def smart_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["smart_files"] = []
     context.user_data["smart_text"] = ""
     await update.message.reply_text(
-        "🤖 *MyTourBazar AI Assistant*\n\n"
-        "What do you want me to make or change? Tell me in your own words — short details are enough.\n\n"
+        "🤖 *MyTourBazar AI Assistant • Quick Client Itinerary*\n\n"
+        "For a quick client enquiry, just send the details naturally — no prefix is required. "
+        "I will create the full day-wise itinerary myself and open the same Tour draft/output workflow.\n\n"
         "For example:\n"
         "• `Make a 4 night / 5 day Goa package for Mr. Amit, 2 adults, 3-star hotels, breakfast, private cab, North & South Goa sightseeing.`\n"
         "• `Make a 5 night / 6 day Kashmir family package, 4 adults, 3-star hotels, breakfast and private vehicle.`\n"
@@ -2451,7 +2452,7 @@ async def smart_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "I will automatically understand the destination, duration, hotel category, meals, vehicle, sightseeing and other details.\n"
         "✈️ If you do not mention a flight/train/bus, I will NOT add one.\n"
         "🏨 If you do not give a hotel name, I will NOT invent one; I can show only the requested hotel category.\n\n"
-        "📥 *Drop anything here* — one or multiple supplier PDFs, screenshots or text — and I will automatically recognize Tour, Air, Bus or Hotel and create the correct MyTourBazar output.\n\n"
+        "📥 You can still drop supplier PDFs/screenshots/text when you actually want supplier extraction.\n\n"
         "🎙️ *Voice also works here:* after pressing AI Assistant, simply send a voice note and ask naturally — no prefix or command is required.\n\n"
         "Or use the quick Air / Hotel / Bus buttons below when you want to force a specific type.",
         parse_mode="Markdown",
@@ -2476,36 +2477,54 @@ def _smart_mtb_edit_request(text):
 
 
 def _looks_like_new_tour_brief(text):
-    """Deterministically catch owner-written new Tour/quotation briefs with no prefix."""
+    """Catch quick client Tour briefs with or without command words.
+
+    Examples:
+      Goa 4N 5D, Mr Amit, 2 adults, 3 star, breakfast, private cab
+      Kashmir 5 nights 6 days, 4 adults, 3 star, breakfast
+      Make a Goa package...
+    """
     t = str(text or "").strip()
     low = t.lower()
     if not low:
         return False
 
-    # Existing-reference edits must never become new Tours.
+    # A saved-reference edit is not a new quick itinerary.
     if _smart_mtb_edit_request(t)[0]:
         return False
 
+    # Strong duration forms: 4N 5D / 4N/5D / 4 nights 5 days / 5 days.
+    duration_pair = bool(re.search(
+        r"\b\d+\s*(?:n|night|nights)\s*(?:[/+\-& ]+)?\s*\d+\s*(?:d|day|days)\b",
+        low, re.I
+    ))
+    duration_single = bool(re.search(r"\b\d+\s*(?:d|day|days|n|night|nights)\b", low, re.I))
+    duration = duration_pair or duration_single
+
+    pax = bool(re.search(
+        r"\b(?:\d+\s*(?:adult|adults|pax|person|persons|child|children|infant|infants)|couple|family)\b",
+        low, re.I
+    ))
+    hotel = bool(re.search(
+        r"\b[1-5]\s*(?:star|stars|\*)\b|\b(?:hotel|hotels|resort|resorts|accommodation)\b",
+        low, re.I
+    ))
+    service = bool(re.search(
+        r"\b(?:breakfast|dinner|lunch|meal|meals|cab|vehicle|car|transfer|transfers|"
+        r"sightseeing|pickup|drop|private|shared|cp|map|mapai)\b",
+        low, re.I
+    ))
     create_word = bool(re.search(
-        r"\b(make|create|prepare|plan|build|design|draft|quote|quotation|itinerary|package|tour|holiday|trip|voucher)\b",
-        low, re.I
-    ))
-    duration = bool(
-        re.search(r"\b\d+\s*(?:night|nights|n)\s*[/&+\- ]*\s*\d+\s*(?:day|days|d)\b", low, re.I)
-        or re.search(r"\b\d+\s*(?:days?|nights?)\b", low, re.I)
-    )
-    pax = bool(re.search(r"\b\d+\s*(?:adult|adults|pax|person|persons|couple|child|children)\b", low, re.I))
-    hotel = bool(re.search(r"\b[1-5]\s*(?:star|\*)\b|\b(?:hotel|hotels|resort|accommodation)\b", low, re.I))
-    travel_service = bool(re.search(
-        r"\b(breakfast|dinner|meal|cab|vehicle|transfer|sightseeing|pickup|drop|private|shared)\b",
+        r"\b(?:make|create|prepare|plan|build|design|draft|itinerary|package|tour|holiday|trip|quotation|quote|voucher)\b",
         low, re.I
     ))
 
-    # Common no-prefix form:
-    # "Goa 4N 5D, Mr Amit, 2 adults, 3 star, breakfast, private cab..."
-    strong_structure = duration and (pax or hotel or travel_service)
+    # The quick format does not require "make/package/tour".
+    # Duration + one more travel signal is enough.
+    if duration and (pax or hotel or service):
+        return True
 
-    return bool(create_word and (duration or pax or hotel or travel_service) or strong_structure)
+    return bool(create_word and (duration or pax or hotel or service))
 
 
 def _smart_requested_tour_mode(text):
@@ -2699,28 +2718,32 @@ async def smart_process(update, context):
                 data["document_mode"] = requested_mode or "itinerary"
                 data["show_cost"] = bool(data.get("package_costs"))
 
-                # Convert the Smart Assistant request into the normal simplified
-                # Tour draft/output workflow. No Tour Guide prefix/button is needed.
+                # V169: Quick Client Itinerary must enter the SAME normal Tour
+                # draft/review/output workflow used by Tour Guide after extraction.
+                # This gives Modify & Regenerate, Basic/Detailed WhatsApp,
+                # Basic/Detailed PDF, then Quotation/Voucher selection.
                 context.user_data.clear()
-                context.user_data["tour_v2"] = True
-                context.user_data["tour_v2_phase"] = "choose_output"
+                context.user_data["quick_ai_tour"] = True
                 context.user_data["smart_owner_brief"] = True
-                context.user_data["smart_requested_document_mode"] = requested_mode
-                context.user_data["smart_requested_detail"] = requested_detail
                 context.user_data["source_text"] = smart_text_value
                 context.user_data["itinerary"] = data
                 context.user_data["_source_status_message"] = status
-
-                if requested_mode:
-                    context.user_data["pending_tour_document_mode"] = requested_mode
+                context.user_data["pending_tour_document_mode"] = "itinerary"
+                context.user_data["pending_tour_pdf_no_cost"] = not bool(
+                    data.get("show_cost") and data.get("package_costs")
+                )
 
                 await safe_status_edit(
                     status,
                     update.message,
-                    "✅ *Tour itinerary created from your brief.*\n\n████████████████ 100%\n\nReview the draft and choose WhatsApp or PDF below.",
+                    "✅ *Quick client itinerary created.*\n\n"
+                    "████████████████ 100%\n\n"
+                    "Review the client draft below. You can Modify & Regenerate it, "
+                    "send Basic/Detailed WhatsApp, or create Basic/Detailed PDF and then choose Quotation/Voucher.",
                     parse_mode="Markdown",
                 )
-                await _tour_v2_after_initial_extract(update.message, context, data)
+
+                await continue_tour_preprint_options(update.message, context, data)
                 return ConversationHandler.END
 
             # Supplier package material goes directly into the authoritative source
@@ -2813,6 +2836,27 @@ async def smart_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📎 Send the next supplier PDF/screenshot or paste more text.", reply_markup=smart_source_keyboard())
         return SMART_INPUT
     context.user_data["smart_text"] = (context.user_data.get("smart_text", "") + "\n" + text).strip()
+
+    # V169 QUICK CLIENT ITINERARY:
+    # When AI Assistant receives a natural no-prefix Tour brief, process it
+    # immediately as a new client itinerary. Do not treat it as supplier text
+    # and do not wait for the source-batch timer.
+    if (
+        context.user_data.get("smart_mode")
+        and not context.user_data.get("auto_creation")
+        and not context.user_data.get("smart_files")
+        and _looks_like_new_tour_brief(context.user_data.get("smart_text", ""))
+        and not _looks_like_supplier_material(context.user_data.get("smart_text", ""))
+    ):
+        _cancel_source_auto_process(context)
+        status = await update.message.reply_text(
+            "⚡ *Quick client itinerary request received.*\n\n"
+            "🧠 I’ll build the day-wise Tour itinerary myself from these details and then open the normal Tour workflow.",
+            parse_mode="Markdown",
+        )
+        context.user_data["_source_status_message"] = status
+        return await smart_process(update, context)
+
     if context.user_data.get("auto_creation"):
         msg=await _source_ack_message(
             update, context,
@@ -2866,7 +2910,7 @@ async def smart_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_status_edit(
             status,
             msg,
-            "✅ *Voice request understood.*\\n\\n🧠 Sending it to AI Assistant now...",
+            "✅ *Voice request understood.*\\n\\n🧠 Building the requested itinerary / action now...",
             parse_mode="Markdown",
         )
         await msg.reply_text("🎙️ *I understood:*\\n" + transcript, parse_mode="Markdown")
@@ -4780,7 +4824,7 @@ def build_confirmation(d):
 def draft_review_keyboard():
     """Draft actions: edit, WhatsApp preview, PDF detail choice, or confirm Done."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton('✏️ Smart Edit Draft', callback_data='draft_edit')],
+        [InlineKeyboardButton('🛠️ Modify & Regenerate', callback_data='draft_edit')],
         [InlineKeyboardButton('📱 Basic WhatsApp', callback_data='tour_output:whatsapp:basic'),
          InlineKeyboardButton('📱 Detailed WhatsApp', callback_data='tour_output:whatsapp:detailed')],
         [InlineKeyboardButton('📄 Basic PDF', callback_data='tour_output:pdf:basic'),
@@ -4872,7 +4916,7 @@ async def _send_draft_review(message, context, data, prefix=None):
         sent.append(await message.reply_text(chunk, parse_mode='Markdown' if len(chunks)==1 else None))
     # Put the live draft actions on a fresh dynamic message. This prevents stale
     # inline buttons from earlier workflow stages from remaining attached to the draft.
-    sent.append(await message.reply_text('🧭 *Draft actions*\nChoose one:', parse_mode='Markdown', reply_markup=draft_review_keyboard()))
+    sent.append(await message.reply_text('🧭 *Tour draft actions*\n\n• Modify & Regenerate the draft\n• Basic / Detailed WhatsApp\n• Basic / Detailed PDF → Quotation / Voucher', parse_mode='Markdown', reply_markup=draft_review_keyboard()))
     # Keep a rolling set so Telegram Reply on any recent draft message is routed
     # straight into the draft editor without requiring the Smart Edit button.
     prior=[int(x) for x in (context.user_data.get('tour_draft_message_ids') or []) if str(x).isdigit()]
@@ -5512,7 +5556,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             return
         context.user_data['editing_current_itinerary'] = True
         await query.message.reply_text(
-            '✏️ *Smart Edit Draft*\n\n'
+            '🛠️ *Modify & Regenerate*\n\n'
             'Tell me exactly what you want changed. I will update the draft only — no PDF will be generated yet.\n\n'
             'Examples:\n'
             '• `Change Day 2 sightseeing to Sonmarg.`\n'
@@ -5566,7 +5610,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             return
         context.user_data["editing_current_itinerary"] = True
         await query.message.reply_text(
-            "✏️ *Smart Edit Draft*\n\nTell me naturally what you want changed. I will update the current draft only — the PDF is generated when you tap Done.",
+            "🛠️ *Modify & Regenerate*\n\nTell me naturally what you want changed. I will update the current draft only. After the updated draft is ready, you can again choose WhatsApp or PDF.",
             parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
         )
         return
