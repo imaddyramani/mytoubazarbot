@@ -214,20 +214,15 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
         arr_terminal=_text(s.get('arr_terminal'))
         dep_airport=_text(s.get('dep_airport'))
         arr_airport=_text(s.get('arr_airport'))
-        # Full supplier airport wording wraps naturally. Terminal stays directly underneath
-        # the relevant Departure/Arrival airport and is never hidden because of text length.
+        # V173 TERMINAL ENDPOINT LOCK:
+        # Never append a free-floating terminal value in the renderer. The full
+        # validated airport endpoint text is authoritative. Genuine terminals are
+        # already bound to the correct airport by the extractor.
         def airport_with_terminal(airport, terminal):
             airport=_text(airport)
-            terminal=_text(terminal)
-            if not airport and not terminal:
-                return ''
-            # Keep supplier endpoint wording as one coherent line whenever the
-            # terminal was extracted separately. If airport already contains it,
-            # do not duplicate it.
-            endpoint=airport
-            if terminal and terminal.lower() not in airport.lower():
-                endpoint=(airport + ' ' + terminal).strip()
-            return _optional_line(endpoint, 'airport-full')
+            if airport:
+                return _optional_line(airport, 'airport-full')
+            return ''
         dep_airport_html=airport_with_terminal(dep_airport, dep_terminal)
         arr_airport_html=airport_with_terminal(arr_airport, arr_terminal)
         duration=_text(s.get("duration"))

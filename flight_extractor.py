@@ -62,6 +62,7 @@ Extract ONLY the booking data required for our customer-facing Air Print:
 - departure/arrival date, local time, city, and the COMPLETE airport/location wording exactly as printed by the supplier. Never shorten a long airport name. Preserve airport qualifiers such as International, Domestic, Airport, Terminal, Gate-area wording, city/airport combinations and punctuation when they are part of the supplier text. Use dep_airport / arr_airport for the full printed airport text and dep_code / arr_code for a printed 3-letter IATA code.
 - terminal is CRITICAL WHEN PRESENT IN THE SOURCE: capture T1/T2/T3, Terminal 1/2/3, 2A/2B, domestic/international terminal labels, etc. in dep_terminal / arr_terminal.
 - AIRPORT + TERMINAL SOURCE TRUTH: dep_airport / arr_airport must preserve the COMPLETE endpoint wording exactly as the supplier prints it. If the supplier prints `Guwahati - Lokpriya Gopinath Bordoloi Terminal 2`, keep that full wording in dep_airport AND set dep_terminal=`Terminal 2`. Never shorten the airport name and never move a terminal to the wrong endpoint.
+- TERMINAL ENDPOINT LOCK: whenever a terminal is genuinely printed separately from an airport name (for example a separate `Terminal 2` column/line), ALSO append that exact terminal wording to the SAME endpoint's dep_airport/arr_airport value. This duplicated support is intentional and lets the deterministic validator prove terminal ownership. NEVER place a terminal into the other endpoint or the next flight sector.
 - cabin, exact elapsed flight duration and stops WHEN PRINTED. Search carefully for Duration / Travel Time / Elapsed Time. If the supplier prints duration, it must be copied exactly; if it does not, leave it empty rather than calculating or inventing it.
 - EVERY payment/fare charge line when explicitly printed. Preserve the original label and order in payment_items (examples: Air Fare Charges, Fuel Surcharge/YQ/YR, Fees and Taxes, Seat, Meal, Baggage, Ancillary, Convenience Fee, Service Fee, GST/K3). Never omit a monetary line merely because it is not called base fare or tax.
 - gross_total = the supplier final payable/total amount exactly as printed. base_fare and taxes are compatibility summary fields only.
@@ -91,7 +92,8 @@ SEGMENT FIELDS — STRICT:
 - Preserve the COMPLETE printed airport/location wording exactly as shown by the supplier. Never shorten or summarize airport names.
 - If terminal wording is part of the supplier endpoint line, keep it in dep_airport / arr_airport too. Example: source `Guwahati - Lokpriya Gopinath Bordoloi Terminal 2` -> dep_airport must retain that complete wording and dep_terminal=`Terminal 2`.
 - VALIDATE EVERY departure and arrival terminal FROM SCRATCH. A terminal belongs ONLY to the exact endpoint beside which the supplier prints it.
-- If CURRENT EXTRACTION contains a terminal not visibly attached to that endpoint, CLEAR the terminal field.
+- If a terminal is genuinely visible for an endpoint, put the terminal in BOTH that endpoint's airport text and its terminal field. Example: dep_airport=`Guwahati - Lokpriya Gopinath Bordoloi Terminal 2`, dep_terminal=`Terminal 2`.
+- If CURRENT EXTRACTION contains a terminal not visibly attached to that exact endpoint, CLEAR the terminal field. Do not copy it to arrival, connection airport, next-sector departure, or destination.
 - Recognize T1/T2/T3, Terminal 1/2/3, 2A/2B, domestic/international terminal wording exactly when printed.
 - Never copy a departure terminal into arrival or an arrival terminal into departure.
 - Copy exact departure/arrival dates and local times, including overnight arrival dates.
@@ -276,12 +278,98 @@ def _explicit_customer_mobile_from_text(raw_text):
     return value if 10 <= len(digits) <= 15 else ''
 
 
+def _terminal_key(value):
+    """Normalize Terminal 2 / T2 / 2A into a comparable source key."""
+    s = re.sub(r'\s+', ' ', str(value or '')).strip().lower()
+    if not s:
+        return ''
+    m = re.search(r'\bterminal\s*([a-z]?\d+[a-z]?|domestic|international)\b', s, re.I)
+    if m:
+        return re.sub(r'\s+', '', m.group(1)).lower()
+    m = re.search(r'\bt\s*([1-9]\d*[a-z]?)\b', s, re.I)
+    if m:
+        return m.group(1).lower()
+    m = re.fullmatch(r'\s*([1-9]\d*[a-z])\s*', s, re.I)
+    if m:
+        return m.group(1).lower()
+    if 'domestic terminal' in s or s == 'domestic':
+        return 'domestic'
+    if 'international terminal' in s or s == 'international':
+        return 'international'
+    return ''
+
+
+def _airport_terminal_key(airport):
+    s = re.sub(r'\s+', ' ', str(airport or '')).strip().lower()
+    if not s:
+        return ''
+    m = re.search(r'\bterminal\s*([a-z]?\d+[a-z]?|domestic|international)\b', s, re.I)
+    if m:
+        return re.sub(r'\s+', '', m.group(1)).lower()
+    m = re.search(r'\bt\s*([1-9]\d*[a-z]?)\b', s, re.I)
+    if m:
+        return m.group(1).lower()
+    if 'domestic terminal' in s:
+        return 'domestic'
+    if 'international terminal' in s:
+        return 'international'
+    return ''
+
+
 def _airport_contains_terminal(airport, terminal):
-    airport = re.sub(r'\s+', ' ', str(airport or '')).strip().lower()
-    terminal = re.sub(r'\s+', ' ', str(terminal or '')).strip().lower()
-    if not airport or not terminal:
-        return False
-    return terminal in airport
+    """True only when THIS endpoint's airport text proves THIS terminal."""
+    tk = _terminal_key(terminal)
+    ak = _airport_terminal_key(airport)
+    return bool(tk and ak and tk == ak)
+
+
+def _append_source_terminal_to_airport(airport, terminal):
+    airport = re.sub(r'\s+', ' ', str(airport or '')).strip()
+    terminal = re.sub(r'\s+', ' ', str(terminal or '')).strip()
+    if not terminal:
+        return airport
+    if _airport_contains_terminal(airport, terminal):
+        return airport
+    return (airport + ' ' + terminal).strip() if airport else terminal
+
+
+def _enforce_terminal_endpoint_truth(data):
+    """Final terminal safety gate.
+
+    A terminal survives ONLY if the same departure/arrival endpoint's airport
+    string independently contains the equivalent terminal marker. This blocks
+    Terminal 2 from one airport leaking into later connection/destination rows.
+    """
+    for seg in data.get('segments') or []:
+        for airport_key, terminal_key in (
+            ('dep_airport', 'dep_terminal'),
+            ('arr_airport', 'arr_terminal'),
+        ):
+            airport = re.sub(r'\s+', ' ', str(seg.get(airport_key) or '')).strip()
+            terminal = re.sub(r'\s+', ' ', str(seg.get(terminal_key) or '')).strip()
+            seg[airport_key] = airport
+            seg[terminal_key] = terminal
+
+            ak = _airport_terminal_key(airport)
+            tk = _terminal_key(terminal)
+
+            # Airport wording itself is the authoritative endpoint evidence.
+            if ak and not tk:
+                m = re.search(r'\bTerminal\s*([A-Za-z]?\d+[A-Za-z]?|Domestic|International)\b', airport, re.I)
+                if m:
+                    seg[terminal_key] = 'Terminal ' + m.group(1)
+                else:
+                    m = re.search(r'\bT\s*([1-9]\d*[A-Za-z]?)\b', airport, re.I)
+                    if m:
+                        seg[terminal_key] = 'T' + m.group(1)
+                continue
+
+            # Terminal field without matching endpoint evidence is leakage.
+            if tk and ak != tk:
+                seg[terminal_key] = ''
+
+    return data
+
 
 def _recover_source_only_fields(data, raw_text):
     """Repair Gemini omissions using literal text already printed by the supplier."""
@@ -328,6 +416,11 @@ def _recover_source_only_fields(data, raw_text):
         )
         seg['dep_terminal']=source_dep_terminal
         seg['arr_terminal']=source_arr_terminal
+        # Literal source text that proves a terminal binds it to THIS endpoint.
+        if source_dep_terminal:
+            seg['dep_airport']=_append_source_terminal_to_airport(seg.get('dep_airport'), source_dep_terminal)
+        if source_arr_terminal:
+            seg['arr_airport']=_append_source_terminal_to_airport(seg.get('arr_airport'), source_arr_terminal)
 
     for pax in data.get('passengers') or []:
         for key in ('name','title','ticket_number','type','dob','baggage'):
@@ -490,6 +583,10 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         # Deterministic source-only recovery: selectable supplier text wins over AI omissions.
         # This is especially useful for Terminal / Aircraft / Cabin / Stops labels in agency PDFs.
         data=_recover_source_only_fields(data, raw_source_text)
+
+        # FINAL TERMINAL ENDPOINT LOCK for every supplier format (PDF/image/text).
+        # A terminal survives only when its own endpoint airport wording supports it.
+        data=_enforce_terminal_endpoint_truth(data)
 
         # Fare recovery: if the main extraction misses a clearly printed supplier
         # total, run a focused multimodal fare pass before declaring the fare absent.
