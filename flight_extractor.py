@@ -51,14 +51,17 @@ PROMPT='''You are MyTourBazar's FAST flight-ticket extraction engine.
 IMPORTANT: Do NOT read or summarize the supplier's general terms, conditions, offers, marketing text, baggage policy paragraphs, refund/cancellation rules, legal notices, loyalty-program information, payment instructions, or other text that is not needed for the itinerary. Ignore those sections completely.
 
 Extract ONLY the booking data required for our customer-facing Air Print:
-- booking ID and booking date
+- booking ID
+- booking date ONLY when the supplier explicitly prints a booking/issued/booked-on date. CRITICAL: the travel/departure date is NEVER a booking date. If no explicit booking date is printed, booking_date MUST be an empty string.
 - airline PNR and GDS PNR
+- customer mobile ONLY when the supplier explicitly prints a customer/passenger/contact mobile or phone number. If no customer mobile is printed, mobile MUST be an empty string. NEVER use an airline phone number, support number, flight number, PNR, ticket number, Trip ID or any other number as customer mobile.
 - passenger names, passenger title (Mr./Mrs./Ms./Master/Miss/etc.), ticket numbers, passenger type, date of birth and baggage
 - airline/carrier name and every FULL flight number, including the airline code (example: `6E 405`, not just `405`)
 - aircraft type/model when it is explicitly printed by the supplier (example: Airbus A320neo); otherwise return an empty string
 - every separate flight sector, including connecting/onward/return sectors
 - departure/arrival date, local time, city, and the COMPLETE airport/location wording exactly as printed by the supplier. Never shorten a long airport name. Preserve airport qualifiers such as International, Domestic, Airport, Terminal, Gate-area wording, city/airport combinations and punctuation when they are part of the supplier text. Use dep_airport / arr_airport for the full printed airport text and dep_code / arr_code for a printed 3-letter IATA code.
-- terminal is CRITICAL WHEN PRESENT IN THE SOURCE: capture T1/T2/T3, Terminal 1/2/3, 2A/2B, domestic/international terminal labels, etc. in dep_terminal / arr_terminal, but ALSO keep the complete airport wording in dep_airport / arr_airport. Never discard terminal text just because the airport string is long.
+- terminal is CRITICAL WHEN PRESENT IN THE SOURCE: capture T1/T2/T3, Terminal 1/2/3, 2A/2B, domestic/international terminal labels, etc. in dep_terminal / arr_terminal.
+- AIRPORT + TERMINAL SOURCE TRUTH: dep_airport / arr_airport must preserve the COMPLETE endpoint wording exactly as the supplier prints it. If the supplier prints `Guwahati - Lokpriya Gopinath Bordoloi Terminal 2`, keep that full wording in dep_airport AND set dep_terminal=`Terminal 2`. Never shorten the airport name and never move a terminal to the wrong endpoint.
 - cabin, exact elapsed flight duration and stops WHEN PRINTED. Search carefully for Duration / Travel Time / Elapsed Time. If the supplier prints duration, it must be copied exactly; if it does not, leave it empty rather than calculating or inventing it.
 - EVERY payment/fare charge line when explicitly printed. Preserve the original label and order in payment_items (examples: Air Fare Charges, Fuel Surcharge/YQ/YR, Fees and Taxes, Seat, Meal, Baggage, Ancillary, Convenience Fee, Service Fee, GST/K3). Never omit a monetary line merely because it is not called base fare or tax.
 - gross_total = the supplier final payable/total amount exactly as printed. base_fare and taxes are compatibility summary fields only.
@@ -74,21 +77,28 @@ For each passenger:
 - Preserve date of birth when printed. Never invent a DOB. For children and infants, DOB is especially important and must be returned whenever it is present in the supplier source.
 If fare is not printed, return base_fare=0, taxes=0, gross_total=0 and payment_items=[]. Return ONLY JSON matching the supplied schema.'''
 
-REPAIR_PROMPT='''You are MyTourBazar's source-only flight-detail validation pass.
-Re-read ALL supplied flight source pages/images/text carefully and return a corrected JSON object matching the schema. Only copy facts that are actually visible in the supplier source.
+REPAIR_PROMPT='''You are MyTourBazar's STRICT SOURCE-TRUTH flight validation pass.
 
-PAY SPECIAL ATTENTION TO:
-- 3-letter departure and arrival IATA codes for EVERY sector (dep_code / arr_code)
-- the COMPLETE printed airport/location wording, even when it is long. Never shorten or summarize airport text.
-- VALIDATE EVERY departure and arrival terminal FROM SCRATCH. A terminal belongs ONLY to the airport endpoint beside which the supplier prints it. Never copy a departure terminal into arrival or an arrival terminal into departure.
-- If CURRENT EXTRACTION contains a terminal that is not visibly attached to that endpoint in the supplier source, CLEAR that terminal field to an empty string.
-- Recognize T1, T2, T3, Terminal 1/2/3, 2A, 2B, domestic/international terminal wording only when actually printed for that endpoint.
-- exact departure and arrival dates/times when printed, including overnight arrival dates
-- exact flight duration / elapsed time / travel time whenever printed
-- never merge connecting sectors
+Re-read ALL supplied flight source pages/images/text from scratch. The CURRENT EXTRACTION is only an UNTRUSTED candidate. Every corrected value must be supported by the visible supplier source.
 
-Do not invent terminal numbers. If a terminal is not explicitly printed for that specific departure/arrival endpoint, return an empty string for that terminal. Do not guess from common airline operations.
-Do not invent or calculate duration if it is not printed. Leave it empty.
+TOP-LEVEL FIELDS — STRICT:
+- booking_date: copy ONLY an explicitly labelled booking/issued/booked-on date such as `Booking Date`, `Booked on`, `Booked Date`, `Issued on`, or equivalent. A travel/departure/arrival date is NEVER a booking date. If no explicit booking date is visible, return booking_date="".
+- mobile: copy ONLY an explicitly printed CUSTOMER/PASSENGER/CONTACT mobile or phone number. If no customer mobile is visible, return mobile="". NEVER copy airline/customer-care/support numbers, flight numbers, ticket numbers, PNRs, Trip IDs or random numeric strings into mobile.
+- booking_id, airline_pnr, gds_pnr and status must also come only from the source.
+
+SEGMENT FIELDS — STRICT:
+- Verify the 3-letter departure and arrival IATA codes for EVERY sector.
+- Preserve the COMPLETE printed airport/location wording exactly as shown by the supplier. Never shorten or summarize airport names.
+- If terminal wording is part of the supplier endpoint line, keep it in dep_airport / arr_airport too. Example: source `Guwahati - Lokpriya Gopinath Bordoloi Terminal 2` -> dep_airport must retain that complete wording and dep_terminal=`Terminal 2`.
+- VALIDATE EVERY departure and arrival terminal FROM SCRATCH. A terminal belongs ONLY to the exact endpoint beside which the supplier prints it.
+- If CURRENT EXTRACTION contains a terminal not visibly attached to that endpoint, CLEAR the terminal field.
+- Recognize T1/T2/T3, Terminal 1/2/3, 2A/2B, domestic/international terminal wording exactly when printed.
+- Never copy a departure terminal into arrival or an arrival terminal into departure.
+- Copy exact departure/arrival dates and local times, including overnight arrival dates.
+- Copy exact flight duration / elapsed time / travel time only when printed.
+- Never merge connecting sectors.
+- Never invent or calculate missing values.
+
 Return ONLY JSON matching the schema.'''
 
 
@@ -226,6 +236,53 @@ def _terminal_after_anchor(block, anchors, stop_anchors=()):
     m=re.search(r'\b(?:Terminal\s*(?:No\.?\s*)?[A-Z0-9-]+|T\s*[1-9][A-Z]?|[1-9][A-Z]?\s*Terminal)\b', chunk, re.I)
     return re.sub(r'\s+',' ',m.group(0)).strip() if m else ''
 
+
+def _explicit_booking_date_from_text(raw_text):
+    """Return a booking date only when an explicit booking-date label exists."""
+    if not raw_text:
+        return ''
+    patterns = (
+        r'(?i)\b(?:booking\s*date|booked\s*(?:on|date)|date\s*of\s*booking|issued\s*(?:on|date)|ticketed\s*(?:on|date))\s*[:\-]?\s*'
+        r'([0-3]?\d[\s./-]+(?:[A-Za-z]{3,9}|\d{1,2})[\s./-]+\d{2,4})',
+        r'(?i)\b(?:booking\s*date|booked\s*(?:on|date)|date\s*of\s*booking|issued\s*(?:on|date)|ticketed\s*(?:on|date))\s*[:\-]?\s*'
+        r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
+    )
+    for pat in patterns:
+        m = re.search(pat, raw_text)
+        if m:
+            return re.sub(r'\s+', ' ', m.group(1)).strip()
+    return ''
+
+
+def _explicit_customer_mobile_from_text(raw_text):
+    """Return only a number explicitly labelled as the customer's contact number."""
+    if not raw_text:
+        return ''
+    # Deliberately narrow labels. Generic airline/support/contact-centre numbers
+    # must not be treated as the passenger's mobile.
+    pat = re.compile(
+        r'(?i)\b(?:customer\s*(?:mobile|phone|contact(?:\s*no\.?)?)|'
+        r'passenger\s*(?:mobile|phone|contact(?:\s*no\.?)?)|'
+        r'guest\s*(?:mobile|phone|contact(?:\s*no\.?)?)|'
+        r'mobile\s*(?:no\.?|number)?|contact\s*mobile)\s*[:\-]?\s*'
+        r'(\+?\d[\d\s().-]{7,18}\d)'
+    )
+    m = pat.search(raw_text)
+    if not m:
+        return ''
+    value = re.sub(r'\s+', ' ', m.group(1)).strip()
+    # Reject strings that look like short booking/flight identifiers rather than phones.
+    digits = re.sub(r'\D', '', value)
+    return value if 10 <= len(digits) <= 15 else ''
+
+
+def _airport_contains_terminal(airport, terminal):
+    airport = re.sub(r'\s+', ' ', str(airport or '')).strip().lower()
+    terminal = re.sub(r'\s+', ' ', str(terminal or '')).strip().lower()
+    if not airport or not terminal:
+        return False
+    return terminal in airport
+
 def _recover_source_only_fields(data, raw_text):
     """Repair Gemini omissions using literal text already printed by the supplier."""
     if not raw_text:
@@ -277,6 +334,13 @@ def _recover_source_only_fields(data, raw_text):
             pax[key]=_clean_source_value(pax.get(key))
     for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile'):
         data[key]=_clean_source_value(data.get(key))
+
+    # STRICT TOP-LEVEL SOURCE TRUTH:
+    # If selectable supplier text exists, booking_date and mobile survive only
+    # when an explicit matching label is present. This prevents travel dates,
+    # airline numbers or random numeric strings from leaking into those fields.
+    data['booking_date'] = _explicit_booking_date_from_text(raw_text)
+    data['mobile'] = _explicit_customer_mobile_from_text(raw_text)
 
     # Local payment-detail fallback for selectable supplier PDFs. Gemini remains the
     # primary cross-supplier reader, but obvious labelled amount rows should never be
@@ -370,16 +434,18 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         # Source-only second reading: if useful airport/terminal/duration fields are blank,
         # re-read the ORIGINAL source once. This never blocks printing and never invents data.
         useful_fields=('dep_airport','arr_airport','dep_terminal','arr_terminal','duration','dep_code','arr_code')
-        # Re-read not only when fields are missing, but also whenever a terminal was
-        # extracted. This makes the second pass verify endpoint ownership and clear
-        # unsupported/hallucinated terminal values from image-only supplier sources.
+        # Re-read not only when segment fields are missing, but also whenever a
+        # sensitive top-level field or terminal was extracted. The second pass
+        # independently verifies booking_date, customer mobile and terminal ownership.
         needs_detail_reread=(
             any(not str(seg.get(k) or '').strip() for seg in (data.get('segments') or []) for k in useful_fields)
             or any(str(seg.get('dep_terminal') or '').strip() or str(seg.get('arr_terminal') or '').strip() for seg in (data.get('segments') or []))
+            or bool(str(data.get('booking_date') or '').strip())
+            or bool(str(data.get('mobile') or '').strip())
         )
         if needs_detail_reread:
             try:
-                repair_contents=[REPAIR_PROMPT, '\nCURRENT EXTRACTION (preserve correct values and repair missing ones):\n'+json.dumps(data, ensure_ascii=False)]
+                repair_contents=[REPAIR_PROMPT, '\nCURRENT EXTRACTION (UNTRUSTED CANDIDATE — verify every value against source):\n'+json.dumps(data, ensure_ascii=False)]
                 if source_text:
                     repair_contents.append('\nSOURCE TEXT:\n'+str(source_text)[:18000])
                 for p in paths:
@@ -409,6 +475,10 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
                                     nseg[key]=value
                     for key, value in data.items():
                         if key == 'segments':
+                            continue
+                        # A blank booking_date/mobile from the validation pass is
+                        # deliberate. Never restore the first-pass hallucination.
+                        if key in ('booking_date', 'mobile'):
                             continue
                         if not repaired.get(key) and value:
                             repaired[key]=value

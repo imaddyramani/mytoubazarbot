@@ -176,6 +176,7 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
 
     logo=_uri(logo_path)
     logo_html=f'<a href="{MYTOURBAZAR_LOGO_URL}"><img class="brand-logo" src="{logo}"></a>' if logo else ''
+    customer_mobile=_text(data.get('mobile'))  # STRICT: no fallback to airline/PNR/other numbers.
     pax_rows=''.join(
         f'<tr><td>{i+1}</td><td><strong>{_esc(_display_person_name(p))}</strong></td>'
         f'<td>{_esc(p.get("ticket_number"))}</td>'
@@ -216,12 +217,17 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
         # Full supplier airport wording wraps naturally. Terminal stays directly underneath
         # the relevant Departure/Arrival airport and is never hidden because of text length.
         def airport_with_terminal(airport, terminal):
-            html=''
-            if airport:
-                html += _optional_line(airport, 'airport-full')
+            airport=_text(airport)
+            terminal=_text(terminal)
+            if not airport and not terminal:
+                return ''
+            # Keep supplier endpoint wording as one coherent line whenever the
+            # terminal was extracted separately. If airport already contains it,
+            # do not duplicate it.
+            endpoint=airport
             if terminal and terminal.lower() not in airport.lower():
-                html += f'<span class="terminal-line">{_esc(terminal)}</span><br>'
-            return html
+                endpoint=(airport + ' ' + terminal).strip()
+            return _optional_line(endpoint, 'airport-full')
         dep_airport_html=airport_with_terminal(dep_airport, dep_terminal)
         arr_airport_html=airport_with_terminal(arr_airport, arr_terminal)
         duration=_text(s.get("duration"))
@@ -269,11 +275,17 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     if isinstance(terms,str): terms=[terms]
     terms_html=''.join(f'<li>{_esc(x)}</li>' for x in terms)
 
+    booking_date=_text(data.get('booking_date'))
+    booked_on_html=(
+        f'<div class="booked-on">Booked on: {_esc(booking_date)}</div>'
+        if booking_date else ''
+    )
+
     html=f'''<!doctype html><html><head><meta charset="utf-8"><style>
 @page{{size:{page_size};margin:12mm 10mm 8mm 10mm}}*{{box-sizing:border-box}}body{{margin:0;color:#12324b;font-family:"MTBLiberationSerifBold",Georgia,serif;font-size:10.2pt;line-height:1.28}}.top{{height:33mm;position:relative;border-bottom:2.5px solid #f4a62a;margin-bottom:5mm}}.brand{{position:absolute;left:0;top:0;width:45%;height:26mm;display:flex;align-items:center}}.brand-logo{{max-width:1.55in;max-height:1.05in;object-fit:contain}}.heading{{position:absolute;right:0;top:3mm;text-align:right;color:#073450}}.heading h1{{margin:0;font-size:21pt;letter-spacing:.3px}}.heading div{{font-size:10.5pt;margin-top:2mm}}.heading .booked-on{{font-size:8.6pt;margin-top:1.1mm;color:#5d646a;font-weight:700}}.meta{{background:#f0f5fa;border:1.5px solid #9cb6cc;border-radius:6px;padding:5mm 6mm;margin-bottom:5mm}}.meta table,.pax,.flights{{width:100%;border-collapse:collapse}}.meta td{{padding:1.4mm 1mm;font-size:10.2pt}}.meta .lab{{font-weight:700;white-space:nowrap}}.meta .val{{font-weight:800;color:#063655}}.section{{background:#063655;color:#fff;padding:2.6mm 4mm;font-size:12pt;letter-spacing:.1px;border-radius:3px 3px 0 0;margin-top:4mm}}.pax,.flights{{border:1.5px solid #9cb6cc}}.pax th,.flights th{{background:#dceaf5;color:#123b58;padding:2.8mm 3mm;text-align:left;font-size:9.7pt;border-bottom:1px solid #9cb6cc}}.pax td{{padding:2.7mm 2.5mm;border-bottom:1px solid #d3e0eb;font-size:9.4pt;color:#1f2c35;vertical-align:top}}.pax th:nth-child(1),.pax td:nth-child(1){{width:6%}}.pax th:nth-child(2),.pax td:nth-child(2){{width:31%}}.pax th:nth-child(3),.pax td:nth-child(3){{width:22%}}.pax th:nth-child(4),.pax td:nth-child(4){{width:13%}}.pax th:nth-child(5),.pax td:nth-child(5){{width:13%}}.pax th:nth-child(6),.pax td:nth-child(6){{width:15%}}.flights td{{padding:4mm 3.5mm;border-bottom:1px solid #d3e0eb;vertical-align:top;font-size:9.7pt;color:#26323a;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere}}.airport-full{{display:inline;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere;line-height:1.35;color:#5d646a}}.terminal-line{{display:inline-block;margin-top:.8mm;font-size:8.8pt;font-weight:800;color:#123b58;white-space:normal}}.airline-logo-wrap{{width:88px;height:36px;display:flex;align-items:center;justify-content:flex-start;margin:0 0 2.5mm 0;overflow:hidden}}.airline-logo{{display:block;max-width:88px;max-height:36px;object-fit:contain;object-position:left center}}.airline-logo.fallback{{opacity:.88;padding:2px}}.flight-id{{font-size:8.4pt;color:#5d646a}}.flight-meta{{display:inline-block;margin-top:.7mm;font-size:8.7pt;font-weight:600;color:#5d646a}}.flights .flight-row td:first-child{{width:29%}}.flights .flight-row td:nth-child(2){{width:27%}}.flights .flight-row td:nth-child(3){{width:15%;text-align:center}}.flights .flight-row td:nth-child(4){{width:29%}}.time{{font-size:13pt;font-weight:900;color:#123b58}}.muted{{font-family:Georgia,serif;color:#5d646a;font-size:8.7pt}}.duration{{font-weight:800;color:#123b58;text-align:center;vertical-align:middle!important}}.duration-main{{display:block;font-size:10.3pt;color:#123b58;line-height:1.25}}.stops{{display:block;margin-top:1.3mm;font-size:8.8pt;color:#5d646a;line-height:1.25}}.terminal{{display:inline-block;margin-top:1.2mm;color:#073450;font-size:8.8pt}}.dash{{color:#9cb6cc;letter-spacing:1px}}.layover td{{background:#edf4fa;text-align:center;padding:2.5mm;font-size:9.6pt;font-weight:800;color:#123b58}}.fare{{margin-top:4mm;background:#f7fafc;border:1.5px solid #9cb6cc;border-radius:6px;padding:0;overflow:hidden;font-size:9.6pt;break-inside:avoid;page-break-inside:avoid}}.fare-title{{background:#e5eff7;color:#123b58;font-size:10.2pt;font-weight:900;padding:2.4mm 3.5mm;border-bottom:1px solid #b8cad9;letter-spacing:.15px}}.payment-table{{width:100%;border-collapse:collapse}}.payment-table td{{padding:2.1mm 3.5mm;border-bottom:1px solid #d7e2eb;vertical-align:middle}}.payment-table .pay-label{{text-align:left;font-weight:700;color:#334b5c}}.payment-table .pay-amount{{text-align:right;font-weight:800;color:#123b58;white-space:nowrap}}.payment-table .payment-total td{{border-bottom:0;background:#eef5fa;font-size:10.6pt;font-weight:900;color:#073450;padding-top:2.7mm;padding-bottom:2.7mm}}.payment-table .payment-total td:last-child{{text-align:right;color:#e65100;white-space:nowrap}}.terms{{border:1.5px solid #9cb6cc;border-radius:6px;padding:4mm 5mm;margin-top:5mm}}.terms h3{{margin:0 0 2mm;color:#123b58;font-size:11.5pt;border-bottom:1px solid #c6d5e2;padding-bottom:2mm}}.terms ul{{margin:0;padding-left:5mm}}.terms li{{margin:1.8mm 0;font-size:9pt;color:#26323a}}.keep{{break-inside:avoid;page-break-inside:avoid}}tr{{break-inside:avoid;page-break-inside:avoid}}strong{{font-weight:800}}
 </style></head><body>
-<div class="top"><div class="brand">{logo_html}</div><div class="heading"><h1>E-TICKET ITINERARY</h1><div>Flight Booking Confirmation</div><div class="booked-on">Booked on: {_esc(data.get('booking_date'))}</div></div></div>
-<div class="meta"><table><tr><td class="lab">Trip ID:</td><td class="val">{_esc(data.get('booking_id') or data.get('trip_id'))}</td><td class="lab">Travel Date:</td><td class="val">{_esc(data.get('travel_date') or (segs[0].get('dep_date') if segs else ''))}</td></tr><tr><td class="lab">Airline PNR:</td><td class="val">{_esc(data.get('airline_pnr'))}</td><td class="lab">GDS PNR:</td><td class="val">{_esc(data.get('gds_pnr'))}</td></tr><tr><td class="lab">Status:</td><td class="val">{_esc(data.get('status') or 'CONFIRMED')}</td><td class="lab">Customer Mobile:</td><td class="val">{_esc(data.get('mobile'))}</td></tr></table></div>
+<div class="top"><div class="brand">{logo_html}</div><div class="heading"><h1>E-TICKET ITINERARY</h1><div>Flight Booking Confirmation</div>{booked_on_html}</div></div>
+<div class="meta"><table><tr><td class="lab">Trip ID:</td><td class="val">{_esc(data.get('booking_id') or data.get('trip_id'))}</td><td class="lab">Travel Date:</td><td class="val">{_esc(data.get('travel_date') or (segs[0].get('dep_date') if segs else ''))}</td></tr><tr><td class="lab">Airline PNR:</td><td class="val">{_esc(data.get('airline_pnr'))}</td><td class="lab">GDS PNR:</td><td class="val">{_esc(data.get('gds_pnr'))}</td></tr><tr><td class="lab">Status:</td><td class="val">{_esc(data.get('status') or 'CONFIRMED')}</td><td class="lab">Customer Mobile:</td><td class="val">{_esc(customer_mobile)}</td></tr></table></div>
 <div class="section">PASSENGER INFORMATION</div><table class="pax"><thead><tr><th>#</th><th>Passenger Name</th><th>Ticket Number</th><th>Type</th><th>DOB</th><th>Baggage</th></tr></thead><tbody>{pax_rows}</tbody></table>
 <div class="section">FLIGHT DETAILS &amp; SCHEDULE{(' (CONNECTING ITINERARY)' if len(segs)>1 else '')}</div><table class="flights"><thead><tr><th>Flight &amp; Aircraft</th><th>Departure</th><th>Duration &amp; Stops</th><th>Arrival</th></tr></thead><tbody>{flight_rows}</tbody></table>
 {fare_html}<div class="terms keep"><h3>General Instructions</h3><ul>{terms_html}</ul></div>
