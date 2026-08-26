@@ -8,18 +8,18 @@ from ai_retry import call_with_high_demand_retry
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 SCHEMA={"type":"object","properties":{
  "booking_id":{"type":"string"},"booking_date":{"type":"string"},"airline_pnr":{"type":"string"},"gds_pnr":{"type":"string"},
- "status":{"type":"string"},"mobile":{"type":"string"},
+ "status":{"type":"string"},"mobile":{"type":"string"},"baggage_summary":{"type":"string"},
  "segments":{"type":"array","items":{"type":"object","properties":{
-  "flight":{"type":"string"},"flight_number":{"type":"string"},"aircraft":{"type":"string"},"cabin":{"type":"string"},
+  "flight":{"type":"string"},"flight_number":{"type":"string"},"aircraft":{"type":"string"},"cabin":{"type":"string"},"fare_type":{"type":"string"},
   "dep_time":{"type":"string"},"dep_city":{"type":"string"},"dep_code":{"type":"string"},"dep_date":{"type":"string"},"dep_airport":{"type":"string"},"dep_terminal":{"type":"string"},
   "arr_time":{"type":"string"},"arr_city":{"type":"string"},"arr_code":{"type":"string"},"arr_date":{"type":"string"},"arr_airport":{"type":"string"},"arr_terminal":{"type":"string"},
-  "duration":{"type":"string"},"stops":{"type":"string"}
- },"required":["flight","flight_number","aircraft","cabin","dep_time","dep_city","dep_code","dep_date","dep_airport","dep_terminal","arr_time","arr_city","arr_code","arr_date","arr_airport","arr_terminal","duration","stops"]}},
+  "duration":{"type":"string"},"stops":{"type":"string"},"layover":{"type":"string"}
+ },"required":["flight","flight_number","aircraft","cabin","fare_type","dep_time","dep_city","dep_code","dep_date","dep_airport","dep_terminal","arr_time","arr_city","arr_code","arr_date","arr_airport","arr_terminal","duration","stops","layover"]}},
  "passengers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"title":{"type":"string"},"ticket_number":{"type":"string"},"type":{"type":"string"},"dob":{"type":"string"},"baggage":{"type":"string"}},"required":["name","title","ticket_number","type","dob","baggage"]}},
  "base_fare":{"type":"number"},"taxes":{"type":"number"},
  "gross_total":{"type":"number"},
  "payment_items":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"amount":{"type":"number"}},"required":["label","amount"]}}
-},"required":["booking_id","booking_date","airline_pnr","gds_pnr","status","mobile","segments","passengers","base_fare","taxes","gross_total","payment_items"]}
+},"required":["booking_id","booking_date","airline_pnr","gds_pnr","status","mobile","baggage_summary","segments","passengers","base_fare","taxes","gross_total","payment_items"]}
 
 FARE_SCHEMA={"type":"object","properties":{
     "gross_total":{"type":"number"},
@@ -56,14 +56,20 @@ Extract ONLY the booking data required for our customer-facing Air Print:
 - airline PNR and GDS PNR
 - customer mobile ONLY when the supplier explicitly prints a customer/passenger/contact mobile or phone number. If no customer mobile is printed, mobile MUST be an empty string. NEVER use an airline phone number, support number, flight number, PNR, ticket number, Trip ID or any other number as customer mobile.
 - passenger names, passenger title (Mr./Mrs./Ms./Master/Miss/etc.), ticket numbers, passenger type, date of birth and baggage
+- ticket_number is NOT a PNR. Copy it only when an actual passenger ticket/e-ticket number is explicitly printed. Never put Airline PNR, GDS PNR, Trip ID or booking reference into ticket_number. If absent, leave blank.
 - airline/carrier name and every FULL flight number, including the airline code (example: `6E 405`, not just `405`)
 - aircraft type/model when it is explicitly printed by the supplier (example: Airbus A320neo); otherwise return an empty string
+- fare_type: copy the exact printed fare family/type such as SAVER/FLEX/SPECIAL. If absent, leave blank.
+- baggage_summary: copy the COMPLETE supplier baggage allowance when printed, including BOTH check-in and cabin baggage. Example: `Check-in: 15KG (1 piece), Cabin: 7KG (1 piece)`. Never drop cabin baggage.
 - every separate flight sector, including connecting/onward/return sectors
 - departure/arrival date, local time, city, and the COMPLETE airport/location wording exactly as printed by the supplier. Never shorten a long airport name. Preserve airport qualifiers such as International, Domestic, Airport, Terminal, Gate-area wording, city/airport combinations and punctuation when they are part of the supplier text. Use dep_airport / arr_airport for the full printed airport text and dep_code / arr_code for a printed 3-letter IATA code.
 - terminal is CRITICAL WHEN PRESENT IN THE SOURCE: capture T1/T2/T3, Terminal 1/2/3, 2A/2B, domestic/international terminal labels, etc. in dep_terminal / arr_terminal.
 - AIRPORT + TERMINAL SOURCE TRUTH: dep_airport / arr_airport must preserve the COMPLETE endpoint wording exactly as the supplier prints it. If the supplier prints `Guwahati - Lokpriya Gopinath Bordoloi Terminal 2`, keep that full wording in dep_airport AND set dep_terminal=`Terminal 2`. Never shorten the airport name and never move a terminal to the wrong endpoint.
-- TERMINAL ENDPOINT LOCK: whenever a terminal is genuinely printed separately from an airport name (for example a separate `Terminal 2` column/line), ALSO append that exact terminal wording to the SAME endpoint's dep_airport/arr_airport value. This duplicated support is intentional and lets the deterministic validator prove terminal ownership. NEVER place a terminal into the other endpoint or the next flight sector.
-- cabin, exact elapsed flight duration and stops WHEN PRINTED. Search carefully for Duration / Travel Time / Elapsed Time. If the supplier prints duration, it must be copied exactly; if it does not, leave it empty rather than calculating or inventing it.
+- TERMINAL ENDPOINT LOCK: a terminal belongs ONLY to the exact endpoint where the supplier visibly prints it.
+- CONNECTION SAFETY EXAMPLE: if GAU departure says `... Terminal 2` but CCU arrival says only `Kolkata - Netaji Subhas Chandra Bose Airport`, then CCU arrival terminal MUST be blank. If the next CCU departure also has no terminal, it stays blank. If RPR arrival has no terminal, it stays blank. Never repeat a previous endpoint terminal into an arrival, connection, next sector or destination.
+- cabin and exact elapsed duration ONLY when printed.
+- stops are SOURCE-ONLY. Never infer `0`, `0 stops`, `Direct` or `Non-stop` from the route. If supplier does not print it, leave blank.
+- layover: copy the exact printed layover/connection duration after the correct preceding sector. Never calculate it from times.
 - EVERY payment/fare charge line when explicitly printed. Preserve the original label and order in payment_items (examples: Air Fare Charges, Fuel Surcharge/YQ/YR, Fees and Taxes, Seat, Meal, Baggage, Ancillary, Convenience Fee, Service Fee, GST/K3). Never omit a monetary line merely because it is not called base fare or tax.
 - gross_total = the supplier final payable/total amount exactly as printed. base_fare and taxes are compatibility summary fields only.
 
@@ -77,6 +83,55 @@ For each passenger:
 - If the supplier does not explicitly print a title, use smart contextual inference only when the source itself provides enough evidence (for example a title in nearby text). Do NOT guess a person's gender from their name alone. If there is no reliable evidence, use a neutral title appropriate to the passenger type: "Mr./Ms." for an adult, "Child" for a child, and "Infant" for an infant.
 - Preserve date of birth when printed. Never invent a DOB. For children and infants, DOB is especially important and must be returned whenever it is present in the supplier source.
 If fare is not printed, return base_fare=0, taxes=0, gross_total=0 and payment_items=[]. Return ONLY JSON matching the supplied schema.'''
+
+
+SOURCE_TRUTH_PROMPT = """You are MyTourBazar's FINAL AIR SOURCE TRANSCRIBER.
+
+Read ONLY the supplied ticket/PDF/image/text. You are not given any earlier extraction.
+SOURCE PRESENT = COPY EXACTLY. SOURCE ABSENT = BLANK.
+Never guess, infer, calculate, repeat nearby values, or use airport knowledge.
+
+TOP LEVEL:
+- booking_id only if printed.
+- booking_date only if explicitly labelled Booking Date / Booked on / Issued on / Ticketed on. Travel date is never booking date.
+- airline_pnr / gds_pnr only if explicitly printed with that meaning.
+- mobile only if explicitly a customer/passenger contact. Never airline/support number.
+- baggage_summary must preserve the complete printed baggage wording, including check-in AND cabin baggage.
+
+PASSENGERS:
+- Preserve explicit name/title/type/DOB.
+- ticket_number only when an actual passenger ticket/e-ticket number is printed.
+- PNR, Trip ID and booking ID are never ticket numbers.
+- Preserve complete baggage wording when printed.
+
+EACH FLIGHT SECTOR IS INDEPENDENT:
+- exact airline and full flight number
+- aircraft only if printed
+- cabin only if printed
+- fare_type only if printed
+- exact departure time/date/city/IATA
+- dep_airport = exact complete printed departure endpoint wording
+- dep_terminal = terminal only if visibly attached to that departure endpoint
+- exact arrival time/date/city/IATA
+- arr_airport = exact complete printed arrival endpoint wording
+- arr_terminal = terminal only if visibly attached to that arrival endpoint
+- duration only if printed
+- stops only if printed; never infer 0/Non-stop
+- layover only if explicitly printed; bind it to the preceding segment
+
+TERMINAL EXAMPLE:
+If the source shows:
+GAU departure: `Guwahati - Lokpriya Gopinath Bordoloi Terminal 2`
+CCU arrival: `Kolkata - Netaji Subhas Chandra Bose Airport`
+CCU departure: `Kolkata - Netaji Subhas Chandra Bose Airport`
+RPR arrival: `Raipur - Raipur`
+then ONLY GAU gets Terminal 2. CCU arrival, CCU departure and RPR terminal fields are blank,
+and their airport strings must not contain Terminal 2.
+
+Never repeat terminal values across sectors.
+Never append a terminal just because it appeared elsewhere on the page.
+Return ONLY JSON matching the schema.
+"""
 
 REPAIR_PROMPT='''You are MyTourBazar's STRICT SOURCE-TRUTH flight validation pass.
 
@@ -216,27 +271,42 @@ def _segment_source_window(raw_text, seg):
                     return raw_text[max(0,m.start()-350):min(len(raw_text),m.end()+1800)]
     return raw_text
 
+
 def _terminal_after_anchor(block, anchors, stop_anchors=()):
-    low=block.lower()
-    positions=[]
-    for a in anchors:
-        a=_clean_source_value(a)
-        if not a: continue
-        pos=low.find(a.lower())
-        if pos>=0: positions.append((pos, len(a)))
-    if not positions:
+    """Search only the endpoint line and at most two continuation lines."""
+    if not block:
         return ''
-    pos, ln=min(positions, key=lambda x:x[0])
-    end=min(len(block), pos+650)
-    for s in stop_anchors:
-        s=_clean_source_value(s)
-        if not s: continue
-        sp=low.find(s.lower(), pos+ln)
-        if sp>=0: end=min(end, sp)
-    chunk=block[pos:end]
-    # Explicit terminal wording only; never infer a terminal number.
-    m=re.search(r'\b(?:Terminal\s*(?:No\.?\s*)?[A-Z0-9-]+|T\s*[1-9][A-Z]?|[1-9][A-Z]?\s*Terminal)\b', chunk, re.I)
-    return re.sub(r'\s+',' ',m.group(0)).strip() if m else ''
+    lines=[re.sub(r'\s+',' ',x).strip() for x in str(block).splitlines()]
+    anchors=[_clean_source_value(a) for a in anchors if _clean_source_value(a)]
+    if not anchors:
+        return ''
+    boundary=re.compile(
+        r'(?i)^(?:baggage|fare\s*type|duration|economy|business|premium|'
+        r'airline\s*pnr|gds\s*pnr|status|passenger|trip\s*id|booking|'
+        r'\d{1,2}:\d{2}|[A-Z0-9]{2,3}\s*[- ]?\s*\d{2,5})\b'
+    )
+    for i,line in enumerate(lines):
+        if not any(a.lower() in line.lower() for a in anchors):
+            continue
+        pieces=[line]
+        for j in range(i+1, min(len(lines), i+3)):
+            nxt=lines[j]
+            if not nxt:
+                continue
+            if boundary.search(nxt):
+                break
+            if any(_clean_source_value(s).lower() in nxt.lower()
+                   for s in stop_anchors if _clean_source_value(s)):
+                break
+            pieces.append(nxt)
+        chunk=' '.join(pieces)
+        m=re.search(
+            r'\b(?:Terminal\s*(?:No\.?\s*)?[A-Z0-9-]+|T\s*[1-9][A-Z]?|[1-9][A-Z]?\s*Terminal)\b',
+            chunk,re.I
+        )
+        if m:
+            return re.sub(r'\s+',' ',m.group(0)).strip()
+    return ''
 
 
 def _explicit_booking_date_from_text(raw_text):
@@ -333,6 +403,55 @@ def _append_source_terminal_to_airport(airport, terminal):
     return (airport + ' ' + terminal).strip() if airport else terminal
 
 
+
+def _norm_source_phrase(value):
+    return re.sub(r'\s+',' ',str(value or '')).strip().lower()
+
+
+def _strip_unproven_terminal_from_airport(airport, raw_text):
+    """Selectable source text must literally support a terminal-bearing airport phrase."""
+    airport=re.sub(r'\s+',' ',str(airport or '')).strip()
+    if not airport or not _airport_terminal_key(airport) or not raw_text:
+        return airport
+    if _norm_source_phrase(airport) in _norm_source_phrase(raw_text):
+        return airport
+    return re.sub(
+        r'(?i)\s*(?:,|-)?\s*(?:Terminal\s*(?:No\.?\s*)?[A-Z0-9-]+|T\s*[1-9][A-Z]?|[1-9][A-Z]?\s*Terminal)\s*$',
+        '',airport
+    ).strip(' ,-')
+
+
+def _sanitize_ticket_numbers(data):
+    forbidden={
+        re.sub(r'\W+','',str(data.get(k) or '')).upper()
+        for k in ('booking_id','airline_pnr','gds_pnr')
+        if str(data.get(k) or '').strip()
+    }
+    for pax in data.get('passengers') or []:
+        ticket=str(pax.get('ticket_number') or '').strip()
+        if ticket and re.sub(r'\W+','',ticket).upper() in forbidden:
+            pax['ticket_number']=''
+    return data
+
+
+def _sanitize_inferred_stops(data):
+    for seg in data.get('segments') or []:
+        stops=str(seg.get('stops') or '').strip()
+        if re.fullmatch(r'0(?:\s*stops?)?', stops, re.I):
+            seg['stops']=''
+    return data
+
+
+def _apply_baggage_summary(data):
+    summary=re.sub(r'\s+',' ',str(data.get('baggage_summary') or '')).strip()
+    if not summary:
+        return data
+    for pax in data.get('passengers') or []:
+        current=re.sub(r'\s+',' ',str(pax.get('baggage') or '')).strip()
+        if (not current) or (re.search(r'(?i)\bcabin\b',summary) and not re.search(r'(?i)\bcabin\b',current)):
+            pax['baggage']=summary
+    return data
+
 def _enforce_terminal_endpoint_truth(data):
     """Final terminal safety gate.
 
@@ -377,8 +496,8 @@ def _recover_source_only_fields(data, raw_text):
         return data
     for seg in data.get('segments') or []:
         # Clean model placeholders first; blank means source did not supply it.
-        for key in ('flight','flight_number','aircraft','cabin','dep_time','dep_city','dep_code','dep_date','dep_airport','dep_terminal',
-                    'arr_time','arr_city','arr_code','arr_date','arr_airport','arr_terminal','duration','stops'):
+        for key in ('flight','flight_number','aircraft','cabin','fare_type','dep_time','dep_city','dep_code','dep_date','dep_airport','dep_terminal',
+                    'arr_time','arr_city','arr_code','arr_date','arr_airport','arr_terminal','duration','stops','layover'):
             seg[key]=_clean_source_value(seg.get(key))
 
         block=_segment_source_window(raw_text, seg)
@@ -389,6 +508,12 @@ def _recover_source_only_fields(data, raw_text):
         if not seg.get('cabin'):
             m=re.search(r'\bCabin\s*[:\-]\s*([^\r\n|]{1,30})', block, re.I)
             if m: seg['cabin']=_clean_source_value(m.group(1))
+        if not seg.get('fare_type'):
+            m=re.search(r'(?i)\bFare\s*type\s*[:\-]?\s*([^\r\n|]{1,30})', block)
+            if m: seg['fare_type']=_clean_source_value(m.group(1))
+        if not seg.get('layover'):
+            m=re.search(r'(?i)\b(?:Long\s+)?Layover\s*[:\-]?\s*([^\r\n|]{2,30})', block)
+            if m: seg['layover']=_clean_source_value(m.group(1))
         if not seg.get('stops'):
             m=re.search(r'\b(?:Non\s*[- ]?stop|Direct|[1-9]\s+Stops?)\b', block, re.I)
             if m: seg['stops']=re.sub(r'\s+',' ',m.group(0)).strip()
@@ -400,6 +525,9 @@ def _recover_source_only_fields(data, raw_text):
                 # Reject a neighbouring label accidentally swallowed by the regex.
                 if candidate and not re.search(r'\b(?:Stops?|Arrival|Departure|Status|PNR)\b', candidate, re.I):
                     seg['duration']=candidate
+
+        seg['dep_airport']=_strip_unproven_terminal_from_airport(seg.get('dep_airport'), raw_text)
+        seg['arr_airport']=_strip_unproven_terminal_from_airport(seg.get('arr_airport'), raw_text)
 
         # Terminal fields are SOURCE-VALIDATED, not merely filled when blank.
         # This prevents a departure terminal (for example DEL T2) leaking into the
@@ -416,16 +544,12 @@ def _recover_source_only_fields(data, raw_text):
         )
         seg['dep_terminal']=source_dep_terminal
         seg['arr_terminal']=source_arr_terminal
-        # Literal source text that proves a terminal binds it to THIS endpoint.
-        if source_dep_terminal:
-            seg['dep_airport']=_append_source_terminal_to_airport(seg.get('dep_airport'), source_dep_terminal)
-        if source_arr_terminal:
-            seg['arr_airport']=_append_source_terminal_to_airport(seg.get('arr_airport'), source_arr_terminal)
+        # Keep airport wording unchanged; never reconstruct it by appending a terminal.
 
     for pax in data.get('passengers') or []:
         for key in ('name','title','ticket_number','type','dob','baggage'):
             pax[key]=_clean_source_value(pax.get(key))
-    for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile'):
+    for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary'):
         data[key]=_clean_source_value(data.get(key))
 
     # STRICT TOP-LEVEL SOURCE TRUTH:
@@ -524,6 +648,29 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         if not r.text: raise RuntimeError('Gemini returned an empty flight ticket response.')
         data=_normalize_flight_segments(json.loads(r.text))
 
+        # V174 independent source-truth pass: supplier source only, no earlier extraction.
+        try:
+            truth_contents=[SOURCE_TRUTH_PROMPT]
+            if source_text:
+                truth_contents.append('\nSOURCE TEXT:\n'+str(source_text)[:18000])
+            for p in paths:
+                if p.exists():
+                    mime='application/pdf' if p.suffix.lower()=='.pdf' else 'image/jpeg'
+                    truth_contents.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+            tr=call_with_high_demand_retry(lambda: client.models.generate_content(
+                model=model,
+                contents=truth_contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type='application/json',
+                    response_schema=SCHEMA,
+                    temperature=0,
+                )
+            ))
+            if tr.text:
+                data=_normalize_flight_segments(json.loads(tr.text))
+        except Exception:
+            pass
+
         # Source-only second reading: if useful airport/terminal/duration fields are blank,
         # re-read the ORIGINAL source once. This never blocks printing and never invents data.
         useful_fields=('dep_airport','arr_airport','dep_terminal','arr_terminal','duration','dep_code','arr_code')
@@ -583,6 +730,9 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         # Deterministic source-only recovery: selectable supplier text wins over AI omissions.
         # This is especially useful for Terminal / Aircraft / Cabin / Stops labels in agency PDFs.
         data=_recover_source_only_fields(data, raw_source_text)
+        data=_sanitize_ticket_numbers(data)
+        data=_sanitize_inferred_stops(data)
+        data=_apply_baggage_summary(data)
 
         # FINAL TERMINAL ENDPOINT LOCK for every supplier format (PDF/image/text).
         # A terminal survives only when its own endpoint airport wording supports it.

@@ -177,12 +177,13 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     logo=_uri(logo_path)
     logo_html=f'<a href="{MYTOURBAZAR_LOGO_URL}"><img class="brand-logo" src="{logo}"></a>' if logo else ''
     customer_mobile=_text(data.get('mobile'))  # STRICT: no fallback to airline/PNR/other numbers.
+    baggage_summary=_text(data.get("baggage_summary"))
     pax_rows=''.join(
         f'<tr><td>{i+1}</td><td><strong>{_esc(_display_person_name(p))}</strong></td>'
         f'<td>{_esc(p.get("ticket_number"))}</td>'
         f'<td>{_esc(p.get("type") or "Adult")}</td>'
         f'<td>{_esc(p.get("dob"))}</td>'
-        f'<td>{_esc(p.get("baggage"))}</td></tr>' for i,p in enumerate(passengers)
+        f'<td>{_esc(p.get("baggage") or baggage_summary)}</td></tr>' for i,p in enumerate(passengers)
     ) or '<tr><td colspan="6">No passenger details found.</td></tr>'
 
     rows=[]
@@ -227,15 +228,19 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
         arr_airport_html=airport_with_terminal(arr_airport, arr_terminal)
         duration=_text(s.get("duration"))
         stops=_text(s.get('stops'))
+        if re.fullmatch(r'0(?:\s*stops?)?', stops, re.I):
+            stops=''
         duration_bits=[]
         if duration: duration_bits.append(f'<span class="duration-main">{_esc(duration)}</span>')
         if stops: duration_bits.append(f'<span class="stops">{_esc(stops)}</span>')
         duration_html='<td class="duration">'+('<br>'.join(duration_bits) if duration_bits else '')+'</td>'
         airline_logo_html = _airline_logo_html(airline, number)
         cabin=_text(s.get('cabin'))
+        fare_type=_text(s.get('fare_type'))
         cabin_html=f'<br><span class="flight-meta">Cabin: {_esc(cabin)}</span>' if cabin else ''
+        fare_type_html=f'<br><span class="flight-meta">Fare type: {_esc(fare_type)}</span>' if fare_type else ''
         rows.append(f'''<tr class="flight-row">
-          <td>{airline_logo_html}<strong>{identity}</strong>{cabin_html}</td>
+          <td>{airline_logo_html}<strong>{identity}</strong>{cabin_html}{fare_type_html}</td>
           <td>{dep_time_html}{dep_place_html}{_optional_line(s.get("dep_date"))}{dep_airport_html}</td>
           {duration_html}
           <td>{arr_time_html}{arr_place_html}{_optional_line(s.get("arr_date"))}{arr_airport_html}</td>
