@@ -170,6 +170,163 @@ def append_pdf_pages(base_pdf, appendix_pdf, output_pdf):
         writer.write(fh)
 
 
+_B2B_BRAND_PATTERN = re.compile(
+    r"(?i)(?:sales@mytourbazar\.com|www\.mytourbazar\.com|mytourbazar\.com|@mytourbazar|my\s*tour\s*bazar|mytourbazar)"
+)
+
+
+def _smart_requested_b2b(text):
+    """True only when the owner explicitly asks for a B2B / white-label Tour output."""
+    low = str(text or "").lower()
+    return bool(re.search(
+        r"\b(?:b\s*2\s*b|business\s*[- ]?to\s*[- ]?business|white\s*[- ]?label|agency\s*[- ]?neutral|unbranded)\b",
+        low,
+        re.I,
+    ))
+
+
+def _is_b2b_tour(data=None, context=None, record=None):
+    data = data or {}
+    record = record or {}
+    if bool(data.get("b2b") or data.get("brand_neutral")):
+        return True
+    if bool(record.get("b2b")):
+        return True
+    if context is not None and bool(context.user_data.get("pending_b2b")):
+        return True
+    return False
+
+
+def _b2b_replace_text(value):
+    """Remove every MyTourBazar brand reference from B2B-visible text."""
+    text = str(value or "")
+    # Contact-style brand strings must not become malformed e-mails/domains.
+    text = re.sub(r"(?i)\bsales@mytourbazar\.com\b", "our company", text)
+    text = re.sub(r"(?i)\b(?:www\.)?mytourbazar\.com\b", "our company", text)
+    text = re.sub(r"(?i)@mytourbazar\b", "our company", text)
+    text = re.sub(r"(?i)\bmy\s*tour\s*bazar\b", "our company", text)
+    text = re.sub(r"(?i)\bmytourbazar\b", "our company", text)
+    return text
+
+
+def _b2b_neutralize_data(data, mode=None):
+    """Deep-copy Tour data and make every customer-visible string B2B white-label."""
+    def scrub(obj):
+        if isinstance(obj, dict):
+            return {k: scrub(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [scrub(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(scrub(v) for v in obj)
+        if isinstance(obj, str):
+            return _b2b_replace_text(obj)
+        return obj
+
+    d = scrub(copy.deepcopy(data or {}))
+    d["b2b"] = True
+    d["brand_neutral"] = True
+    d["agency_removed"] = True
+    if mode:
+        d["document_mode"] = str(mode).lower()
+    return d
+
+
+def _b2b_greeting(data, mode):
+    guest = str((data or {}).get("client_name") or "Guest").strip()
+    mode = str(mode or "itinerary").lower()
+    if mode == "quotation":
+        return (
+            f"Dear {guest},\n\nGreetings from our company! We are delighted to present this official "
+            "tour quotation prepared especially for your travel requirements. The following proposal "
+            "summarizes the planned destinations, accommodation, transportation, sightseeing experiences, "
+            "inclusions and exclusions for your consideration. We look forward to arranging a comfortable "
+            "and memorable journey for you and your family.\n\nPlease review the itinerary and package "
+            "details carefully, and feel free to contact our company for any clarification or amendment before confirmation."
+        )
+    if mode == "voucher":
+        return (
+            f"Dear {guest},\n\nGreetings from our company! Thank you for choosing our company for your journey. "
+            "Please find below your official tour voucher containing the confirmed travel plan, accommodation "
+            "schedule, services and day-wise arrangements. Kindly keep this voucher available during your "
+            "journey and review the included services and travel instructions before departure.\n\n"
+            "Our company wishes you a smooth, comfortable and memorable trip."
+        )
+    return (
+        f"Dear {guest},\n\nGreetings from our company! Please find below your carefully planned day-wise "
+        "travel itinerary, including accommodation, transportation, sightseeing experiences, inclusions and "
+        "exclusions for a smooth and comfortable journey."
+    )
+
+
+def _sanitize_b2b_terms_pdf(source_pdf, output_pdf):
+    """Create a temporary B2B terms PDF with no MyTourBazar text.
+
+    This is fail-closed: if a visible/extractable MyTourBazar reference remains,
+    the B2B print is stopped instead of leaking the brand into a white-label PDF.
+    """
+    source_pdf = Path(source_pdf)
+    output_pdf = Path(output_pdf)
+    try:
+        import fitz  # PyMuPDF is already used by the MyTourBazar bot stack.
+    except Exception as exc:
+        raise RuntimeError(
+            "B2B terms sanitizing needs PyMuPDF. Refusing to append an unsanitized B2B terms page."
+        ) from exc
+
+    doc = fitz.open(str(source_pdf))
+    # Long/contact forms first, then brand-name variants.
+    replacements = [
+        ("sales@mytourbazar.com", "our company"),
+        ("www.mytourbazar.com", "our company"),
+        ("mytourbazar.com", "our company"),
+        ("@mytourbazar", "our company"),
+        ("MY TOUR BAZAR", "our company"),
+        ("My Tour Bazar", "our company"),
+        ("MYTOURBAZAR", "our company"),
+        ("MyTourBazar", "our company"),
+        ("mytourbazar", "our company"),
+    ]
+
+    for page in doc:
+        found = []
+        occupied = []
+        for needle, replacement in replacements:
+            for rect in page.search_for(needle):
+                # Avoid overlapping replacement rectangles when one long token
+                # also contains a shorter brand token.
+                if any(rect.intersects(prev) for prev in occupied):
+                    continue
+                occupied.append(rect)
+                found.append((rect, replacement))
+                page.add_redact_annot(rect, fill=(1, 1, 1))
+        if found:
+            page.apply_redactions()
+            for rect, replacement in found:
+                fontsize = max(6.0, min(11.0, rect.height * 0.72))
+                page.insert_textbox(
+                    rect,
+                    replacement,
+                    fontsize=fontsize,
+                    fontname="helv",
+                    color=(0, 0, 0),
+                    align=0,
+                )
+
+    doc.save(str(output_pdf), garbage=4, deflate=True)
+    doc.close()
+
+    verify = fitz.open(str(output_pdf))
+    extracted = "\n".join(page.get_text("text") for page in verify)
+    verify.close()
+    if _B2B_BRAND_PATTERN.search(extracted):
+        output_pdf.unlink(missing_ok=True)
+        raise RuntimeError(
+            "B2B terms still contain a MyTourBazar reference after sanitizing. "
+            "The PDF was stopped to protect white-label branding."
+        )
+    return output_pdf
+
+
 def terms_pdf_path(choice=None):
     choice = choice or get_tour_last_page()
     return {
@@ -191,14 +348,22 @@ def append_selected_terms(base_pdf, terms_choice=None, output_pdf=None):
     if output_pdf is None:
         output_pdf = terms_choice
     choice = terms_choice or get_tour_last_page()
+    temporary_b2b_terms = None
     if choice == 'b2b':
         terms_path = B2B_TERMS_PDF_PATH
     else:
         terms_path = terms_pdf_path(choice)
     if not terms_path.exists():
         raise FileNotFoundError(f'Tour last-page file not found: {terms_path}')
-    append_pdf_pages(base_pdf, terms_path, output_pdf)
-    return Path(output_pdf)
+    try:
+        if choice == 'b2b':
+            temporary_b2b_terms = GENERATED_DIR / f"_b2b_terms_clean_{int(time.time()*1000)}.pdf"
+            terms_path = _sanitize_b2b_terms_pdf(terms_path, temporary_b2b_terms)
+        append_pdf_pages(base_pdf, terms_path, output_pdf)
+        return Path(output_pdf)
+    finally:
+        if temporary_b2b_terms is not None:
+            temporary_b2b_terms.unlink(missing_ok=True)
 
 
 def _apply_footer_mode(input_pdf, output_pdf, mode):
@@ -1242,6 +1407,13 @@ async def perform_saved_edit(update, context, instruction):
             # normal/Hinglish voice phrasing without introducing a markup workflow.
             new_data, ai_package_rates = _tour_reconcile_ai_customer_costs(old_data,new_data,instruction)
 
+        if doc_type == 'package' and record.get('b2b'):
+            new_data = _apply_tour_document_mode_fields(
+                new_data,
+                record.get('document_mode') or new_data.get('document_mode') or 'itinerary',
+                b2b=True,
+            )
+
         if doc_type == "package" and package_whatsapp and not package_pdf:
             new_data["detail_level"] = requested_detail or new_data.get("detail_level") or "detailed"
             record.update({"data": new_data, "detail_level": new_data["detail_level"]})
@@ -1277,18 +1449,29 @@ async def perform_saved_edit(update, context, instruction):
         chosen_size = _normalize_page_size(controls["page_size"]) or "auto"
 
         if doc_type == "package":
+            edit_b2b = bool(record.get('b2b'))
+            if edit_b2b:
+                new_data = _apply_tour_document_mode_fields(new_data, record.get('document_mode') or new_data.get('document_mode') or 'itinerary', b2b=True)
+                logo_path = None
+                controls['footer_mode'] = 'none'
+                controls['footer'] = False
+                controls['logo'] = False
             base_pdf = GENERATED_DIR / f"_edit_base_{reference}.pdf"
             chosen_size = chosen_size if chosen_size != "auto" else "A4"
             await asyncio.to_thread(generate_pdf, new_data, base_pdf, logo_path, chosen_size, text_scale_override=current_text_scale, logo_scale_override=current_logo_scale)
             combined_pdf = GENERATED_DIR / f"_edit_combined_{reference}.pdf"
-            await asyncio.to_thread(append_selected_terms, base_pdf, 'tc2', combined_pdf)
+            terms_choice = 'b2b' if edit_b2b else (record.get('terms_choice') or get_tour_last_page())
+            await asyncio.to_thread(append_selected_terms, base_pdf, terms_choice, combined_pdf)
             base_pdf.unlink(missing_ok=True)
             base_pdf = combined_pdf
             wm_path = GENERATED_DIR / f"_edit_wm_{reference}.pdf"
             ws = load_settings()
-            await asyncio.to_thread(add_watermark_to_pdf, base_pdf, wm_path, ws['buttons'].get('watermark', True), ws.get('watermark_opacity', 0.04), ws.get('watermark_scale', 1.0))
+            await asyncio.to_thread(add_watermark_to_pdf, base_pdf, wm_path, ws['buttons'].get('watermark', True) and not edit_b2b, ws.get('watermark_opacity', 0.04), ws.get('watermark_scale', 1.0))
             base_pdf.unlink(missing_ok=True)
-            await asyncio.to_thread(_apply_footer_mode, wm_path, pdf_path, controls.get('footer_mode') or _default_footer_mode('package'))
+            if edit_b2b:
+                shutil.copyfile(wm_path, pdf_path)
+            else:
+                await asyncio.to_thread(_apply_footer_mode, wm_path, pdf_path, controls.get('footer_mode') or _default_footer_mode('package'))
             wm_path.unlink(missing_ok=True)
         else:
             base_pdf = GENERATED_DIR / f"_edit_base_{reference}.pdf"
@@ -1342,7 +1525,7 @@ async def perform_saved_edit(update, context, instruction):
             sent_pdf = await update.message.reply_document(
                 document=fh,
                 filename=pdf_path.name,
-                caption=_record_caption(reference, f"📄 Updated MyTourBazar {doc_type.replace('package','tour').replace('_',' ').title()}", f"Page size: {chosen_size}"),
+                caption=_record_caption(reference, (f"📄 Updated B2B {doc_type.replace('package','tour').replace('_',' ').title()}" if doc_type == 'package' and record.get('b2b') else f"📄 Updated MyTourBazar {doc_type.replace('package','tour').replace('_',' ').title()}"), f"Page size: {chosen_size}"),
                 reply_markup=generated_document_keyboard(reference, doc_type),
             )
         _register_reference_message(reference, sent_pdf)
@@ -2710,6 +2893,7 @@ async def smart_process(update, context):
             if not auto_creation and not smart_files and smart_text_value and not _looks_like_supplier_material(smart_text_value):
                 requested_detail = _smart_requested_tour_detail(smart_text_value)
                 requested_mode = _smart_requested_tour_mode(smart_text_value)
+                requested_b2b = _smart_requested_b2b(smart_text_value)
 
                 await safe_status_edit(
                     status,
@@ -2741,6 +2925,9 @@ async def smart_process(update, context):
                 data["detail_level"] = requested_detail
                 data["document_mode"] = requested_mode or "itinerary"
                 data["show_cost"] = bool(data.get("package_costs"))
+                if requested_b2b:
+                    data = _b2b_neutralize_data(data, requested_mode or "itinerary")
+                    data["greeting"] = _b2b_greeting(data, requested_mode or "itinerary")
 
                 # V169: Quick Client Itinerary must enter the SAME normal Tour
                 # draft/review/output workflow used by Tour Guide after extraction.
@@ -2752,16 +2939,22 @@ async def smart_process(update, context):
                 context.user_data["source_text"] = smart_text_value
                 context.user_data["itinerary"] = data
                 context.user_data["_source_status_message"] = status
-                context.user_data["pending_tour_document_mode"] = "itinerary"
+                context.user_data["pending_tour_document_mode"] = requested_mode or "itinerary"
+                context.user_data["smart_requested_document_mode"] = requested_mode
                 context.user_data["pending_tour_pdf_no_cost"] = not bool(
                     data.get("show_cost") and data.get("package_costs")
                 )
+                if requested_b2b:
+                    context.user_data["pending_b2b"] = True
+                    context.user_data["pending_clean_agency"] = True
+                    context.user_data["pending_tour_last_page"] = "b2b"
 
                 await safe_status_edit(
                     status,
                     update.message,
                     "✅ *Quick client itinerary created.*\n\n"
-                    "████████████████ 100%\n\n"
+                    "████████████████ 100%\n\n" +
+                    ("B2B white-label mode is active. " if requested_b2b else "") +
                     "Review the client draft below. You can Modify & Regenerate it, "
                     "send Basic/Detailed WhatsApp, or create Basic/Detailed PDF and then choose Quotation/Voucher.",
                     parse_mode="Markdown",
@@ -4780,44 +4973,57 @@ async def _tour_variant_data(message, data, detail, status=None):
         new_data["show_cost"] = old.get("show_cost")
     if old.get("document_mode"):
         new_data["document_mode"] = old.get("document_mode")
+    if old.get("b2b") or old.get("brand_neutral"):
+        new_data = _b2b_neutralize_data(new_data, new_data.get("document_mode") or "itinerary")
+        new_data["greeting"] = _b2b_greeting(new_data, new_data.get("document_mode") or "itinerary")
     return _normalize_guest_counts(new_data)
 
 
-def _apply_tour_document_mode_fields(data, mode):
-    """Apply the same title/greeting rules used by normal Tour PDF printing."""
+def _apply_tour_document_mode_fields(data, mode, b2b=False):
+    """Apply Tour title/greeting rules, including strict B2B white-label mode."""
     d = copy.deepcopy(data or {})
     mode = str(mode or d.get("document_mode") or "itinerary").lower()
     if mode not in ("quotation", "voucher", "itinerary"):
         mode = "itinerary"
     d["document_mode"] = mode
+    b2b = bool(b2b or d.get("b2b") or d.get("brand_neutral"))
     guest = d.get("client_name") or "Guest"
 
     if mode == "quotation":
         d["document_title"] = "OFFICIAL TOUR QUOTATION"
+    elif mode == "voucher":
+        d["document_title"] = "OFFICIAL TOUR VOUCHER"
+    else:
+        d["document_title"] = "OFFICIAL TOUR ITINERARY"
+
+    if b2b:
+        d = _b2b_neutralize_data(d, mode)
+        d["greeting"] = _b2b_greeting(d, mode)
+        return d
+
+    if mode == "quotation":
         d["greeting"] = (
-            f"Dear {guest},\\n\\nGreetings from MyTourBazar! We are delighted to present this official "
+            f"Dear {guest},\n\nGreetings from MyTourBazar! We are delighted to present this official "
             "tour quotation prepared especially for your travel requirements. The following proposal "
             "summarizes the planned destinations, accommodation, transportation, sightseeing experiences, "
             "inclusions and exclusions for your consideration. We look forward to arranging a comfortable "
-            "and memorable journey for you and your family.\\n\\nPlease review the itinerary and package "
+            "and memorable journey for you and your family.\n\nPlease review the itinerary and package "
             "details carefully, and feel free to contact us for any clarification or amendment before confirmation."
         )
     elif mode == "voucher":
-        d["document_title"] = "OFFICIAL TOUR VOUCHER"
         d["greeting"] = (
-            f"Dear {guest},\\n\\nGreetings from MyTourBazar! Thank you for choosing us for your journey. "
+            f"Dear {guest},\n\nGreetings from MyTourBazar! Thank you for choosing us for your journey. "
             "Please find below your official tour voucher containing the confirmed travel plan, accommodation "
             "schedule, services and day-wise arrangements. Kindly keep this voucher available during your "
-            "journey and review the included services and travel instructions before departure.\\n\\n"
+            "journey and review the included services and travel instructions before departure.\n\n"
             "We wish you a smooth, comfortable and memorable trip."
         )
     else:
-        d["document_title"] = "OFFICIAL TOUR ITINERARY"
         d["greeting"] = (
-            f"Dear {guest},\\n\\nGreetings from MyTourBazar! We are pleased to present your carefully planned "
+            f"Dear {guest},\n\nGreetings from MyTourBazar! We are pleased to present your carefully planned "
             "travel itinerary. This document brings together the accommodation schedule, transportation "
             "arrangements, sightseeing experiences, inclusions and exclusions so that you have a clear "
-            "day-by-day plan for your journey.\\n\\nWe look forward to assisting you throughout your travel "
+            "day-by-day plan for your journey.\n\nWe look forward to assisting you throughout your travel "
             "and making your trip comfortable, smooth and memorable."
         )
     return d
@@ -4843,11 +5049,19 @@ async def _reply_saved_tour_variant(message, context, reference, record, command
 
     try:
         new_data = await _tour_variant_data(message, old_data, detail, status=status)
+        b2b = bool(record.get("b2b") or old_data.get("b2b") or old_data.get("brand_neutral"))
+        if b2b:
+            new_data = _b2b_neutralize_data(new_data, mode)
+            new_data["greeting"] = _b2b_greeting(new_data, mode)
         new_data["document_mode"] = mode
 
         if output == "draft":
             context.user_data["itinerary"] = new_data
             context.user_data["source_text"] = record.get("source_text", "")
+            if b2b:
+                context.user_data["pending_b2b"] = True
+                context.user_data["pending_clean_agency"] = True
+                context.user_data["pending_tour_last_page"] = "b2b"
             await safe_status_edit(
                 status, message,
                 f"✅ *{detail.title()} draft ready.*\\n\\n████████████████ 100%\\n\\n"
@@ -4885,7 +5099,7 @@ async def _reply_saved_tour_variant(message, context, reference, record, command
             return True
 
         # PDF: preserve the exact saved print personality of the replied PDF.
-        stored_data = _apply_tour_document_mode_fields(new_data, mode)
+        stored_data = _apply_tour_document_mode_fields(new_data, mode, b2b=b2b)
         render_data = copy.deepcopy(stored_data)
 
         if "no_cost" in record:
@@ -4960,7 +5174,7 @@ async def _reply_saved_tour_variant(message, context, reference, record, command
             sent_pdf = await message.reply_document(
                 document=fh,
                 filename=filename,
-                caption=f"📄 {detail.title()} MyTourBazar {title}",
+                caption=(f"📄 {detail.title()} B2B {title}" if b2b else f"📄 {detail.title()} MyTourBazar {title}"),
                 reply_markup=generated_document_keyboard(reference, "package"),
             )
         _register_reference_message(reference, sent_pdf)
@@ -4993,6 +5207,13 @@ async def _reply_draft_tour_variant(message, context, command):
     )
     try:
         new_data = await _tour_variant_data(message, old_data, detail, status=status)
+        draft_b2b = bool(old_data.get("b2b") or old_data.get("brand_neutral") or context.user_data.get("pending_b2b"))
+        if draft_b2b:
+            new_data = _b2b_neutralize_data(new_data, mode or new_data.get("document_mode") or "itinerary")
+            new_data["greeting"] = _b2b_greeting(new_data, mode or new_data.get("document_mode") or "itinerary")
+            context.user_data["pending_b2b"] = True
+            context.user_data["pending_clean_agency"] = True
+            context.user_data["pending_tour_last_page"] = "b2b"
         context.user_data["itinerary"] = new_data
 
         if output == "whatsapp":
@@ -5117,22 +5338,32 @@ def build_whatsapp_itinerary(data, detail_level=None):
         for label,key in [("Adult","per_adult"),("Child","per_child"),("CNB","per_child_cnb"),("CWB","per_child_cwb"),("Extra Bed","per_extra_bed")]:
             if str(c.get(key) or "").strip(): lines.append(f"• {label}: INR {c.get(key)}")
     mode=str(data.get('document_mode') or 'itinerary').lower()
-    if mode == 'quotation':
-        lines += ["", "Dear Guest,", "Greetings from MyTourBazar! Please find below your official tour quotation prepared around the requested travel plan, accommodation, sightseeing, inclusions and exclusions. We hope the proposal gives you a clear understanding of the planned journey and we will be happy to assist with any clarification or amendment before confirmation."]
-    elif mode == 'voucher':
-        lines += ["", "Dear Guest,", "Greetings from MyTourBazar! Please find below your official tour voucher containing the confirmed travel plan, accommodation, services and day-wise arrangements. Kindly keep the voucher available during your journey and review the included services before departure."]
+    b2b=bool(data.get('b2b') or data.get('brand_neutral'))
+    if b2b:
+        if mode == 'quotation':
+            lines += ["", f"Dear {guest},", "Greetings from our company! Please find below your official tour quotation prepared around the requested travel plan, accommodation, sightseeing, inclusions and exclusions. We hope the proposal gives you a clear understanding of the planned journey, and our company will be happy to assist with any clarification or amendment before confirmation."]
+        elif mode == 'voucher':
+            lines += ["", f"Dear {guest},", "Greetings from our company! Please find below your official tour voucher containing the confirmed travel plan, accommodation, services and day-wise arrangements. Kindly keep the voucher available during your journey and review the included services before departure."]
+        else:
+            lines += ["", f"Dear {guest},", "Greetings from our company! Please find below your carefully planned day-wise travel itinerary, including accommodation, transportation, sightseeing experiences, inclusions and exclusions for a smooth and comfortable journey."]
+        lines += ["", "Thank you for choosing our company!"]
     else:
-        lines += ["", f"Dear {guest},", "Greetings from MyTourBazar! Please find below your carefully planned day-wise travel itinerary, including accommodation, transportation, sightseeing experiences, inclusions and exclusions for a smooth and comfortable journey."]
-    lines += [
-        "",
-        "Thank you for choosing MyTourBazar!",
-        "Aapke Safar Ka Saathi",
-        "",
-        "MYTOURBAZAR",
-        "📞 +91 9425259086",
-        "✉️ sales@mytourbazar.com",
-        "🌐 www.mytourbazar.com",
-    ]
+        if mode == 'quotation':
+            lines += ["", "Dear Guest,", "Greetings from MyTourBazar! Please find below your official tour quotation prepared around the requested travel plan, accommodation, sightseeing, inclusions and exclusions. We hope the proposal gives you a clear understanding of the planned journey and we will be happy to assist with any clarification or amendment before confirmation."]
+        elif mode == 'voucher':
+            lines += ["", "Dear Guest,", "Greetings from MyTourBazar! Please find below your official tour voucher containing the confirmed travel plan, accommodation, services and day-wise arrangements. Kindly keep the voucher available during your journey and review the included services before departure."]
+        else:
+            lines += ["", f"Dear {guest},", "Greetings from MyTourBazar! Please find below your carefully planned day-wise travel itinerary, including accommodation, transportation, sightseeing experiences, inclusions and exclusions for a smooth and comfortable journey."]
+        lines += [
+            "",
+            "Thank you for choosing MyTourBazar!",
+            "Aapke Safar Ka Saathi",
+            "",
+            "MYTOURBAZAR",
+            "📞 +91 9425259086",
+            "✉️ sales@mytourbazar.com",
+            "🌐 www.mytourbazar.com",
+        ]
     return "\n".join(lines)
 
 async def reply_text_chunked(message, text, **kwargs):
@@ -5361,6 +5592,15 @@ async def perform_draft_edit(update, context, instruction):
         else:
             new_data, _ = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(apply_edit, 'package', old_data, instruction, GEMINI_API_KEY, GEMINI_MODEL, None), status=status)
         new_data = _ensure_supplier_costs(new_data)
+        if old_data.get('b2b') or old_data.get('brand_neutral') or context.user_data.get('pending_b2b'):
+            new_data = _apply_tour_document_mode_fields(
+                new_data,
+                old_data.get('document_mode') or new_data.get('document_mode') or 'itinerary',
+                b2b=True,
+            )
+            context.user_data['pending_b2b'] = True
+            context.user_data['pending_clean_agency'] = True
+            context.user_data['pending_tour_last_page'] = 'b2b'
         context.user_data['itinerary'] = new_data
         context.user_data['pending_tour_markup_print'] = None
         context.user_data.pop('editing_current_itinerary', None)
@@ -5421,6 +5661,8 @@ async def _prepare_tour_pdf_request(message, context, detail, mode):
         data = await _run_ai_with_retry_status(message, lambda: asyncio.to_thread(enhance_package_itinerary, data, GEMINI_API_KEY, GEMINI_MODEL, detail), status=status)
         data['client_name'] = old_name or str(data.get('client_name') or '').strip()
         data['detail_level'] = detail
+        if context.user_data.get('pending_b2b'):
+            data = _apply_tour_document_mode_fields(data, mode, b2b=True)
         context.user_data['itinerary'] = data
         await safe_status_edit(status, message, f'✅ {detail.title()} day plan ready.')
     data['document_mode'] = mode
@@ -5454,16 +5696,8 @@ async def generate_tour_pdf_final(message, context, data, detail='basic', no_cos
     data = _normalize_guest_counts(dict(data))
     data['detail_level'] = detail or 'basic'
     document_mode = context.user_data.get('pending_tour_document_mode') or data.get('document_mode') or 'itinerary'
-    if document_mode == 'quotation':
-        data['document_title'] = 'OFFICIAL TOUR QUOTATION'
-        data['greeting'] = (f"Dear {data.get('client_name') or 'Guest'},\n\nGreetings from MyTourBazar! We are delighted to present this official tour quotation prepared especially for your travel requirements. The following proposal summarizes the planned destinations, accommodation, transportation, sightseeing experiences, inclusions and exclusions for your consideration. We look forward to arranging a comfortable and memorable journey for you and your family.\n\nPlease review the itinerary and package details carefully, and feel free to contact us for any clarification or amendment before confirmation.")
-    elif document_mode == 'voucher':
-        data['document_title'] = 'OFFICIAL TOUR VOUCHER'
-        data['greeting'] = (f"Dear {data.get('client_name') or 'Guest'},\n\nGreetings from MyTourBazar! Thank you for choosing us for your journey. Please find below your official tour voucher containing the confirmed travel plan, accommodation schedule, services and day-wise arrangements. Kindly keep this voucher available during your journey and review the included services and travel instructions before departure.\n\nWe wish you a smooth, comfortable and memorable trip.")
-    else:
-        data['document_title'] = 'OFFICIAL TOUR ITINERARY'
-        if not str(data.get('greeting') or '').strip():
-            data['greeting'] = (f"Dear {data.get('client_name') or 'Guest'},\n\nGreetings from MyTourBazar! We are pleased to present your carefully planned travel itinerary. This document brings together the accommodation schedule, transportation arrangements, sightseeing experiences, inclusions and exclusions so that you have a clear day-by-day plan for your journey.\n\nWe look forward to assisting you throughout your travel and making your trip comfortable, smooth and memorable.")
+    b2b = _is_b2b_tour(data=data, context=context)
+    data = _apply_tour_document_mode_fields(data, document_mode, b2b=b2b)
     # Keep supplier/package costing in the saved record for future markup edits,
     # while using a separate render copy when the customer PDF must hide cost.
     stored_data = copy.deepcopy(data)
@@ -5479,15 +5713,19 @@ async def generate_tour_pdf_final(message, context, data, detail='basic', no_cos
     size = context.user_data.get('pending_tour_page_size', 'A4') or 'A4'
     footer_mode = context.user_data.get('pending_tour_footer_mode') or _default_footer_mode('package')
     logo_path = LOGO_PATH if LOGO_PATH.exists() else None
-    clean = bool(context.user_data.get('pending_b2b', False) or context.user_data.get('pending_clean_agency', False))
+    clean = bool(b2b or context.user_data.get('pending_b2b', False) or context.user_data.get('pending_clean_agency', False))
     if clean:
         footer_mode = 'none'
         render_data['agency_removed'] = True
         stored_data['agency_removed'] = True
     last_page = context.user_data.get('pending_tour_last_page') or get_tour_last_page()
     if last_page == 'tc_default': last_page = 'tc_non_google'
-    if context.user_data.get('pending_b2b'):
+    if b2b or context.user_data.get('pending_b2b'):
         last_page = 'b2b'
+        render_data = _b2b_neutralize_data(render_data, document_mode)
+        render_data['greeting'] = _b2b_greeting(render_data, document_mode)
+        stored_data = _b2b_neutralize_data(stored_data, document_mode)
+        stored_data['greeting'] = _b2b_greeting(stored_data, document_mode)
     await asyncio.to_thread(generate_pdf, render_data, base_pdf, None if clean else logo_path, size)
     await asyncio.to_thread(append_selected_terms, base_pdf, last_page, combined_pdf)
     base_pdf.unlink(missing_ok=True)
@@ -5497,8 +5735,11 @@ async def generate_tour_pdf_final(message, context, data, detail='basic', no_cos
     await asyncio.to_thread(_apply_footer_mode, wm_pdf, final_pdf, footer_mode)
     wm_pdf.unlink(missing_ok=True)
     ref = reference or create_reference()
-    save_record(ref, {'type':'package','filename':filename,'data':stored_data,'fare':None,'source_text':context.user_data.get('source_text',''),'detail_level':detail,'terms_choice':last_page,'document_mode':document_mode,'b2b':bool(context.user_data.get('pending_b2b')),'footer':footer_mode!='none','footer_mode':footer_mode,'logo_enabled':not clean,'page_size':size,'agency_removed':clean,'text_scale':float(load_settings().get('text_scale',1.0)),'logo_scale':float(get_logo_scale('package')),'auto_creation':bool(context.user_data.get('auto_creation')),'no_cost':bool(no_cost)})
-    caption_prefix = "🤖 Auto-Created MyTourBazar" if context.user_data.get('auto_creation') else "📄 MyTourBazar"
+    save_record(ref, {'type':'package','filename':filename,'data':stored_data,'fare':None,'source_text':context.user_data.get('source_text',''),'detail_level':detail,'terms_choice':last_page,'document_mode':document_mode,'b2b':bool(b2b or context.user_data.get('pending_b2b')),'footer':footer_mode!='none','footer_mode':footer_mode,'logo_enabled':not clean,'page_size':size,'agency_removed':clean,'text_scale':float(load_settings().get('text_scale',1.0)),'logo_scale':float(get_logo_scale('package')),'auto_creation':bool(context.user_data.get('auto_creation')),'no_cost':bool(no_cost)})
+    if b2b:
+        caption_prefix = "📄 B2B"
+    else:
+        caption_prefix = "🤖 Auto-Created MyTourBazar" if context.user_data.get('auto_creation') else "📄 MyTourBazar"
     caption = f"{caption_prefix} {data.get('document_title','OFFICIAL TOUR ITINERARY').title()}\n\n📜 Last page: {terms_label(last_page)}"
     with open(final_pdf,'rb') as fh:
         sent_pdf=await message.reply_document(document=fh, filename=filename, caption=caption, parse_mode='Markdown', reply_markup=generated_document_keyboard(ref, 'package'))
@@ -5566,7 +5807,15 @@ async def _render_saved_pdf(reference, record, data, kind, fare, page_size, foot
         try:
             logo_path=LOGO_PATH if logo_enabled and LOGO_PATH.exists() else None
             if kind=='package':
-                await asyncio.to_thread(generate_pdf,data,base,logo_path,_normalize_page_size(page_size) or 'A4',text_scale_override=scale,logo_scale_override=logo_scale_override)
+                render_data = copy.deepcopy(data)
+                render_b2b = bool(record.get('b2b') or render_data.get('b2b') or render_data.get('brand_neutral'))
+                if render_b2b:
+                    render_data = _apply_tour_document_mode_fields(render_data, record.get('document_mode') or render_data.get('document_mode') or 'itinerary', b2b=True)
+                    logo_path = None
+                    record['_clean_agency'] = True
+                    footer_mode = 'none'
+                    last_page = 'b2b'
+                await asyncio.to_thread(generate_pdf,render_data,base,logo_path,_normalize_page_size(page_size) or 'A4',text_scale_override=scale,logo_scale_override=logo_scale_override)
                 combined=GENERATED_DIR/f'_modify_{reference}_terms_{attempt}.pdf'
                 await asyncio.to_thread(append_selected_terms,base,last_page or record.get('terms_choice') or get_tour_last_page(),combined); base.unlink(missing_ok=True); base=combined
             else:
@@ -5616,6 +5865,8 @@ async def auto_fit_saved_ticket(query, context, reference):
         return
 
     data = _normalize_guest_counts(copy.deepcopy(record.get('data') or {}))
+    if kind == 'package' and record.get('b2b'):
+        data = _apply_tour_document_mode_fields(data, record.get('document_mode') or data.get('document_mode') or 'itinerary', b2b=True)
     fare = record.get('fare')
     footer_mode = record.get('footer_mode') or (_default_footer_mode(kind) if record.get('footer') else 'none')
     logo_enabled = bool(record.get('logo_enabled', True)) and not bool(record.get('agency_removed', False))
@@ -5748,24 +5999,27 @@ async def regenerate_saved_with_modifications(query, context, reference):
     logo_enabled=record.get('logo_enabled',True) and not pending.get('clean_agency',False)
     logo_scale=float(pending.get('logo_scale') or record.get('logo_scale') or get_logo_scale(kind))
     font_scale=float(pending.get('font_scale') or record.get('text_scale') or load_settings().get('text_scale',1.0))
-    clean=bool(pending.get('clean_agency',False))
+    b2b=bool(pending.get('b2b',False) or record.get('b2b',False)) if kind=='package' else False
+    clean=bool(pending.get('clean_agency',False) or record.get('agency_removed',False) or b2b)
     if clean:
         footer_mode='none'
     if kind=='package':
-        context.user_data['pending_tour_last_page']=pending.get('tour_last_page') or record.get('terms_choice') or get_tour_last_page()
+        context.user_data['pending_tour_last_page']='b2b' if b2b else (pending.get('tour_last_page') or record.get('terms_choice') or get_tour_last_page())
         if context.user_data['pending_tour_last_page']=='tc_default': context.user_data['pending_tour_last_page']='tc_non_google'
-        context.user_data['pending_b2b']=bool(pending.get('b2b',False))
+        context.user_data['pending_b2b']=b2b
         context.user_data['pending_tour_document_mode']=pending.get('document_mode') or record.get('document_mode') or 'itinerary'
+        if b2b:
+            data=_apply_tour_document_mode_fields(data,context.user_data['pending_tour_document_mode'],b2b=True)
     # Use the selected per-service footer and keep it through page-size/font changes unless explicitly changed.
     record['_clean_agency']=clean
     final, selected_scale, filename=await _render_saved_pdf(reference,record,data,kind,fare,page_size,footer_mode,logo_enabled,text_scale_override=font_scale,logo_scale_override=logo_scale,auto_fit=False,last_page=context.user_data.get('pending_tour_last_page') or ('b2b' if pending.get('b2b') else record.get('terms_choice') or get_tour_last_page()))
     record.pop('_clean_agency',None)
-    record.update({'filename':filename,'data':data,'page_size':page_size,'footer':footer_mode!='none','footer_mode':footer_mode,'detail_level':detail or record.get('detail_level','basic'),'logo_enabled':logo_enabled,'text_scale':selected_scale,'logo_scale':logo_scale,'agency_removed':clean,'terms_choice':context.user_data.get('pending_tour_last_page') or ('b2b' if pending.get('b2b') else record.get('terms_choice') or get_tour_last_page()),'document_mode':pending.get('document_mode') or record.get('document_mode','itinerary'),'b2b':bool(pending.get('b2b',False))})
+    record.update({'filename':filename,'data':data,'page_size':page_size,'footer':footer_mode!='none','footer_mode':footer_mode,'detail_level':detail or record.get('detail_level','basic'),'logo_enabled':logo_enabled,'text_scale':selected_scale,'logo_scale':logo_scale,'agency_removed':clean,'terms_choice':context.user_data.get('pending_tour_last_page') or ('b2b' if pending.get('b2b') else record.get('terms_choice') or get_tour_last_page()),'document_mode':pending.get('document_mode') or record.get('document_mode','itinerary'),'b2b':bool(b2b)})
     update_record(reference,record)
     context.user_data.pop(f'modify:{reference}',None)
     await safe_callback_edit(query,'⏳ Regenerating with your selected changes...')
     with open(final,'rb') as fh:
-        sent_pdf=await query.message.reply_document(document=fh,filename=filename,caption=_record_caption(reference,f'📄 Updated MyTourBazar {kind.title()}',f'Page size: {page_size}'),reply_markup=generated_document_keyboard(reference,kind))
+        sent_pdf=await query.message.reply_document(document=fh,filename=filename,caption=_record_caption(reference,(f'📄 Updated B2B {kind.title()}' if b2b else f'📄 Updated MyTourBazar {kind.title()}'),f'Page size: {page_size}'),reply_markup=generated_document_keyboard(reference,kind))
     _register_reference_message(reference, sent_pdf)
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6009,6 +6263,15 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             new_data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, GEMINI_API_KEY, GEMINI_MODEL, detail), status=status)
             new_data["client_name"] = data.get("client_name", "")
             new_data["detail_level"] = detail
+            if data.get('b2b') or data.get('brand_neutral') or context.user_data.get('pending_b2b'):
+                new_data = _apply_tour_document_mode_fields(
+                    new_data,
+                    data.get('document_mode') or new_data.get('document_mode') or 'itinerary',
+                    b2b=True,
+                )
+                context.user_data['pending_b2b'] = True
+                context.user_data['pending_clean_agency'] = True
+                context.user_data['pending_tour_last_page'] = 'b2b'
             context.user_data["itinerary"] = new_data
             await safe_status_edit(status, query.message, f"✅ {detail.title()} itinerary ready. Choose WhatsApp or PDF.")
             await query.message.reply_text(build_confirmation(new_data), parse_mode="Markdown")
@@ -6156,7 +6419,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
         reference=query.data.split(':',1)[1]
         pending=context.user_data.setdefault(f'modify:{reference}',{})
         pending['b2b']=True; pending['clean_agency']=True; pending['tour_last_page']='b2b'
-        await safe_callback_edit(query,'🏢 B2B Print selected. Agency branding will be removed and the B2B terms page will be appended.',reply_markup=modify_keyboard(reference,'package')); return
+        await safe_callback_edit(query,'🏢 B2B Print selected. This is strict white-label mode: MyTourBazar will be removed from greeting/body/footer/watermark/terms, and company references will use “our company”.',reply_markup=modify_keyboard(reference,'package')); return
 
     if query.data.startswith('mod_mode:'):
         _,reference,mode=query.data.split(':',2)
@@ -6386,8 +6649,9 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             return
         try:
             if output == "pdf":
-                if document_mode in ('quotation','voucher'):
-                    await _prepare_tour_pdf_request(query.message, context, detail, document_mode)
+                requested_mode = document_mode or str(context.user_data.get("smart_requested_document_mode") or "").lower()
+                if requested_mode in ('quotation','voucher'):
+                    await _prepare_tour_pdf_request(query.message, context, detail, requested_mode)
                 else:
                     await safe_callback_edit(
                         query,
@@ -6400,6 +6664,15 @@ I will show the detailed Transit text I understood before regenerating the PDF."
                 data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, GEMINI_API_KEY, GEMINI_MODEL, detail))
                 data["client_name"] = old_name or str(data.get("client_name") or "").strip()
                 data["detail_level"] = detail
+                if data.get('b2b') or data.get('brand_neutral') or context.user_data.get('pending_b2b'):
+                    data = _apply_tour_document_mode_fields(
+                        data,
+                        context.user_data.get('pending_tour_document_mode') or data.get('document_mode') or 'itinerary',
+                        b2b=True,
+                    )
+                    context.user_data['pending_b2b'] = True
+                    context.user_data['pending_clean_agency'] = True
+                    context.user_data['pending_tour_last_page'] = 'b2b'
                 context.user_data["itinerary"] = data
             if output == "whatsapp":
                 await reply_text_chunked(query.message, build_whatsapp_itinerary(data, detail), parse_mode="Markdown")
