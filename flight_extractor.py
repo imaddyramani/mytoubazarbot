@@ -21,6 +21,113 @@ SCHEMA={"type":"object","properties":{
  "payment_items":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"amount":{"type":"number"}},"required":["label","amount"]}}
 },"required":["booking_id","booking_date","airline_pnr","gds_pnr","status","mobile","baggage_summary","segments","passengers","base_fare","taxes","gross_total","payment_items"]}
 
+
+ENDPOINT_ROW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "flight_number": {"type": "string"},
+                    "dep_code": {"type": "string"},
+                    "dep_time": {"type": "string"},
+                    "dep_endpoint_text": {"type": "string"},
+                    "dep_terminal": {"type": "string"},
+                    "dep_terminal_evidence": {"type": "string"},
+                    "arr_code": {"type": "string"},
+                    "arr_time": {"type": "string"},
+                    "arr_endpoint_text": {"type": "string"},
+                    "arr_terminal": {"type": "string"},
+                    "arr_terminal_evidence": {"type": "string"}
+                },
+                "required": [
+                    "flight_number",
+                    "dep_code",
+                    "dep_time",
+                    "dep_endpoint_text",
+                    "dep_terminal",
+                    "dep_terminal_evidence",
+                    "arr_code",
+                    "arr_time",
+                    "arr_endpoint_text",
+                    "arr_terminal",
+                    "arr_terminal_evidence"
+                ]
+            }
+        }
+    },
+    "required": ["segments"]
+}
+
+ENDPOINT_ROW_PROMPT = """You are MyTourBazar's AIRPORT ENDPOINT ROW VERIFIER.
+
+Your ONLY job is to read the DEPARTURE and ARRIVAL cells/rows for EVERY flight sector
+from the supplier ticket/PDF/screenshot/text.
+
+DO NOT extract fare, passenger, booking or other data.
+DO NOT use airport knowledge.
+DO NOT infer terminals.
+
+MOST IMPORTANT METHOD:
+For EACH flight sector:
+1. Identify the exact sector using its printed flight number.
+2. Read the DEPARTURE side/cell independently.
+3. Read the ARRIVAL side/cell independently.
+4. Never carry any word, terminal or airport text from one side to the other.
+5. Never carry a terminal from one flight row into the next flight row.
+
+dep_endpoint_text / arr_endpoint_text:
+- Copy the COMPLETE airport/location wording printed inside that endpoint's own cell.
+- Include ALL airport-name continuation lines belonging to that same cell.
+- If the terminal is written inside the airport name, include it.
+- If the terminal is printed on the NEXT LINE but still inside the same Departure/Arrival
+  cell, include it at the end of endpoint_text too.
+- Do not include departure/arrival time, date, flight duration, fare type or baggage.
+- Keep supplier wording. Do not shorten or rewrite airport names.
+
+TERMINAL:
+- dep_terminal / arr_terminal = exact terminal only when visibly printed in THAT SAME
+  endpoint cell. Examples: `Terminal 2`, `T1`, `Terminal 2A`, `2B`, `Domestic Terminal`.
+- If no terminal is visible in that exact endpoint cell, return an empty string.
+- dep_terminal_evidence / arr_terminal_evidence = a SHORT VERBATIM text snippet from
+  that SAME endpoint cell that proves the terminal. It must contain the terminal wording.
+  If terminal is blank, evidence must also be blank.
+
+CRITICAL CONNECTION RULE:
+Suppose one flight row shows:
+Departure: `Guwahati - Lokpriya Gopinath Bordoloi Terminal 2`
+Arrival: `Kolkata - Netaji Subhas Chandra Bose Airport`
+
+and the next flight row shows:
+Departure: `Kolkata - Netaji Subhas Chandra Bose Airport`
+Arrival: `Raipur - Raipur`
+
+Then:
+- GAU departure terminal = Terminal 2
+- CCU arrival terminal = blank
+- CCU departure terminal = blank
+- RPR arrival terminal = blank
+
+The presence of Terminal 2 anywhere else on the page is NOT evidence for those endpoints.
+
+WHEN TERMINAL IS EMBEDDED:
+`Delhi - Indira Gandhi International Airport T3`
+must be copied as the full endpoint text and terminal=`T3`.
+
+WHEN TERMINAL IS ON A SEPARATE LINE IN SAME CELL:
+Airport line: `Mumbai - Chhatrapati Shivaji Maharaj International Airport`
+next line in SAME ARRIVAL CELL: `Terminal 2`
+then arr_endpoint_text must become:
+`Mumbai - Chhatrapati Shivaji Maharaj International Airport Terminal 2`
+and arr_terminal=`Terminal 2`.
+
+If layout is ambiguous, leave terminal blank rather than assigning it to the wrong endpoint.
+
+Return ONLY JSON matching the schema.
+"""
+
 FARE_SCHEMA={"type":"object","properties":{
     "gross_total":{"type":"number"},
     "base_fare":{"type":"number"},
@@ -66,6 +173,7 @@ Extract ONLY the booking data required for our customer-facing Air Print:
 - terminal is CRITICAL WHEN PRESENT IN THE SOURCE: capture T1/T2/T3, Terminal 1/2/3, 2A/2B, domestic/international terminal labels, etc. in dep_terminal / arr_terminal.
 - AIRPORT + TERMINAL SOURCE TRUTH: dep_airport / arr_airport must preserve the COMPLETE endpoint wording exactly as the supplier prints it. If the supplier prints `Guwahati - Lokpriya Gopinath Bordoloi Terminal 2`, keep that full wording in dep_airport AND set dep_terminal=`Terminal 2`. Never shorten the airport name and never move a terminal to the wrong endpoint.
 - TERMINAL ENDPOINT LOCK: a terminal belongs ONLY to the exact endpoint where the supplier visibly prints it.
+- ROW/CELL OWNERSHIP: always visually inspect the complete Departure and Arrival columns for EACH individual flight row. A terminal can be embedded inside the airport name OR printed on the next line inside that same cell. In either case it belongs only to that endpoint.
 - CONNECTION SAFETY EXAMPLE: if GAU departure says `... Terminal 2` but CCU arrival says only `Kolkata - Netaji Subhas Chandra Bose Airport`, then CCU arrival terminal MUST be blank. If the next CCU departure also has no terminal, it stays blank. If RPR arrival has no terminal, it stays blank. Never repeat a previous endpoint terminal into an arrival, connection, next sector or destination.
 - cabin and exact elapsed duration ONLY when printed.
 - stops are SOURCE-ONLY. Never infer `0`, `0 stops`, `Direct` or `Non-stop` from the route. If supplier does not print it, leave blank.
@@ -103,6 +211,9 @@ PASSENGERS:
 - ticket_number only when an actual passenger ticket/e-ticket number is printed.
 - PNR, Trip ID and booking ID are never ticket numbers.
 - Preserve complete baggage wording when printed.
+
+VISUAL ROW RULE:
+For each flight number, inspect its Departure cell and Arrival cell separately from top to bottom. Airport names may wrap across multiple lines, and terminal can be embedded in the airport name or appear as a final continuation line. Capture all lines belonging to that one cell before moving to the other endpoint.
 
 EACH FLIGHT SECTOR IS INDEPENDENT:
 - exact airline and full flight number
@@ -452,12 +563,201 @@ def _apply_baggage_summary(data):
             pax['baggage']=summary
     return data
 
+
+def _norm_flight_key(value):
+    return re.sub(r'[^A-Z0-9]', '', str(value or '').upper())
+
+
+def _norm_time_key(value):
+    raw = str(value or '').strip().lower()
+    raw = re.sub(r'\bhrs?\b', '', raw)
+    raw = re.sub(r'\s+', '', raw)
+    return raw
+
+
+def _norm_code_key(value):
+    return re.sub(r'[^A-Z]', '', str(value or '').upper())[:3]
+
+
+def _extract_terminal_from_endpoint_text(value):
+    """Derive terminal only from this endpoint's own copied text."""
+    text = re.sub(r'\s+', ' ', str(value or '')).strip()
+    if not text:
+        return ''
+    patterns = (
+        r'\bTerminal\s*(?:No\.?\s*)?([A-Za-z]?\d+[A-Za-z]?|Domestic|International)\b',
+        r'\b(T\s*[1-9]\d*[A-Za-z]?)\b',
+        r'\b([1-9][A-Za-z]?)\s*Terminal\b',
+        r'\b(Domestic|International)\s+Terminal\b',
+    )
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if not m:
+            continue
+        found = m.group(0)
+        found = re.sub(r'\s+', ' ', found).strip()
+        if re.match(r'(?i)^t\s*\d', found):
+            found = re.sub(r'\s+', '', found).upper()
+        return found
+    return ''
+
+
+def _terminal_evidence_is_valid(terminal, evidence):
+    """Dedicated row pass must provide same-cell evidence for a loose terminal."""
+    terminal = re.sub(r'\s+', ' ', str(terminal or '')).strip()
+    evidence = re.sub(r'\s+', ' ', str(evidence or '')).strip()
+    if not terminal or not evidence:
+        return False
+
+    tk = _terminal_key(terminal)
+    ek = _airport_terminal_key(evidence) or _terminal_key(evidence)
+    return bool(tk and ek and tk == ek)
+
+
+def _compose_verified_endpoint(endpoint_text, terminal, evidence):
+    """Build display text using ONLY one verified endpoint row/cell.
+
+    Prefer terminal already embedded in endpoint_text. If the terminal is printed on a
+    separate line in the same cell, the dedicated verifier supplies same-cell evidence;
+    only then is it appended.
+    """
+    endpoint = re.sub(r'\s+', ' ', str(endpoint_text or '')).strip()
+    terminal = re.sub(r'\s+', ' ', str(terminal or '')).strip()
+
+    embedded = _extract_terminal_from_endpoint_text(endpoint)
+    if embedded:
+        return endpoint, embedded
+
+    if terminal and _terminal_evidence_is_valid(terminal, evidence):
+        # Append only after evidence from the SAME departure/arrival cell.
+        return (endpoint + ' ' + terminal).strip(), terminal
+
+    return endpoint, ''
+
+
+def _endpoint_row_match_score(seg, row):
+    """Match verifier row to extracted segment without relying on array order."""
+    score = 0
+    sf = _norm_flight_key(seg.get('flight_number'))
+    rf = _norm_flight_key(row.get('flight_number'))
+    if sf and rf:
+        if sf == rf:
+            score += 12
+        else:
+            return -999
+
+    pairs = (
+        ('dep_code', _norm_code_key, 4),
+        ('arr_code', _norm_code_key, 4),
+        ('dep_time', _norm_time_key, 3),
+        ('arr_time', _norm_time_key, 3),
+    )
+    for key, fn, weight in pairs:
+        a = fn(seg.get(key))
+        b = fn(row.get(key))
+        if a and b:
+            if a == b:
+                score += weight
+            else:
+                score -= weight
+    return score
+
+
+def _apply_verified_endpoint_rows(data, verified):
+    """Final endpoint authority: row-by-row departure/arrival verification wins."""
+    rows = (verified or {}).get('segments') or []
+    used = set()
+
+    for seg in data.get('segments') or []:
+        best_i = None
+        best_score = -999
+        for i, row in enumerate(rows):
+            if i in used:
+                continue
+            score = _endpoint_row_match_score(seg, row)
+            if score > best_score:
+                best_i, best_score = i, score
+
+        # Require strong identity: usually flight number + at least one time/code.
+        if best_i is None or best_score < 12:
+            continue
+
+        row = rows[best_i]
+        used.add(best_i)
+
+        dep_text, dep_terminal = _compose_verified_endpoint(
+            row.get('dep_endpoint_text'),
+            row.get('dep_terminal'),
+            row.get('dep_terminal_evidence'),
+        )
+        arr_text, arr_terminal = _compose_verified_endpoint(
+            row.get('arr_endpoint_text'),
+            row.get('arr_terminal'),
+            row.get('arr_terminal_evidence'),
+        )
+
+        # A non-empty endpoint copied from its exact row is authoritative.
+        if dep_text:
+            seg['dep_airport'] = dep_text
+            seg['dep_terminal'] = dep_terminal
+        if arr_text:
+            seg['arr_airport'] = arr_text
+            seg['arr_terminal'] = arr_terminal
+
+    return data
+
+
+def _verify_endpoint_rows(client, model, original_paths, source_text=''):
+    """One focused multimodal pass that reads each Departure/Arrival row independently."""
+    contents = [ENDPOINT_ROW_PROMPT]
+    if source_text:
+        contents.append(
+            '\nSOURCE TEXT (use only as supporting evidence; preserve visual row ownership):\n'
+            + str(source_text)[:18000]
+        )
+
+    added = 0
+    for p in original_paths or []:
+        try:
+            p = Path(p)
+            if not p.exists():
+                continue
+            suffix = p.suffix.lower()
+            if suffix == '.pdf':
+                mime = 'application/pdf'
+            elif suffix in ('.png',):
+                mime = 'image/png'
+            elif suffix in ('.webp',):
+                mime = 'image/webp'
+            else:
+                mime = 'image/jpeg'
+            contents.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+            added += 1
+        except Exception:
+            continue
+
+    if not added and not source_text:
+        return {'segments': []}
+
+    rr = call_with_high_demand_retry(lambda: client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_mime_type='application/json',
+            response_schema=ENDPOINT_ROW_SCHEMA,
+            temperature=0,
+        )
+    ))
+    if not rr.text:
+        return {'segments': []}
+    return json.loads(rr.text)
+
 def _enforce_terminal_endpoint_truth(data):
     """Final terminal safety gate.
 
-    A terminal survives ONLY if the same departure/arrival endpoint's airport
-    string independently contains the equivalent terminal marker. This blocks
-    Terminal 2 from one airport leaking into later connection/destination rows.
+    A terminal survives ONLY if the same departure/arrival endpoint's own
+    verified row/cell supports it. The dedicated row verifier is applied after
+    this gate and is the final authority.
     """
     for seg in data.get('segments') or []:
         for airport_key, terminal_key in (
@@ -734,9 +1034,23 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         data=_sanitize_inferred_stops(data)
         data=_apply_baggage_summary(data)
 
-        # FINAL TERMINAL ENDPOINT LOCK for every supplier format (PDF/image/text).
-        # A terminal survives only when its own endpoint airport wording supports it.
+        # First generic endpoint safety gate.
         data=_enforce_terminal_endpoint_truth(data)
+
+        # V175 FINAL ROW-BY-ROW ENDPOINT VERIFICATION.
+        # Read every Departure and Arrival cell independently from the ORIGINAL
+        # supplier source. This is the final authority for airport text + terminal.
+        try:
+            verified_endpoints = _verify_endpoint_rows(
+                client,
+                model,
+                original_paths,
+                source_text=source_text,
+            )
+            data = _apply_verified_endpoint_rows(data, verified_endpoints)
+        except Exception:
+            # Never block Air Print if a supplemental verification call fails.
+            pass
 
         # Fare recovery: if the main extraction misses a clearly printed supplier
         # total, run a focused multimodal fare pass before declaring the fare absent.
