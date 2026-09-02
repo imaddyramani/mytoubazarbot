@@ -530,8 +530,134 @@ def _airport_code(value):
     return codes[-1].upper() if codes else "XXX"
 
 
+def _dd_mm(value, fallback="Date"):
+    """Short document date for filenames: DD_MM."""
+    compact=_ddmm(value, "")
+    if compact and len(compact)==4 and compact.isdigit():
+        return compact[:2] + "_" + compact[2:]
+    return fallback
+
+
+def _normal_title(value):
+    raw=str(value or "").strip().replace(".","")
+    low=raw.lower()
+    mapping={
+        "mr":"Mr","mrs":"Mrs","ms":"Ms","miss":"Miss",
+        "master":"Master","mstr":"Mstr","mst":"Mstr",
+        "dr":"Dr","prof":"Prof",
+    }
+    return mapping.get(low, raw)
+
+
+def _split_title_first_name(value, explicit_title=""):
+    """Return a short filename identity such as Mr-Amit / Mrs-Neha / Pravin."""
+    raw=re.sub(r"\s+"," ",str(value or "").strip())
+    title=_normal_title(explicit_title)
+    name=raw
+
+    # Remove one or more repeated leading honorifics from the name.
+    honorific_re=r"^(Mr|Mrs|Ms|Miss|Master|Mstr|Mst|Dr|Prof)\.?\s+"
+    while True:
+        m=re.match(honorific_re,name,re.I)
+        if not m:
+            break
+        if not title:
+            title=_normal_title(m.group(1))
+        name=re.sub(honorific_re,"",name,count=1,flags=re.I).strip()
+
+    # First useful personal name only.
+    # "Amit Sharma" -> Amit
+    # "Amit & Family" -> Amit
+    first=""
+    for token in re.split(r"[\s,/&+]+",name):
+        token=token.strip(" ._-")
+        if token:
+            first=token
+            break
+    first=_safe_filename_part(first or "Guest","Guest")
+
+    if title:
+        return f"{_safe_filename_part(title)}-{first}"
+    return first
+
+
+def _filename_person_short(person):
+    person=person or {}
+    return _split_title_first_name(
+        person.get("name") or person.get("full_name") or "Guest",
+        person.get("title") or person.get("passenger_title") or "",
+    )
+
+
+def _tour_client_short(data):
+    return _split_title_first_name(
+        (data or {}).get("client_name") or (data or {}).get("guest_name") or "Guest",
+        (data or {}).get("client_title") or (data or {}).get("guest_title") or "",
+    )
+
+
+def _tour_duration_short(data):
+    """Normalize Tour duration to 4N5D style without making the filename long."""
+    data=data or {}
+    candidates=[
+        data.get("duration"),
+        data.get("tour_title"),
+        data.get("travel_dates"),
+    ]
+    text=" | ".join(str(x or "") for x in candidates)
+
+    # 4N5D / 4 nights 5 days / 5 days 4 nights.
+    patterns=[
+        r"\b(\d+)\s*(?:n|night|nights)\s*[/+\-& ]*\s*(\d+)\s*(?:d|day|days)\b",
+        r"\b(\d+)\s*(?:d|day|days)\s*[/+\-& ]*\s*(\d+)\s*(?:n|night|nights)\b",
+    ]
+    m=re.search(patterns[0],text,re.I)
+    if m:
+        return f"{int(m.group(1))}N{int(m.group(2))}D"
+    m=re.search(patterns[1],text,re.I)
+    if m:
+        return f"{int(m.group(2))}N{int(m.group(1))}D"
+
+    # If only nights/days is provided, use the standard tour relation.
+    mn=re.search(r"\b(\d+)\s*(?:n|night|nights)\b",text,re.I)
+    md=re.search(r"\b(\d+)\s*(?:d|day|days)\b",text,re.I)
+    if mn and md:
+        return f"{int(mn.group(1))}N{int(md.group(1))}D"
+    if mn:
+        n=int(mn.group(1))
+        return f"{n}N{n+1}D"
+    if md:
+        d=int(md.group(1))
+        return f"{max(0,d-1)}N{d}D"
+
+    return "Tour"
+
+
+def _tour_document_type(data):
+    mode=str((data or {}).get("document_mode") or "itinerary").strip().lower()
+    if "quot" in mode:
+        return "Quotation"
+    if "vouch" in mode:
+        return "Voucher"
+    return "Itinerary"
+
+
+def _tour_detail_type(data):
+    detail=str((data or {}).get("detail_level") or "basic").strip().lower()
+    return "Detailed" if detail=="detailed" else "Basic"
+
+
 def _package_filename(data):
-    return f"Tour- {_safe_filename_part(data.get('tour_title'),'Tour Itinerary')}_{_safe_filename_part(data.get('client_name'),'Guest')}_{_safe_filename_part(data.get('destination'),'Destination')}_{_ddmm(data.get('travel_dates'))}.pdf"
+    """Destination_4N5D_Mr-Amit_Detailed_Quotation.pdf"""
+    destination=_safe_filename_part(
+        (data or {}).get("destination") or (data or {}).get("tour_title") or "Tour",
+        "Tour",
+    )
+    duration=_tour_duration_short(data)
+    client=_tour_client_short(data)
+    detail=_tour_detail_type(data)
+    doc_type=_tour_document_type(data)
+    return f"{destination}_{duration}_{client}_{detail}_{doc_type}.pdf"
 
 
 def _title_for_person(person):
@@ -546,40 +672,144 @@ def _title_for_person(person):
 def _full_name_without_title(person):
     person = person or {}
     name = str(person.get("name") or person.get("full_name") or "").strip()
-    # Supplier/AI combinations sometimes return title="Mr." AND name="Mr. Govind Sinha".
-    # Strip every repeated leading honorific here so filenames never become Mr_Mr_....
     honorific = r"^(?:Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof|Child|Infant)\.?\s+"
     while re.match(honorific, name, flags=re.I):
         name = re.sub(honorific, "", name, count=1, flags=re.I).strip()
     return name or "Guest"
 
 def _filename_person(person):
-    title = _title_for_person(person)
-    name = _full_name_without_title(person)
-    if title:
-        return f"{_safe_filename_part(title)}_{_safe_filename_part(name)}"
-    return _safe_filename_part(name)
+    # Kept for compatibility with any older internal calls.
+    return _filename_person_short(person)
+
+
+def _first_data_value(data, keys):
+    data=data or {}
+    for key in keys:
+        value=data.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return ""
+
+
+def _nested_first(data, container_keys):
+    data=data or {}
+    for key in container_keys:
+        items=data.get(key)
+        if isinstance(items,list) and items and isinstance(items[0],dict):
+            return items[0]
+        if isinstance(items,dict):
+            return items
+    return {}
+
+
+def _document_date(data, keys, nested_keys=()):
+    value=_first_data_value(data,keys)
+    if value:
+        return _dd_mm(value)
+    nested=_nested_first(data,nested_keys)
+    value=_first_data_value(nested,keys)
+    return _dd_mm(value)
+
+
+def _flight_route_filename_part(data):
+    segs=(data or {}).get("segments") or []
+    if not segs:
+        return "DEP-ARR"
+
+    def code(seg, dep=True):
+        if dep:
+            raw=seg.get("dep_code") or seg.get("departure_code")
+            airport=seg.get("dep_airport") or seg.get("departure_airport") or seg.get("dep_city")
+        else:
+            raw=seg.get("arr_code") or seg.get("arrival_code")
+            airport=seg.get("arr_airport") or seg.get("arrival_airport") or seg.get("arr_city")
+        raw=str(raw or "").strip().upper()
+        if re.fullmatch(r"[A-Z]{3}",raw):
+            return raw
+        return _airport_code(airport)
+
+    origin=code(segs[0],True)
+    final=code(segs[-1],False)
+
+    # Round trip: show actual destination rather than an unhelpful RPR-RPR.
+    if final==origin and len(segs)>=2:
+        route=[origin] + [code(s,False) for s in segs]
+        # Mid-point is normally the turnaround destination for direct/connecting RT.
+        destination=route[len(route)//2] if len(route)>=3 else code(segs[0],False)
+        if destination and destination!=origin:
+            return f"{origin}-{destination}_RT"
+
+    return f"{origin}-{final}"
+
 
 def _flight_filename(data):
-    passengers = data.get("passengers") or []
-    person = passengers[0] if passengers else {"name": data.get("guest_name") or "Guest"}
-    guest = _filename_person(person)
-    segs = data.get("segments") or []
-    arr = _safe_filename_part(segs[-1].get("arr_city") or segs[-1].get("arr_airport") or "Arrival") if segs else "Arrival"
-    return f"Air_{guest}_{_safe_filename_part(arr)}.pdf"
+    passengers=(data or {}).get("passengers") or []
+    person=passengers[0] if passengers else {
+        "name":(data or {}).get("guest_name") or "Guest",
+        "title":(data or {}).get("guest_title") or "",
+    }
+    guest=_filename_person_short(person)
+    route=_flight_route_filename_part(data)
+    segs=(data or {}).get("segments") or []
+    first_seg=segs[0] if segs else {}
+    date=_dd_mm(
+        first_seg.get("dep_date")
+        or first_seg.get("departure_date")
+        or (data or {}).get("travel_date")
+        or (data or {}).get("journey_date")
+        or (data or {}).get("date")
+    )
+    return f"{route}_{guest}_{date}_Itinerary.pdf"
+
 
 def _bus_filename(data):
-    passengers = data.get("passengers") or []
-    person = passengers[0] if passengers else {"name": data.get("guest_name") or "Guest"}
-    guest = _filename_person(person)
-    arr = _safe_filename_part(data.get("arr_city") or data.get("arrival_city") or "Arrival")
-    return f"Bus_{guest}_{arr}.pdf"
+    data=data or {}
+    passengers=data.get("passengers") or []
+    person=passengers[0] if passengers else {
+        "name":data.get("guest_name") or data.get("passenger_name") or "Guest",
+        "title":data.get("guest_title") or data.get("passenger_title") or "",
+    }
+    guest=_filename_person_short(person)
+
+    nested=_nested_first(data,("segments","journeys","trips"))
+    dep=_first_data_value(data,(
+        "dep_city","departure_city","from_city","origin_city","boarding_city","from","origin"
+    )) or _first_data_value(nested,(
+        "dep_city","departure_city","from_city","origin_city","boarding_city","from","origin"
+    ))
+    arr=_first_data_value(data,(
+        "arr_city","arrival_city","to_city","destination_city","dropping_city","to","destination"
+    )) or _first_data_value(nested,(
+        "arr_city","arrival_city","to_city","destination_city","dropping_city","to","destination"
+    ))
+
+    dep=_safe_filename_part(dep or "Departure","Departure")
+    arr=_safe_filename_part(arr or "Arrival","Arrival")
+
+    date=_document_date(
+        data,
+        ("journey_date","travel_date","departure_date","dep_date","boarding_date","bus_date","date"),
+        ("segments","journeys","trips"),
+    )
+    return f"{dep}-{arr}_{guest}_{date}_Itinerary.pdf"
+
 
 def _hotel_filename(data):
-    guest_obj = {"name": data.get("guest_name") or "Guest", "title": data.get("guest_title") or data.get("title") or ""}
-    guest = _filename_person(guest_obj)
-    city = _safe_filename_part(data.get("hotel_city") or data.get("city") or "City")
-    return f"Hotel_{guest}_{city}.pdf"
+    data=data or {}
+    guest_obj={
+        "name":data.get("guest_name") or data.get("passenger_name") or "Guest",
+        "title":data.get("guest_title") or data.get("title") or data.get("passenger_title") or "",
+    }
+    guest=_filename_person_short(guest_obj)
+    city=_safe_filename_part(data.get("hotel_city") or data.get("city") or "City","City")
+    date=_dd_mm(
+        data.get("check_in")
+        or data.get("checkin")
+        or data.get("check_in_date")
+        or data.get("arrival_date")
+        or data.get("date")
+    )
+    return f"{city}_{guest}_{date}_Voucher.pdf"
 
 
 def is_allowed(update: Update) -> bool:
@@ -869,12 +1099,13 @@ def _parse_markup_input(value, supplier_total=0, pax_count=1):
 
     Examples:
       15000 / total 15000 / make total 15000 -> final customer total
-      +800 per person / add markup 300 per pax -> supplier + amount × pax
+      403 per pax / +800 per person / add markup 300 per pax -> supplier + amount × eligible pax
       +1200 / add 1200 / markup 1200 total -> supplier + total markup
       -300 / reduce 300 -> supplier - markup
     """
     raw = str(value or "").strip().replace(",", "")
-    low = raw.lower().replace("₹", " ").replace("inr", " ").replace("rs.", " ").replace("rs", " ")
+    low = raw.lower().replace("₹", " ")
+    low = re.sub(r"(?i)\b(?:inr|rs\.?)\b", " ", low)
     if not low.strip():
         raise ValueError("Write the final total or markup naturally.")
 
@@ -893,18 +1124,29 @@ def _parse_markup_input(value, supplier_total=0, pax_count=1):
         low,
     ))
 
-    # "markup 1200 total" means ADD 1200 total, not set final total.
+    # OWNER RULE:
+    # `403 per pax`, `800 per person`, `300 each`, `500 pp` are ALL markups
+    # on the supplier booking fare. No + / markup prefix is required.
+    # Infant/INF exclusion is handled by the caller's eligible pax count.
     is_markup = plus or minus
-    if is_markup:
+    if per_person:
+        base = float(supplier_total or 0)
+        if base <= 0:
+            raise ValueError(
+                "Per-pax markup needs the original supplier fare. "
+                "If there is no supplier fare, enter the final booking total directly."
+            )
+        delta = amount * pax_count
+        fare = base - delta if minus else base + delta
+    elif is_markup:
         base = float(supplier_total or 0)
         if base <= 0:
             raise ValueError("A markup needs an original supplier fare. Otherwise enter the final total directly.")
-        delta = amount * pax_count if per_person else amount
-        fare = base - delta if minus else base + delta
+        fare = base - amount if minus else base + amount
     elif final_hint or re.fullmatch(r"\s*(?:₹|inr|rs\.?)?\s*[0-9]+(?:\.[0-9]+)?\s*(?:total|final)?\s*", raw, re.I):
         fare = amount
     else:
-        # A plain amount is intentionally treated as final customer total.
+        # Plain amount without per-pax/markup wording = final booking total.
         fare = amount
 
     if fare < 0:
@@ -912,9 +1154,34 @@ def _parse_markup_input(value, supplier_total=0, pax_count=1):
     return float(fare)
 
 
-def _fare_pax_count(data):
-    passengers = (data or {}).get("passengers") or []
-    return max(1, len(passengers))
+def _is_infant_passenger(p):
+    raw=" ".join(str((p or {}).get(k) or "") for k in ("type","title","name")).lower()
+    return bool(re.search(r"\b(?:infant|inf|baby)\b", raw))
+
+
+def _fare_pax_count(data, include_infants=False):
+    """Count chargeable pax for per-person fares/markups.
+
+    By default Infant/INF passengers are excluded. They are included only when
+    the owner's cost reply explicitly asks to include infants.
+    """
+    passengers=(data or {}).get("passengers") or []
+    if not passengers:
+        return 1
+    if include_infants:
+        return max(1, len(passengers))
+    eligible=[p for p in passengers if not _is_infant_passenger(p)]
+    return max(1, len(eligible))
+
+
+def _fare_include_infants(text):
+    low=str(text or "").lower()
+    return bool(re.search(
+        r"\b(?:include|including|add|with)\s+(?:the\s+)?(?:infant|infants|inf)\b|"
+        r"\b(?:infant|infants|inf)\s+(?:also|included)\b",
+        low,
+        re.I,
+    ))
 
 
 def _fare_cost_confirmation(value, supplier_total, final_fare, pax_count):
@@ -924,15 +1191,20 @@ def _fare_cost_confirmation(value, supplier_total, final_fare, pax_count):
     amount = float(nums[0]) if nums else 0
     per_person = bool(re.search(r"(?i)\b(?:per\s*(?:person|pax|passenger)|each|pp)\b", low))
     markup = bool(re.search(r"(?i)^\s*[+-]|\b(?:add|plus|increase|markup|mark\s*up|reduce|less|minus|deduct|discount)\b", low))
+    sign = "−" if re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b", low) else "+"
+    if per_person and supplier_total:
+        return (
+            f"✅ *Cost understood:*\n"
+            f"Supplier Fare: *INR {supplier_total:,.0f}*\n"
+            f"Per-pax Markup: {sign} INR {amount:,.0f} × {max(1,int(pax_count or 1))} eligible pax\n"
+            f"Infant: *Excluded by default*\n"
+            f"Final Customer Fare: *INR {final_fare:,.0f}*"
+        )
     if markup and supplier_total:
-        sign = "−" if re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b", low) else "+"
-        if per_person:
-            return (
-                f"✅ *Cost understood:* Supplier INR {supplier_total:,.0f} {sign} "
-                f"INR {amount:,.0f} × {max(1,int(pax_count or 1))} passenger(s) "
-                f"→ *Final INR {final_fare:,.0f}*"
-            )
-        return f"✅ *Cost understood:* Supplier INR {supplier_total:,.0f} {sign} INR {amount:,.0f} → *Final INR {final_fare:,.0f}*"
+        return (
+            f"✅ *Cost understood:* Supplier INR {supplier_total:,.0f} {sign} "
+            f"INR {amount:,.0f} → *Final INR {final_fare:,.0f}*"
+        )
     return f"✅ *Cost understood:* Final customer fare → *INR {final_fare:,.0f}*"
 
 
@@ -2646,7 +2918,11 @@ async def flight_ticket_fare(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_allowed(update): return ConversationHandler.END
     raw=(update.message.text or '').strip()
     supplier_total=float(context.user_data.get('pending_fare_supplier_total',0) or 0)
-    pax_count=_fare_pax_count(context.user_data.get('pending_flight_data') or {})
+    include_infants=_fare_include_infants(raw)
+    pax_count=_fare_pax_count(
+        context.user_data.get('pending_flight_data') or {},
+        include_infants=include_infants,
+    )
     try:
         fare=_parse_markup_input(raw,supplier_total,pax_count)
     except ValueError as exc:
@@ -7013,8 +7289,8 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             prompt=(f"💰 *Supplier fare: INR {supplier_total:,.0f}.*\n\n"
                     "Write the customer cost naturally — *no prefix is required*.\n\n"
                     "Examples:\n"
-                    "`+800 per person`\n"
-                    "`add markup 300 per pax`\n"
+                    "`403 per pax` → supplier fare + (403 × Adult/Child pax)\n`+800 per person` → markup × Adult/Child pax\n"
+                    "`add markup 300 per pax`\n`403 per pax including infant` → include INF too\n"
                     "`markup 1200 total`\n"
                     "`15000 total`\n"
                     "`make total 15000`\n"
@@ -7316,7 +7592,8 @@ async def receive_extra_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 fare=float(hotel_cost.get('total') or 0) or None
             else:
                 source_data=context.user_data.get('pending_flight_data') if kind=='flight' else context.user_data.get('pending_bus_data')
-                pax_count=_fare_pax_count(source_data or {})
+                include_infants=_fare_include_infants(text)
+                pax_count=_fare_pax_count(source_data or {}, include_infants=include_infants)
                 fare=_parse_markup_input(text, supplier_total, pax_count)
         except ValueError as exc:
             context.user_data['pending_fare_kind']=kind
