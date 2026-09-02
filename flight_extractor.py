@@ -232,6 +232,8 @@ Extract ONLY the booking data required for our customer-facing Air Print:
 - aircraft type/model when it is explicitly printed by the supplier (example: Airbus A320neo); otherwise return an empty string
 - fare_type: copy the exact printed fare family/type such as SAVER/FLEX/SPECIAL. If absent, leave blank.
 - baggage_summary: copy the COMPLETE supplier baggage allowance when printed, including BOTH check-in and cabin baggage. Example: `Check-in: 15KG (1 piece), Cabin: 7KG (1 piece)`. Never drop cabin baggage.
+- BAGGAGE TYPE RULE: passenger `type` must be canonical `Adult`, `Child`, or `Infant` whenever the source/title/passenger context supports it. Never use the generic word `Passenger` as a passenger type.
+- Preserve the supplier baggage source once only. Do not duplicate the same allowance token (for example never turn `15KG` into `15KG 15KG`).
 - special_ancillary_summary: copy ONLY explicitly BOOKED/CONFIRMED special ancillaries such as paid seat/seat number, meal, extra baggage beyond normal allowance, priority boarding, wheelchair, lounge, sports equipment or another SSR/service. Normal included check-in/cabin baggage is NOT a special ancillary. If nothing special is booked, leave blank.
 - every separate flight sector, including connecting/onward/return sectors
 - departure/arrival date, local time, city, and the COMPLETE airport/location wording exactly as printed by the supplier. Never shorten a long airport name. Preserve airport qualifiers such as International, Domestic, Airport, Terminal, Gate-area wording, city/airport combinations and punctuation when they are part of the supplier text. Use dep_airport / arr_airport for the full printed airport text and dep_code / arr_code for a printed 3-letter IATA code.
@@ -275,9 +277,11 @@ TOP LEVEL:
 
 PASSENGERS:
 - Preserve explicit name/title/type/DOB.
+- Normalize passenger type to exactly `Adult`, `Child`, or `Infant` when source/title context supports it. Never output generic `Passenger` as the type.
 - ticket_number only when an actual passenger ticket/e-ticket number is printed.
 - PNR, Trip ID and booking ID are never ticket numbers.
-- Preserve complete baggage wording when printed.
+- Preserve complete baggage wording when printed, including both check-in and cabin allowance when present.
+- Never duplicate an allowance while transcribing. Source `15KG` stays one `15KG`, not `15KG 15KG`.
 - Preserve passenger-specific special_ancillary only when explicitly booked/confirmed and visibly associated with that passenger.
 
 VISUAL ROW RULE:
@@ -618,6 +622,43 @@ def _sanitize_inferred_stops(data):
         stops=str(seg.get('stops') or '').strip()
         if re.fullmatch(r'0(?:\s*stops?)?', stops, re.I):
             seg['stops']=''
+    return data
+
+
+
+def _canonical_passenger_type(pax):
+    """Return only Adult / Child / Infant when supported by passenger context.
+
+    This is deliberately conservative. Generic `Passenger` is never retained.
+    """
+    pax=pax or {}
+    raw=" ".join(str(pax.get(k) or "") for k in ("type","title","name","baggage")).strip().lower()
+
+    if re.search(r"\b(?:infant|inf|baby)\b", raw):
+        return "Infant"
+    if re.search(r"\b(?:child|chd|cnn)\b", raw):
+        return "Child"
+    if re.search(r"\b(?:adult|adt)\b", raw):
+        return "Adult"
+
+    title=str(pax.get("title") or "").strip().lower().replace(".","")
+    if title in ("master","mstr"):
+        return "Child"
+    if title in ("mr","mrs","ms","dr","prof"):
+        return "Adult"
+    if title=="infant":
+        return "Infant"
+    if title=="child":
+        return "Child"
+
+    # Unknown is safer than a wrong category.
+    return ""
+
+
+def _normalize_passenger_types(data):
+    for pax in (data or {}).get("passengers") or []:
+        canonical=_canonical_passenger_type(pax)
+        pax["type"]=canonical
     return data
 
 
@@ -1682,6 +1723,7 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         data=_sanitize_ticket_numbers(data)
         data=_sanitize_inferred_stops(data)
         data=_apply_baggage_summary(data)
+        data=_normalize_passenger_types(data)
         data=_apply_special_ancillary_summary(data)
 
         # First generic endpoint safety gate.

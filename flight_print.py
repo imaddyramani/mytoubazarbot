@@ -260,90 +260,173 @@ def _baggage_icon(kind):
     )
 
 
-def _clean_baggage_allowance(component, kind, pax_type=""):
-    text=re.sub(r'\s+',' ',_text(component)).strip(' ,;|')
-    if not text:
-        return ""
+def _canonical_baggage_pax_type(person, raw_baggage=""):
+    """Canonical baggage label: Adult / Child / Infant only.
 
-    # The clip-art already communicates check-in vs cabin, so remove those labels.
-    if kind=="cabin":
-        text=re.sub(
-            r'(?i)\b(?:cabin\s*(?:baggage|bag)?|hand\s*(?:baggage|bag)?|carry[- ]?on\s*(?:baggage|bag)?)\b\s*[:\-]?',
-            ' ',
-            text,
-        )
-    else:
-        text=re.sub(
-            r'(?i)\b(?:checked(?:[- ]?in)?\s*(?:baggage|bag)?|check[- ]?in\s*(?:baggage|bag)?)\b\s*[:\-]?',
-            ' ',
-            text,
-        )
-
-    # Supplier may already print Adult/Child/Infant. Remove it and add the actual
-    # passenger type from the passenger row so the title is always correct.
-    text=re.sub(r'(?i)\b(?:adult|child|infant|inf|chd|adt)\b\s*[:\-]?', ' ', text)
-    text=re.sub(r'\s+',' ',text).strip(' :,-')
-
-    title=_text(pax_type).strip()
-    if not title:
-        title="Passenger"
-    low=title.lower()
-    if "inf" in low or "baby" in low:
-        title="Infant"
-    elif "child" in low or low in ("chd","cnn"):
-        title="Child"
-    elif "adult" in low or low=="adt":
-        title="Adult"
-
-    return f"{title} {text}".strip()
-
-
-def _baggage_html(value, pax_type=""):
-    """Two clean icon lines: trolley=check-in, handbag=cabin.
-
-    Example:
-      [trolley clip-art] Adult 15 KG
-      [cabin clip-art]   Adult 7 KG
+    Never prints generic `Passenger`. If the category cannot be supported from
+    passenger/source context, return blank rather than guessing.
     """
-    raw=re.sub(r'\s+',' ',_text(value)).strip()
-    if not raw:
-        return ""
+    if isinstance(person,dict):
+        raw=" ".join(
+            _text(person.get(k))
+            for k in ("type","title","name")
+        ) + " " + _text(raw_baggage)
+        title=_text(person.get("title")).lower().replace(".","")
+    else:
+        raw=_text(person) + " " + _text(raw_baggage)
+        title=_text(person).lower().replace(".","")
 
-    # Split at the cabin/hand-baggage label. This handles both comma-separated
-    # supplier wording and one continuous sentence.
-    cabin_match=re.search(
-        r'(?i)\b(?:cabin\s*(?:baggage|bag)?|hand\s*(?:baggage|bag)?|carry[- ]?on\s*(?:baggage|bag)?)\b',
-        raw,
+    low=raw.lower()
+    if re.search(r"\b(?:infant|inf|baby)\b",low):
+        return "Infant"
+    if re.search(r"\b(?:child|chd|cnn)\b",low):
+        return "Child"
+    if re.search(r"\b(?:adult|adt)\b",low):
+        return "Adult"
+
+    if title in ("master","mstr"):
+        return "Child"
+    if title in ("mr","mrs","ms","dr","prof"):
+        return "Adult"
+    if title=="infant":
+        return "Infant"
+    if title=="child":
+        return "Child"
+    return ""
+
+
+def _normalize_weight_token(number, unit):
+    try:
+        n=float(number)
+        number=str(int(n)) if n.is_integer() else str(n).rstrip("0").rstrip(".")
+    except Exception:
+        number=str(number).strip()
+
+    u=str(unit or "").lower()
+    if u.startswith("kg") or u.startswith("kilo"):
+        return f"{number}kg"
+    if u.startswith("pc") or u.startswith("piece"):
+        suffix="pc" if number=="1" else "pcs"
+        return f"{number}{suffix}"
+    return f"{number}{unit}".strip()
+
+
+def _baggage_allowance_tokens(text):
+    """Extract source allowance tokens once, removing exact duplicates.
+
+    Examples:
+      15kgs 15kgs -> ["15kg"]
+      7 KG 7kgs   -> ["7kg"]
+      1 Piece     -> ["1pc"]
+    """
+    text=_text(text)
+    found=[]
+    seen=set()
+    pattern=r"(?i)(\d+(?:\.\d+)?)\s*(kg|kgs|kilogram|kilograms|pc|pcs|piece|pieces)\b"
+    for m in re.finditer(pattern,text):
+        token=_normalize_weight_token(m.group(1),m.group(2))
+        key=token.lower()
+        if key not in seen:
+            seen.add(key)
+            found.append(token)
+    return found
+
+
+def _baggage_kind_chunks(raw):
+    """Split baggage text by source labels without inventing cabin/check-in data."""
+    raw=re.sub(r"\s+"," ",_text(raw)).strip()
+    if not raw:
+        return []
+
+    check_re=re.compile(
+        r"(?i)\b(?:checked(?:[- ]?in)?\s*(?:baggage|bag)?|"
+        r"check[- ]?in\s*(?:baggage|bag)?|registered\s*(?:baggage|bag)?)\b"
+    )
+    cabin_re=re.compile(
+        r"(?i)\b(?:cabin\s*(?:baggage|bag)?|hand\s*(?:baggage|bag)?|"
+        r"carry[- ]?on\s*(?:baggage|bag)?)\b"
     )
 
-    check_part=""
-    cabin_part=""
-    if cabin_match:
-        check_part=raw[:cabin_match.start()].strip(' ,;|')
-        cabin_part=raw[cabin_match.start():].strip(' ,;|')
-    else:
-        # No explicit cabin label: treat the supplier text as check-in unless it
-        # clearly says hand/carry-on.
-        if re.search(r'(?i)\b(?:hand\s*bag|carry[- ]?on)\b',raw):
-            cabin_part=raw
-        else:
-            check_part=raw
+    labels=[]
+    for m in check_re.finditer(raw):
+        labels.append((m.start(),m.end(),"checkin"))
+    for m in cabin_re.finditer(raw):
+        labels.append((m.start(),m.end(),"cabin"))
+    labels.sort(key=lambda x:x[0])
 
+    chunks=[]
+    if labels:
+        # If an allowance appears before the first CABIN label (common format:
+        # `Adult 15kg, Cabin 7kg`), that prefix is the check-in allowance.
+        prefix=raw[:labels[0][0]].strip(" ,;|:/-")
+        if prefix and _baggage_allowance_tokens(prefix):
+            prefix_kind="checkin" if labels[0][2]=="cabin" else labels[0][2]
+            chunks.append((prefix_kind,prefix))
+
+        for i,(s,e,kind) in enumerate(labels):
+            next_s=labels[i+1][0] if i+1<len(labels) else len(raw)
+            chunk=raw[s:next_s].strip(" ,;|:/-")
+            if chunk:
+                chunks.append((kind,chunk))
+    else:
+        # No source cabin/check-in label. Do NOT guess a second category.
+        chunks=[("checkin",raw)]
+
+    return chunks
+
+
+def _normalized_baggage_entries(value, person=None):
+    """Return normalized unique entries: [(kind, pax_type, allowance), ...]."""
+    raw=re.sub(r"\s+"," ",_text(value)).strip()
+    if not raw:
+        return []
+
+    pax_type=_canonical_baggage_pax_type(person,raw)
+    if not pax_type:
+        # Never fall back to the word Passenger or guess a category.
+        return []
+
+    entries=[]
+    seen=set()
+    for kind,chunk in _baggage_kind_chunks(raw):
+        tokens=_baggage_allowance_tokens(chunk)
+        if not tokens:
+            continue
+
+        # Preserve multiple DISTINCT source allowances if genuinely present, but
+        # never print duplicated tokens.
+        allowance=" + ".join(tokens)
+        key=(kind,pax_type.lower(),allowance.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append((kind,pax_type,allowance))
+    return entries
+
+
+def _baggage_signature(value, person=None):
+    return tuple(
+        (kind,pax_type.lower(),allowance.lower())
+        for kind,pax_type,allowance in _normalized_baggage_entries(value,person)
+    )
+
+
+def _baggage_html(value, person=None):
+    """Render only canonical type + normalized allowance.
+
+    Example:
+      [trolley icon] Adult 15kg
+      [cabin icon]   Adult 7kg
+
+    No `Passenger`, no `15kg 15kg`, no repeated baggage labels.
+    """
+    entries=_normalized_baggage_entries(value,person)
     lines=[]
-    if check_part:
-        cleaned=_clean_baggage_allowance(check_part,"checkin",pax_type)
-        if cleaned:
-            lines.append(
-                f'<span class="bag-line">{_baggage_icon("checkin")}'
-                f'<span>{_esc(cleaned)}</span></span>'
-            )
-    if cabin_part:
-        cleaned=_clean_baggage_allowance(cabin_part,"cabin",pax_type)
-        if cleaned:
-            lines.append(
-                f'<span class="bag-line">{_baggage_icon("cabin")}'
-                f'<span>{_esc(cleaned)}</span></span>'
-            )
+    for kind,pax_type,allowance in entries:
+        lines.append(
+            f'<span class="bag-line">{_baggage_icon(kind)}'
+            f'<span>{_esc(pax_type)} {_esc(allowance)}</span></span>'
+        )
     return ''.join(lines)
 
 
@@ -511,17 +594,27 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     pax_table_class="pax has-ancillary" if has_ancillary else "pax"
 
     pax_rows_list=[]
+    seen_baggage_signatures=set()
     for i,p in enumerate(passengers):
         ticket_value=_text(p.get("ticket_number")) if has_real_ticket else _text(data.get("airline_pnr"))
         baggage_value=_text(p.get("baggage")) or baggage_summary
         ancillary_value=_text(p.get("special_ancillary")) or ancillary_summary
+
+        baggage_signature=_baggage_signature(baggage_value,p)
+        if baggage_signature and baggage_signature in seen_baggage_signatures:
+            baggage_html=""
+        else:
+            baggage_html=_baggage_html(baggage_value,p)
+            if baggage_signature:
+                seen_baggage_signatures.add(baggage_signature)
+
         row=(
             f'<tr><td class="pax-index">{i+1}</td>'
             f'<td class="pax-name"><strong>{_esc(_display_person_name(p))}</strong></td>'
             f'<td class="pax-pnr">{_esc(ticket_value)}</td>'
             f'<td class="pax-type">{_esc(p.get("type") or "Adult")}</td>'
             f'<td class="pax-dob">{_esc(p.get("dob"))}</td>'
-            f'<td class="baggage-cell">{_baggage_html(baggage_value, p.get("type"))}</td>'
+            f'<td class="baggage-cell">{baggage_html}</td>'
         )
         if has_ancillary:
             row += f'<td class="ancillary-cell">{_esc(ancillary_value)}</td>'
