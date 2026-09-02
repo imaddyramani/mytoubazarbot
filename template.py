@@ -174,7 +174,8 @@ def generate_pdf(data, output_path, logo_path=None, page_size="A4", text_scale_o
         <div class='section'>TRANSIT &amp; CONNECTION SCHEDULE</div>
         <table class='schedule transit'><thead><tr>
         <th>DATE</th><th>SEGMENT &amp; MODE</th><th>ROUTE DETAILS</th><th>DEPARTURE</th><th>ARRIVAL</th>
-        </tr></thead><tbody>{transit_rows}</tbody></table>"""
+        </tr></thead><tbody>{transit_rows}</tbody></table>
+        <div class='transit-ticket-note'><strong>Important:</strong> Please check the original ticket / e-ticket for the latest and exact departure/arrival timings, terminal information and any operational updates before travel.</div>"""
     elif data.get("transit_done_by_self"):
         transit_section = """
         <div class='section'>TRANSIT &amp; CONNECTION SCHEDULE</div>
@@ -507,7 +508,7 @@ li{{margin-bottom:4px;font-size:8pt}}.policies{{font-size:7.8pt;white-space:pre-
 .footer{{border-top:2px solid #f39a21;margin-top:15px;padding-top:9px;text-align:center;color:#4b555c;font-size:7.7pt}}
 .footer h2{{margin:0;color:#153b5c;letter-spacing:1.5px;font-size:11pt}}.tag{{color:#f39a21;font-style:italic;margin:2px 0 4px}}
  .itinerary-roomy{{font-size:9.5pt}}.itinerary-roomy .schedule th{{font-size:8.2pt;padding:7px 8px}}.itinerary-roomy .schedule td{{font-size:8.4pt;padding:7px 8px}}.itinerary-roomy .day h3{{font-size:9.8pt}}.itinerary-roomy .day p{{font-size:9.4pt}}.itinerary-roomy .section{{font-size:10pt}} .itinerary-normal{{font-size:9pt}} .itinerary-compact{{font-size:8.5pt}}.itinerary-compact .schedule th{{font-size:7.3pt;padding:5px 6px}}.itinerary-compact .schedule td{{font-size:7.5pt;padding:5px 6px}}.itinerary-compact .day p{{font-size:8.2pt}}
-.transit-self{{text-align:center!important;vertical-align:middle!important;height:58px;font-weight:700}}.transit-airport{{font-size:7.5pt;color:#555}}</style></head><body class='{density_class}'>
+.transit-self{{text-align:center!important;vertical-align:middle!important;height:58px;font-weight:700}}.transit-airport{{font-size:7.5pt;color:#555}}.transit-ticket-note{{margin:2mm 1mm 3mm;padding:2mm 2.6mm;background:#fff7ed;border-left:3px solid #f4a62a;color:#5a4931;font-size:7.8pt;line-height:1.35}}</style></head><body class='{density_class}'>
 <div class='banner'><div class='logo'>{logo_html}</div><div class='head'>
 <div class='label'>{esc(data.get('document_title') or 'OFFICIAL TOUR ITINERARY')}</div><div class='client'>{esc(data.get('client_name'))}</div>
 <div class='title'>{esc(data.get('travel_dates'))} | {esc(data.get('tour_title'))} {('(' + esc(data.get('duration')) + ')') if data.get('duration') else ''}</div>

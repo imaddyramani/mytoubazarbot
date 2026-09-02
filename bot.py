@@ -670,60 +670,271 @@ def _normalize_page_size(value):
     }
     return aliases.get(raw, "")
 
-def _parse_hotel_cost_input(value, supplier_total=0):
-    """Hotel cost uses Per Room + optional EB + Total, not Air/Bus fare fields."""
-    raw=str(value or '').strip().replace('₹','').replace(',','')
-    if not raw:
-        raise ValueError('Please enter hotel costing. Example: Room 8500, EB 1200, Total 18200.')
-    def pick(patterns):
+def _hotel_date_value(value):
+    raw=re.sub(r'(?i)(\d)(st|nd|rd|th)\b',r'\1',str(value or ''))
+    raw=re.sub(r'[,|]',' ',raw)
+    raw=re.sub(r'\s+',' ',raw).strip()
+    formats=(
+        '%d %b %Y','%d %B %Y','%Y-%m-%d','%d-%m-%Y','%d/%m/%Y',
+        '%d %b %y','%d %B %y','%d-%b-%Y','%d-%B-%Y'
+    )
+    # Extract a date token from labels/times around it.
+    candidates=[raw]
+    m=re.search(r'(?i)\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})\b',raw)
+    if m: candidates.insert(0,m.group(1))
+    m=re.search(r'\b(\d{4}-\d{1,2}-\d{1,2})\b',raw)
+    if m: candidates.insert(0,m.group(1))
+    m=re.search(r'\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b',raw)
+    if m: candidates.insert(0,m.group(1))
+    for cand in candidates:
+        for fmt in formats:
+            try: return datetime.strptime(cand,fmt)
+            except Exception: pass
+    return None
+
+
+def _hotel_night_count(data, explicit=None):
+    if explicit:
+        try:
+            n=int(float(explicit))
+            if n>0: return n
+        except Exception: pass
+    raw=str((data or {}).get('nights') or '')
+    m=re.search(r'(\d+)',raw)
+    if m and int(m.group(1))>0:
+        return int(m.group(1))
+    ci=_hotel_date_value((data or {}).get('check_in'))
+    co=_hotel_date_value((data or {}).get('check_out'))
+    if ci and co:
+        days=(co-ci).days
+        if days>0: return days
+    return 0
+
+
+def _hotel_room_count(data, explicit=None):
+    if explicit:
+        try:
+            n=int(float(explicit))
+            if n>0: return n
+        except Exception: pass
+    try:
+        n=int(float((data or {}).get('room_count') or 0))
+        if n>0: return n
+    except Exception: pass
+    raw=' '.join(str((data or {}).get(k) or '') for k in ('room_type','occupancy_summary'))
+    m=re.search(r'(?i)\b(\d+)\s*(?:room|rooms)\b',raw)
+    return int(m.group(1)) if m else 1
+
+
+def _hotel_extra_bed_count(data, explicit=None):
+    if explicit is not None:
+        try:
+            n=int(float(explicit))
+            if n>=0: return n
+        except Exception: pass
+    try:
+        n=int(float((data or {}).get('extra_bed_count') or 0))
+        if n>=0 and n>0: return n
+    except Exception: pass
+    raw=' '.join(str((data or {}).get(k) or '') for k in ('room_type','occupancy_summary'))
+    m=re.search(r'(?i)\b(\d+)\s*(?:extra\s*(?:bed|mattress)|eb)\b',raw)
+    return int(m.group(1)) if m else 0
+
+
+def _parse_hotel_cost_input(value, supplier_total=0, data=None):
+    """Natural Hotel costing with room/night and EB/night calculation."""
+    raw=str(value or '').strip().replace('₹',' ').replace(',','')
+    low=re.sub(r'\s+',' ',raw.lower()).strip()
+    if not low:
+        raise ValueError('Write the room/night rate, EB/night rate, or final hotel total naturally.')
+
+    def amount(patterns):
         for pat in patterns:
-            m=re.search(pat,raw,re.I)
+            m=re.search(pat,low,re.I)
             if m: return float(m.group(1))
         return None
-    per_room=pick([r'\b(?:per\s*)?room(?:\s*cost)?\b\s*(?:[:=\-]|is|cost)?\s*([0-9]+(?:\.[0-9]+)?)',r'([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*)?room\b'])
-    eb=pick([r'\b(?:eb|extra\s*bed)\b\s*(?:[:=\-]|is|cost)?\s*([0-9]+(?:\.[0-9]+)?)',r'([0-9]+(?:\.[0-9]+)?)\s*(?:eb|extra\s*bed)\b'])
-    total=pick([r'\b(?:total|grand\s*total|final)\b\s*(?:[:=\-]|is|cost)?\s*([0-9]+(?:\.[0-9]+)?)',r'([0-9]+(?:\.[0-9]+)?)\s*(?:total|grand\s*total|final)\b'])
-    if per_room is None and eb is None and total is None:
-        m=re.fullmatch(r'\s*([+-])?\s*([0-9]+(?:\.[0-9]+)?)\s*',raw)
-        if not m:
-            raise ValueError('Hotel cost format: Room 8500, EB 1200, Total 18200.')
-        amount=float(m.group(2)); sign=m.group(1)
-        if sign:
-            base=float(supplier_total or 0)
-            if base<=0: raise ValueError('A + / - hotel markup needs a supplier total. Enter Room/Total directly.')
-            amount=base+amount if sign=='+' else base-amount
-        per_room=amount; total=amount
-    if total is None:
-        total=(per_room or 0)+(eb or 0)
-    return {'per_room':per_room,'eb':eb,'total':total,'currency':'INR'}
+
+    explicit_nights=amount([r'\b(\d+)\s*nights?\b'])
+    explicit_rooms=amount([r'\b(\d+)\s*rooms?\b'])
+    explicit_eb_count=amount([r'\b(\d+)\s*(?:eb|extra\s*(?:bed|beds|mattress|mattresses))\b'])
+
+    nights=_hotel_night_count(data,explicit_nights)
+    rooms=_hotel_room_count(data,explicit_rooms)
+    extra_beds=_hotel_extra_bed_count(data,explicit_eb_count)
+
+    final_total=amount([
+        r'\b(?:make\s+(?:it\s+)?total|set\s+(?:the\s+)?total|final\s*(?:hotel\s*)?(?:cost|total|amount)|grand\s*total|total\s*(?:hotel\s*)?(?:cost|amount)?)\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
+        r'([0-9]+(?:\.[0-9]+)?)\s*(?:final|grand\s*total|total)\b',
+    ])
+
+    # Markup language is detected before direct rate parsing.
+    markup_word=bool(re.search(r'(?i)^\s*[+-]|\b(?:add|markup|mark\s*up|increase|plus|reduce|less|minus|deduct)\b',low))
+    markup_amount=amount([r'(?i)(?:^\s*[+-]\s*|\b(?:add|markup|mark\s*up|increase|plus|reduce|less|minus|deduct)\b[^0-9]{0,15})([0-9]+(?:\.[0-9]+)?)'])
+    minus=bool(re.search(r'(?i)^\s*-|\b(?:reduce|less|minus|deduct)\b',low))
+    per_room_night=bool(re.search(r'(?i)\b(?:per\s*room\s*(?:per|/)?\s*night|room\s*/\s*night|per\s*night\s*per\s*room)\b',low))
+
+    existing=(data or {}).get('customer_hotel_cost') or {}
+
+    if markup_word and markup_amount is not None:
+        if per_room_night:
+            if nights<=0:
+                raise ValueError('I could not determine the number of nights from check-in/check-out. Include the nights or enter a final total.')
+            base_rate=float(existing.get('room_rate_per_night') or existing.get('per_room') or 0)
+            if base_rate<=0 and float(supplier_total or 0)>0:
+                base_rate=float(supplier_total)/(max(1,rooms)*nights)
+            if base_rate<=0:
+                raise ValueError('Per-room/night markup needs an existing supplier/customer base. Enter the new room rate directly instead.')
+            room_rate=base_rate-markup_amount if minus else base_rate+markup_amount
+            eb_rate=float(existing.get('eb_rate_per_night') or existing.get('eb') or 0)
+        else:
+            base=float(existing.get('total') or supplier_total or 0)
+            if base<=0:
+                raise ValueError('A hotel markup needs an existing total. Enter the final total directly.')
+            total=base-markup_amount if minus else base+markup_amount
+            return {
+                'per_room':None,'eb':None,'room_rate_per_night':None,'eb_rate_per_night':None,
+                'rooms':rooms,'nights':nights,'extra_beds':extra_beds,
+                'room_total':None,'eb_total':None,'total':total,'currency':'INR','mode':'direct_total'
+            }
+    else:
+        room_rate=amount([
+            r'\b(?:room\s*(?:rate|cost|price)?|per\s*room)\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*)?room(?:\s*(?:per|/)\s*night)?\b',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:room\s*/\s*night)\b',
+        ])
+        eb_rate=amount([
+            r'\b(?:eb|extra\s*(?:bed|mattress))(?:\s*(?:rate|cost|price))?\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*)?(?:eb|extra\s*(?:bed|mattress))(?:\s*(?:per|/)\s*night)?\b',
+        ])
+
+    # An explicit final total wins when no per-night rate is being supplied.
+    if final_total is not None and room_rate is None and eb_rate is None and not markup_word:
+        return {
+            'per_room':None,'eb':None,'room_rate_per_night':None,'eb_rate_per_night':None,
+            'rooms':rooms,'nights':nights,'extra_beds':extra_beds,
+            'room_total':None,'eb_total':None,'total':final_total,'currency':'INR','mode':'direct_total'
+        }
+
+    # Plain number = final total, keeping the old easy behavior.
+    if room_rate is None and eb_rate is None:
+        nums=re.findall(r'([0-9]+(?:\.[0-9]+)?)',low)
+        if len(nums)==1 and not re.search(r'(?i)\b(?:room|night|eb|extra\s*bed)\b',low):
+            total=float(nums[0])
+            return {
+                'per_room':None,'eb':None,'room_rate_per_night':None,'eb_rate_per_night':None,
+                'rooms':rooms,'nights':nights,'extra_beds':extra_beds,
+                'room_total':None,'eb_total':None,'total':total,'currency':'INR','mode':'direct_total'
+            }
+        raise ValueError('I could not understand the hotel rate. Example: 3500 per room per night, EB 1200 per night, or total 25000.')
+
+    if nights<=0:
+        raise ValueError('I could not determine nights from the hotel check-in/check-out. Add the number of nights or enter a final total.')
+    rooms=max(1,rooms)
+    if eb_rate is not None and extra_beds<=0:
+        extra_beds=1
+
+    room_total=(float(room_rate or 0)*rooms*nights)
+    eb_total=(float(eb_rate or 0)*extra_beds*nights)
+    total=room_total+eb_total
+    return {
+        'per_room':room_rate,'eb':eb_rate,
+        'room_rate_per_night':room_rate,'eb_rate_per_night':eb_rate,
+        'rooms':rooms,'nights':nights,'extra_beds':extra_beds,
+        'room_total':room_total,'eb_total':eb_total,'total':total,
+        'currency':'INR','mode':'calculated'
+    }
 
 
-def _parse_markup_input(value, supplier_total=0):
-    """Parse a fare entry from the owner.
+def _hotel_cost_confirmation(cost):
+    c=cost or {}
+    total=float(c.get('total') or 0)
+    if c.get('mode')=='direct_total' or c.get('room_rate_per_night') is None:
+        return f"✅ *Hotel cost understood:* Final Total Hotel Cost → *INR {total:,.0f}*"
+    rooms=int(c.get('rooms') or 1); nights=int(c.get('nights') or 0)
+    room_rate=float(c.get('room_rate_per_night') or 0); room_total=float(c.get('room_total') or 0)
+    lines=[
+        "✅ *Hotel cost understood:*",
+        f"Room: INR {room_rate:,.0f} × {rooms} room(s) × {nights} night(s) = *INR {room_total:,.0f}*",
+    ]
+    if float(c.get('eb_rate_per_night') or 0)>0:
+        eb_rate=float(c.get('eb_rate_per_night') or 0); eb_count=int(c.get('extra_beds') or 0); eb_total=float(c.get('eb_total') or 0)
+        lines.append(f"Extra Bed: INR {eb_rate:,.0f} × {eb_count} EB × {nights} night(s) = *INR {eb_total:,.0f}*")
+    lines.append(f"*Total Hotel Cost: INR {total:,.0f}*")
+    return "\\n".join(lines)
 
-    Supported forms:
-      8500   -> final fare
-      +500   -> supplier fare + 500
-      -300   -> supplier fare - 300
+
+
+def _parse_markup_input(value, supplier_total=0, pax_count=1):
+    """Natural Air/Bus customer-fare parser.
+
+    Examples:
+      15000 / total 15000 / make total 15000 -> final customer total
+      +800 per person / add markup 300 per pax -> supplier + amount × pax
+      +1200 / add 1200 / markup 1200 total -> supplier + total markup
+      -300 / reduce 300 -> supplier - markup
     """
-    text = str(value or "").strip().replace(",", "")
-    if not text:
-        raise ValueError("Please enter a fare, +markup, or -markup.")
-    m = re.fullmatch(r"([+-])?\s*₹?\s*(\d+(?:\.\d+)?)", text)
-    if not m:
-        raise ValueError("Invalid fare. Use 8500, +500, or -300.")
-    amount = float(m.group(2))
-    sign = m.group(1)
-    if sign:
+    raw = str(value or "").strip().replace(",", "")
+    low = raw.lower().replace("₹", " ").replace("inr", " ").replace("rs.", " ").replace("rs", " ")
+    if not low.strip():
+        raise ValueError("Write the final total or markup naturally.")
+
+    numbers = re.findall(r"(?<![A-Za-z])([0-9]+(?:\.[0-9]+)?)", low)
+    if not numbers:
+        raise ValueError("I could not find an amount in that reply.")
+    amount = float(numbers[0])
+
+    pax_count = max(1, int(pax_count or 1))
+    per_person = bool(re.search(r"(?i)\b(?:per\s*(?:person|pax|passenger)|each|pp)\b", low))
+    minus = bool(re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b", low))
+    plus = bool(re.search(r"(?i)^\s*\+|\b(?:add|plus|increase|markup|mark\s*up)\b", low))
+    final_hint = bool(re.search(
+        r"(?i)\b(?:final\s*(?:fare|total|amount)|customer\s*(?:fare|total|amount)|"
+        r"make\s+(?:it\s+)?total|set\s+(?:the\s+)?total|direct\s+total|total\s+amount|total\s+fare)\b",
+        low,
+    ))
+
+    # "markup 1200 total" means ADD 1200 total, not set final total.
+    is_markup = plus or minus
+    if is_markup:
         base = float(supplier_total or 0)
         if base <= 0:
-            raise ValueError("A + / - markup needs a supplier fare. Enter the final fare directly instead.")
-        fare = base + amount if sign == "+" else base - amount
-    else:
+            raise ValueError("A markup needs an original supplier fare. Otherwise enter the final total directly.")
+        delta = amount * pax_count if per_person else amount
+        fare = base - delta if minus else base + delta
+    elif final_hint or re.fullmatch(r"\s*(?:₹|inr|rs\.?)?\s*[0-9]+(?:\.[0-9]+)?\s*(?:total|final)?\s*", raw, re.I):
         fare = amount
+    else:
+        # A plain amount is intentionally treated as final customer total.
+        fare = amount
+
     if fare < 0:
         raise ValueError("Updated fare cannot be negative.")
-    return fare
+    return float(fare)
+
+
+def _fare_pax_count(data):
+    passengers = (data or {}).get("passengers") or []
+    return max(1, len(passengers))
+
+
+def _fare_cost_confirmation(value, supplier_total, final_fare, pax_count):
+    raw = str(value or "").strip()
+    low = raw.lower()
+    nums = re.findall(r"([0-9]+(?:\.[0-9]+)?)", raw.replace(",", ""))
+    amount = float(nums[0]) if nums else 0
+    per_person = bool(re.search(r"(?i)\b(?:per\s*(?:person|pax|passenger)|each|pp)\b", low))
+    markup = bool(re.search(r"(?i)^\s*[+-]|\b(?:add|plus|increase|markup|mark\s*up|reduce|less|minus|deduct|discount)\b", low))
+    if markup and supplier_total:
+        sign = "−" if re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b", low) else "+"
+        if per_person:
+            return (
+                f"✅ *Cost understood:* Supplier INR {supplier_total:,.0f} {sign} "
+                f"INR {amount:,.0f} × {max(1,int(pax_count or 1))} passenger(s) "
+                f"→ *Final INR {final_fare:,.0f}*"
+            )
+        return f"✅ *Cost understood:* Supplier INR {supplier_total:,.0f} {sign} INR {amount:,.0f} → *Final INR {final_fare:,.0f}*"
+    return f"✅ *Cost understood:* Final customer fare → *INR {final_fare:,.0f}*"
+
 
 def _supplier_total(data):
     """Return the supplier payable total without dropping surcharges/ancillaries."""
@@ -1328,9 +1539,9 @@ async def perform_saved_edit(update, context, instruction):
         package_cost_only = False
         hotel_cost_update = None
         hotel_cost_only = False
-        if doc_type == 'hotel' and re.search(r'(?i)\b(?:per\s*room|room\s*(?:cost|rate|price)|hotel\s*(?:cost|rate|price)|customer\s*(?:cost|rate|price)|extra\s*(?:bed|mattress)|\beb\b|grand\s*total|total\s*(?:cost|price|fare))\b', str(instruction or '')):
+        if doc_type == 'hotel' and re.search(r'(?i)\b(?:per\s*room|per\s*night|room\s*(?:cost|rate|price)|hotel\s*(?:cost|rate|price)|customer\s*(?:cost|rate|price)|extra\s*(?:bed|mattress)|\beb\b|grand\s*total|total\s*(?:cost|price|fare)|markup|mark\s*up)\b', str(instruction or '')):
             try:
-                hotel_cost_update = _parse_hotel_cost_input(instruction, float(old_fare or 0) or _supplier_total(old_data))
+                hotel_cost_update = _parse_hotel_cost_input(instruction, _supplier_total(old_data), old_data)
             except Exception:
                 hotel_cost_update = None
             hotel_cost_only = _hotel_edit_is_cost_only(instruction, hotel_cost_update)
@@ -2103,6 +2314,7 @@ async def _source_ack_message(update, context, text, reply_markup=None):
                 parse_mode='Markdown',
                 reply_markup=None,
             )
+            context.user_data['_source_status_message'] = existing
             return existing
         except Exception as exc:
             logger.warning(
@@ -2150,7 +2362,13 @@ async def _source_countdown(prompt_message, context, workflow, process_callback)
         context.user_data.pop("_source_auto_token", None)
         context.user_data.pop("_source_auto_task", None)
         context.user_data["_source_auto_processed"] = workflow
-        await _safe_message_text_edit(prompt_message, "✅ *5 seconds elapsed — processing now...*", reply_markup=None)
+        await _safe_message_text_edit(
+            prompt_message,
+            "🤖 *Processing your supplier material...*\n\n"
+            "████░░░░░░░░░░░ 25%\n\n"
+            "🔍 Starting extraction now...",
+            reply_markup=None
+        )
         await process_callback()
     except asyncio.CancelledError:
         return
@@ -2209,8 +2427,23 @@ async def process_bus_ticket(update, context):
     files=context.user_data.get('bus_ticket_files',[]); txt=context.user_data.get('bus_ticket_text','')
     if not files and not txt:
         await update.message.reply_text('Please send a bus PDF, image or text. Tap ❌ Cancel to stop.', reply_markup=bus_ticket_keyboard()); return BUS_TICKET_INPUT
-    status=await update.message.reply_text('🚌 *Reading bus booking documents...*\n\n████░░░░░░░░░░░ 25%\n\n🔍 Extracting passenger, PNR, route and fare details...',parse_mode='Markdown',reply_markup=ReplyKeyboardRemove())
-    context.user_data['_source_status_message']=status
+    # V176: continue editing the SAME countdown/source message.
+    status=context.user_data.get('_source_status_message')
+    if status is None:
+        status=await update.message.reply_text(
+            '🚌 *Reading bus booking documents...*\n\n████░░░░░░░░░░░ 25%\n\n'
+            '🔍 Extracting passenger, PNR, route and fare details...',
+            parse_mode='Markdown'
+        )
+        context.user_data['_source_status_message']=status
+    else:
+        await safe_status_edit(
+            status,
+            update.message,
+            '🚌 *Reading bus booking documents...*\n\n████░░░░░░░░░░░ 25%\n\n'
+            '🔍 Extracting passenger, PNR, route and fare details...',
+            parse_mode='Markdown'
+        )
     try:
         parts=[{'path':p,'mime_type':'application/pdf' if p.lower().endswith('.pdf') else 'image/jpeg'} for p in files]
         data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_bus_ticket,parts,txt,GEMINI_API_KEY,GEMINI_MODEL), ['🚌 Reading bus booking pages...','🔍 Extracting passenger, PNR, route and fare...'], 25, 92)
@@ -2323,8 +2556,24 @@ async def process_flight_ticket(update, context):
     files=context.user_data.get('flight_ticket_files',[]); txt=context.user_data.get('flight_ticket_text','')
     if not files and not txt:
         await update.message.reply_text('Please send a flight PDF, image or text. Tap ❌ Cancel to stop.', reply_markup=flight_ticket_keyboard()); return FLIGHT_TICKET_INPUT
-    status=await update.message.reply_text('✈️ *Reading flight documents...*\n\n████░░░░░░░░░░░ 25%\n\n🔍 Extracting passenger, PNR, flight sectors and fare details...',parse_mode='Markdown',reply_markup=ReplyKeyboardRemove())
-    context.user_data['_source_status_message']=status
+    # V176: continue editing the SAME countdown/source message.
+    # Do not create a second "Reading flight documents" message.
+    status=context.user_data.get('_source_status_message')
+    if status is None:
+        status=await update.message.reply_text(
+            '✈️ *Reading flight documents...*\n\n████░░░░░░░░░░░ 25%\n\n'
+            '🔍 Extracting passenger, PNR, flight sectors and fare details...',
+            parse_mode='Markdown'
+        )
+        context.user_data['_source_status_message']=status
+    else:
+        await safe_status_edit(
+            status,
+            update.message,
+            '✈️ *Reading flight documents...*\n\n████░░░░░░░░░░░ 25%\n\n'
+            '🔍 Extracting passenger, PNR, flight sectors and fare details...',
+            parse_mode='Markdown'
+        )
     try:
         parts=[{'path':p,'mime_type':'application/pdf' if p.lower().endswith('.pdf') else 'image/jpeg'} for p in files]
         data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_flight_ticket,parts,txt,GEMINI_API_KEY,GEMINI_MODEL), ['✈️ Reading flight booking pages...','🔍 Extracting passenger, PNR, sectors and fare...'], 25, 92)
@@ -2395,12 +2644,17 @@ async def flight_ticket_document(update: Update, context: ContextTypes.DEFAULT_T
 
 async def flight_ticket_fare(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return ConversationHandler.END
-    raw=(update.message.text or '').replace(',','').replace('INR','').replace('₹','').strip()
-    try: fare=float(raw)
-    except ValueError:
-        await update.message.reply_text('❌ Please enter only the updated fare amount, e.g. `8500`.', parse_mode='Markdown'); return FLIGHT_FARE_INPUT
-    if fare<=0:
-        await update.message.reply_text('❌ Fare must be greater than zero.'); return FLIGHT_FARE_INPUT
+    raw=(update.message.text or '').strip()
+    supplier_total=float(context.user_data.get('pending_fare_supplier_total',0) or 0)
+    pax_count=_fare_pax_count(context.user_data.get('pending_flight_data') or {})
+    try:
+        fare=_parse_markup_input(raw,supplier_total,pax_count)
+    except ValueError as exc:
+        await update.message.reply_text(
+            f'❌ {exc}\n\nExamples: `+800 per person`, `markup 1200 total`, `15000 total`.',
+            parse_mode='Markdown'
+        ); return FLIGHT_FARE_INPUT
+    await update.message.reply_text(_fare_cost_confirmation(raw,supplier_total,fare,pax_count),parse_mode='Markdown')
     context.user_data['pending_flight_fare']=fare
     try:
         await ask_footer_choice(update.message, context, 'flight')
@@ -2480,7 +2734,12 @@ async def hotel_voucher_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         filename=TEMP_DIR / f"voucher_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
         await tg_file.download_to_drive(filename)
         context.user_data.setdefault("voucher_files", []).append(str(filename))
-        msg=await update.message.reply_text("📸 Hotel screenshot received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.", reply_markup=voucher_keyboard())
+        msg=await _source_ack_message(
+            update,
+            context,
+            "📸 Hotel screenshot received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.",
+            reply_markup=voucher_keyboard()
+        )
         _schedule_source_auto_process(update, context, 'hotel', lambda: process_hotel_voucher(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
         return HOTEL_VOUCHER_INPUT
     except Exception as exc:
@@ -2526,10 +2785,24 @@ async def process_hotel_voucher(update: Update, context: ContextTypes.DEFAULT_TY
     if not files and not source_text:
         await update.message.reply_text("Please send a hotel PDF, image or text. Tap ❌ Cancel to stop.", reply_markup=voucher_keyboard())
         return
-    status=await update.message.reply_text("🏨 *Reading hotel confirmation...*\n\n░░░░░░░░░░░░░░░░ 0%", parse_mode="Markdown")
-    context.user_data['_source_status_message']=status
+    # V176: continue editing the SAME countdown/source message.
+    status=context.user_data.get('_source_status_message')
+    if status is None:
+        status=await update.message.reply_text(
+            "🏨 *Reading hotel confirmation...*\n\n████░░░░░░░░░░░ 25%\n\n"
+            "🔍 Extracting booking details...",
+            parse_mode="Markdown"
+        )
+        context.user_data['_source_status_message']=status
+    else:
+        await safe_status_edit(
+            status,
+            update.message,
+            "🏨 *Reading hotel confirmation...*\n\n████░░░░░░░░░░░ 25%\n\n"
+            "🔍 Extracting booking details...",
+            parse_mode="Markdown"
+        )
     try:
-        await safe_status_edit(status, update.message, "🏨 *Reading hotel confirmation...*\n\n████░░░░░░░░░░░ 25%\n\n🔍 Extracting booking details...", parse_mode="Markdown")
         parts=[]
         for f in files:
             mime="application/pdf" if f.lower().endswith(".pdf") else "image/jpeg"
@@ -4556,14 +4829,17 @@ async def _process_post_generated_hotel_costing(message, context, cost_text):
         context.user_data.pop('post_hotel_cost_reference',None)
         await message.reply_text('❌ Saved Hotel reference is no longer available.',reply_markup=main_keyboard()); return
     try:
-        supplier=float(record.get('fare') or 0)
-        hotel_cost=_parse_hotel_cost_input(cost_text,supplier)
-    except ValueError as exc:
-        await message.reply_text(f'❌ {exc}\n\nExample: `Room 8500, EB 1200, Total 18200`',parse_mode='Markdown')
-        return
-    status=await message.reply_text('🏨 Adding Hotel costing and regenerating the voucher...')
-    try:
         data=copy.deepcopy(record.get('data') or {})
+        supplier=_supplier_total(data)
+        hotel_cost=_parse_hotel_cost_input(cost_text,supplier,data)
+    except ValueError as exc:
+        await message.reply_text(
+            f'❌ {exc}\n\nExamples: `3500 per room per night`, `room 4200 and EB 1200`, `total 25000`.',
+            parse_mode='Markdown'
+        )
+        return
+    status=await message.reply_text(_hotel_cost_confirmation(hotel_cost),parse_mode='Markdown')
+    try:
         data['customer_hotel_cost']=hotel_cost
         total=float(hotel_cost.get('total') or 0) or None
         page_size=record.get('page_size') or 'A4'
@@ -6045,7 +6321,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('pending_fare_kind',None)
         context.user_data.pop('pending_fare_supplier_total',None)
         await query.message.reply_text(
-            '🏨 *Add Hotel Cost*\n\nReply in one message, for example:\n`Room 8500, EB 1200, Total 18200`\n\nEB is optional. I will regenerate this same Hotel voucher from saved data.',
+            '🏨 *Add Hotel Cost*\n\nReply in one message, for example:\n`3500 per room per night`\n`room 4200 and EB 1200 per night`\n`total 25000`\n\nNo prefix is required. I will use check-in/check-out to calculate nights and regenerate this same Hotel voucher.',
             parse_mode='Markdown',reply_markup=ReplyKeyboardRemove())
         return
 
@@ -6730,17 +7006,24 @@ I will show the detailed Transit text I understood before regenerating the PDF."
         if kind=='hotel':
             if supplier_total > 0:
                 prompt=(f"🏨 *Supplier hotel total: INR {supplier_total:,.0f}.*\n\n"
-                        "Enter Hotel customer costing as: `Room 8500, EB 1200, Total 18200`\n\nEB is optional. A single amount like `8500` is also accepted.")
+                        "Enter Hotel customer costing as: `3500 per room per night`\n`room 4200 and EB 1200 per night`\n`total 25000`\n\nNo prefix is required. I will calculate rooms × nights and EB × nights automatically. A direct total is also accepted.")
             else:
-                prompt=("🏨 *Add Hotel Cost*\n\nEnter: `Room 8500, EB 1200, Total 18200`\n\nEB is optional. A single amount like `8500` is also accepted.")
+                prompt=("🏨 *Add Hotel Cost*\n\nEnter: `3500 per room per night`\n`room 4200 and EB 1200 per night`\n`total 25000`\n\nNo prefix is required. I will calculate rooms × nights and EB × nights automatically. A direct total is also accepted.")
         elif supplier_total > 0:
             prompt=(f"💰 *Supplier fare: INR {supplier_total:,.0f}.*\n\n"
-                    "Enter either a final fare or a + / - markup.\n\n"
-                    "Examples:\n`8500` → final fare ₹8,500\n`+500` → supplier fare + ₹500\n`-300` → supplier fare - ₹300")
+                    "Write the customer cost naturally — *no prefix is required*.\n\n"
+                    "Examples:\n"
+                    "`+800 per person`\n"
+                    "`add markup 300 per pax`\n"
+                    "`markup 1200 total`\n"
+                    "`15000 total`\n"
+                    "`make total 15000`\n"
+                    "`15000`")
         else:
             prompt=("💰 *No supplier fare is available.*\n\n"
-                    "Enter the final fare directly. Example: `8500`\n\n"
-                    "You can also use + / - only when a supplier fare has been found.")
+                    "Write the final customer total naturally — no prefix required.\n\n"
+                    "Examples: `15000`, `15000 total`, `make total 15000`.\n"
+                    "Per-person markup needs an original supplier fare.")
         await safe_callback_edit(query, prompt,parse_mode='Markdown')
         return
 
@@ -7026,19 +7309,28 @@ async def receive_extra_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         supplier_total=float(context.user_data.get("pending_fare_supplier_total", 0) or 0)
         try:
             if kind=='hotel':
-                hotel_cost=_parse_hotel_cost_input(text,supplier_total)
                 hdata=copy.deepcopy(context.user_data.get('pending_hotel_data') or {})
+                hotel_cost=_parse_hotel_cost_input(text,supplier_total,hdata)
                 hdata['customer_hotel_cost']=hotel_cost
                 context.user_data['pending_hotel_data']=hdata
                 fare=float(hotel_cost.get('total') or 0) or None
             else:
-                fare=_parse_markup_input(text, supplier_total)
+                source_data=context.user_data.get('pending_flight_data') if kind=='flight' else context.user_data.get('pending_bus_data')
+                pax_count=_fare_pax_count(source_data or {})
+                fare=_parse_markup_input(text, supplier_total, pax_count)
         except ValueError as exc:
             context.user_data['pending_fare_kind']=kind
-            hint='Room 8500, EB 1200, Total 18200' if kind=='hotel' else '8500, +500, or -300'
-            await update.message.reply_text(f'❌ {exc}\n\nUse `{hint}` as applicable.',parse_mode='Markdown')
+            hint='3500 per room per night, EB 1200 per night, or total 25000' if kind=='hotel' else '+800 per person, markup 1200 total, or 15000 total'
+            await update.message.reply_text(f'❌ {exc}\n\nExample: `{hint}`',parse_mode='Markdown')
             return
         context.user_data[f'pending_{kind}_fare']=fare
+        if kind in ('flight','bus'):
+            await update.message.reply_text(
+                _fare_cost_confirmation(text,supplier_total,fare,pax_count),
+                parse_mode='Markdown'
+            )
+        elif kind=='hotel':
+            await update.message.reply_text(_hotel_cost_confirmation(hotel_cost),parse_mode='Markdown')
         try:
             await ask_footer_choice(update.message, context, kind)
         except Exception as exc:

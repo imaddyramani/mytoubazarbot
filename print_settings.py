@@ -9,7 +9,7 @@ SETTINGS_FILE = DATA_DIR / 'print_settings.json'
 DEFAULTS = {
     'font': 'Liberation Serif Bold',
     'text_scale': 1.0,
-    'logo_scales': {'flight': 1.0, 'bus': 1.0, 'hotel': 1.0, 'package': 1.0},
+    'logo_scales': {'flight': 1.25, 'bus': 1.0, 'hotel': 1.0, 'package': 1.0},
     'watermark_opacity': 0.04,
     'watermark_scale': 1.5,
     'default_terms': 'tc_non_google',
@@ -63,12 +63,22 @@ def load_settings():
         return json.loads(json.dumps(DEFAULTS))
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding='utf-8'))
+        if isinstance(data, dict) and not data.get('_air_logo_125_migrated'):
+            scales = data.get('logo_scales') if isinstance(data.get('logo_scales'), dict) else {}
+            try:
+                if abs(float(scales.get('flight', 1.0)) - 1.0) < 0.001:
+                    scales['flight'] = 1.25
+            except Exception:
+                scales['flight'] = 1.25
+            data['logo_scales'] = scales
+            data['_air_logo_125_migrated'] = True
+            save_settings(data)
         merged = _merge(DEFAULTS, data if isinstance(data, dict) else {})
         if merged.get('font') not in FONT_OPTIONS:
             merged['font'] = DEFAULTS['font']
         merged['text_scale'] = max(0.75, min(1.35, float(merged.get('text_scale', 1.0))))
         ls = merged.get('logo_scales') if isinstance(merged.get('logo_scales'), dict) else {}
-        merged['logo_scales'] = {k: max(0.70, min(1.50, float(ls.get(k, 1.0)))) for k in ('flight','bus','hotel','package')}
+        merged['logo_scales'] = {k: max(0.70, min(1.50, float(ls.get(k, 1.25 if k=='flight' else 1.0)))) for k in ('flight','bus','hotel','package')}
         merged['watermark_opacity'] = max(0.01, min(0.20, float(merged.get('watermark_opacity', 0.04))))
         merged['watermark_scale'] = max(0.50, min(2.00, float(merged.get('watermark_scale', 1.5))))
         # V94 uses one Tour T&C page only (the supplied T&C 2 document).
@@ -114,14 +124,14 @@ def adjust_logo_scale(kind, delta):
         raise ValueError('Unsupported document type.')
     s = load_settings()
     s.setdefault('logo_scales', {})
-    current = float(s['logo_scales'].get(kind, 1.0))
+    current = float(s['logo_scales'].get(kind, 1.25 if kind=='flight' else 1.0))
     s['logo_scales'][kind] = round(max(0.70, min(1.50, current + float(delta))), 2)
     save_settings(s)
     return s
 
 def get_logo_scale(kind):
     s = load_settings()
-    return float(s.get('logo_scales', {}).get(str(kind), 1.0))
+    return float(s.get('logo_scales', {}).get(str(kind), 1.25 if str(kind)=='flight' else 1.0))
 
 def toggle_button(key):
     s = load_settings()
@@ -213,7 +223,7 @@ def apply_css_settings(html: str, kind=None, text_scale_override=None, logo_scal
         out = '<style>' + css + '</style>' + out
     settings = load_settings()
     scale = float(settings['text_scale'] if text_scale_override is None else text_scale_override)
-    logo_scale = float(logo_scale_override if logo_scale_override is not None else settings.get('logo_scales', {}).get(str(kind), 1.0))
+    logo_scale = float(logo_scale_override if logo_scale_override is not None else settings.get('logo_scales', {}).get(str(kind), 1.25 if str(kind)=='flight' else 1.0))
     logo_css = f"\n.logo, .logo img, .brand-logo, .banner .logo img {{ transform:scale({logo_scale}); transform-origin:left center; }}\n"
     out = out.replace('</style>', logo_css + '</style>', 1)
     # Scale explicit font sizes so the owner can change print readability globally.

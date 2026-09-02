@@ -107,6 +107,58 @@ def _airline_logo_html(airline_name, flight_number=""):
     alt=escape(_text(airline_name) or "Airline")
     return f'<div class="airline-logo-wrap"><img class="airline-logo{extra}" src="{uri}" alt="{alt} logo"></div>'
 
+
+def _baggage_icon(kind):
+    """Small deterministic vector clip-art; no emoji/font dependency."""
+    if kind == "cabin":
+        return (
+            '<svg class="bag-icon cabin-bag" viewBox="0 0 24 24" aria-hidden="true">'
+            '<path d="M7 7h10l2 4v9H5v-9l2-4z" fill="none" stroke="currentColor" stroke-width="1.8"/>'
+            '<path d="M9 7V5.5C9 4.1 10.1 3 11.5 3h1C13.9 3 15 4.1 15 5.5V7" fill="none" stroke="currentColor" stroke-width="1.8"/>'
+            '<path d="M5 12h14" fill="none" stroke="currentColor" stroke-width="1.4"/>'
+            '</svg>'
+        )
+    return (
+        '<svg class="bag-icon trolley-bag" viewBox="0 0 24 24" aria-hidden="true">'
+        '<rect x="6" y="7" width="12" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>'
+        '<path d="M10 7V4h4v3M9 11v5M15 11v5" fill="none" stroke="currentColor" stroke-width="1.6"/>'
+        '<circle cx="9" cy="21" r="1.2" fill="currentColor"/><circle cx="15" cy="21" r="1.2" fill="currentColor"/>'
+        '</svg>'
+    )
+
+
+def _baggage_html(value):
+    """Show check-in and cabin allowances as compact icon rows while preserving supplier text."""
+    raw = re.sub(r'\s+', ' ', _text(value)).strip()
+    if not raw:
+        return ""
+
+    # Common supplier wording has check-in first and cabin/hand baggage second.
+    m = re.search(
+        r'(?is)(.*?(?:check[- ]?in|checked(?:[- ]?in)?(?:\s+baggage)?)[^,;|]*?(?:\([^)]*\))?)'
+        r'\s*[,;|]\s*(.*?(?:cabin|hand(?:\s+baggage)?)[^,;|]*(?:\([^)]*\))?.*)$',
+        raw,
+    )
+    if not m:
+        # Also handle text with no comma, e.g. "Checked baggage Adult 15kgs Cabin baggage Adult 7kgs".
+        m2 = re.search(r'(?is)(.*?(?:check[- ]?in|checked(?:[- ]?in)?).*?)(?=\s+(?:cabin|hand(?:\s+baggage)?))(.+)$', raw)
+        if m2:
+            m = m2
+
+    lines = []
+    if m:
+        check = re.sub(r'\s+', ' ', m.group(1)).strip(' ,;|')
+        cabin = re.sub(r'\s+', ' ', m.group(2)).strip(' ,;|')
+        if check:
+            lines.append(f'<span class="bag-line">{_baggage_icon("checkin")}<span>{_esc(check)}</span></span>')
+        if cabin:
+            lines.append(f'<span class="bag-line">{_baggage_icon("cabin")}<span>{_esc(cabin)}</span></span>')
+    else:
+        # Supplier wording is unusual: keep exact text and use the closest safe icon.
+        kind = "cabin" if re.search(r'(?i)\b(?:cabin|hand\s*baggage)\b', raw) else "checkin"
+        lines.append(f'<span class="bag-line">{_baggage_icon(kind)}<span>{_esc(raw)}</span></span>')
+    return ''.join(lines)
+
 def _payment_breakdown(data, updated_total):
     """Return a professional line-by-line payment breakdown.
 
@@ -178,13 +230,30 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     logo_html=f'<a href="{MYTOURBAZAR_LOGO_URL}"><img class="brand-logo" src="{logo}"></a>' if logo else ''
     customer_mobile=_text(data.get('mobile'))  # STRICT: no fallback to airline/PNR/other numbers.
     baggage_summary=_text(data.get("baggage_summary"))
-    pax_rows=''.join(
-        f'<tr><td>{i+1}</td><td><strong>{_esc(_display_person_name(p))}</strong></td>'
-        f'<td>{_esc(p.get("ticket_number"))}</td>'
-        f'<td>{_esc(p.get("type") or "Adult")}</td>'
-        f'<td>{_esc(p.get("dob"))}</td>'
-        f'<td>{_esc(p.get("baggage") or baggage_summary)}</td></tr>' for i,p in enumerate(passengers)
-    ) or '<tr><td colspan="6">No passenger details found.</td></tr>'
+    ancillary_summary=_text(data.get("special_ancillary_summary"))
+    has_real_ticket=any(_text(p.get("ticket_number")) for p in passengers)
+    ticket_heading="Ticket Number" if has_real_ticket else "Airline PNR"
+    has_ancillary=bool(ancillary_summary or any(_text(p.get("special_ancillary")) for p in passengers))
+    pax_table_class="pax has-ancillary" if has_ancillary else "pax"
+
+    pax_rows_list=[]
+    for i,p in enumerate(passengers):
+        ticket_value=_text(p.get("ticket_number")) if has_real_ticket else _text(data.get("airline_pnr"))
+        baggage_value=_text(p.get("baggage")) or baggage_summary
+        ancillary_value=_text(p.get("special_ancillary")) or ancillary_summary
+        row=(
+            f'<tr><td>{i+1}</td><td><strong>{_esc(_display_person_name(p))}</strong></td>'
+            f'<td>{_esc(ticket_value)}</td>'
+            f'<td>{_esc(p.get("type") or "Adult")}</td>'
+            f'<td>{_esc(p.get("dob"))}</td>'
+            f'<td class="baggage-cell">{_baggage_html(baggage_value)}</td>'
+        )
+        if has_ancillary:
+            row += f'<td class="ancillary-cell">{_esc(ancillary_value)}</td>'
+        row += '</tr>'
+        pax_rows_list.append(row)
+    pax_colspan=7 if has_ancillary else 6
+    pax_rows=''.join(pax_rows_list) or f'<tr><td colspan="{pax_colspan}">No passenger details found.</td></tr>'
 
     rows=[]
     for i,s in enumerate(segs):
@@ -233,7 +302,7 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
         duration_bits=[]
         if duration: duration_bits.append(f'<span class="duration-main">{_esc(duration)}</span>')
         if stops: duration_bits.append(f'<span class="stops">{_esc(stops)}</span>')
-        duration_html='<td class="duration">'+('<br>'.join(duration_bits) if duration_bits else '')+'</td>'
+        duration_html='<td class="duration">'+('<span class="duration-join"> • </span>'.join(duration_bits) if duration_bits else '')+'</td>'
         airline_logo_html = _airline_logo_html(airline, number)
         cabin=_text(s.get('cabin'))
         fare_type=_text(s.get('fare_type'))
@@ -282,11 +351,11 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     )
 
     html=f'''<!doctype html><html><head><meta charset="utf-8"><style>
-@page{{size:{page_size};margin:12mm 10mm 8mm 10mm}}*{{box-sizing:border-box}}body{{margin:0;color:#12324b;font-family:"MTBLiberationSerifBold",Georgia,serif;font-size:10.2pt;line-height:1.28}}.top{{height:33mm;position:relative;border-bottom:2.5px solid #f4a62a;margin-bottom:5mm}}.brand{{position:absolute;left:0;top:0;width:45%;height:26mm;display:flex;align-items:center}}.brand-logo{{max-width:1.55in;max-height:1.05in;object-fit:contain}}.heading{{position:absolute;right:0;top:3mm;text-align:right;color:#073450}}.heading h1{{margin:0;font-size:21pt;letter-spacing:.3px}}.heading div{{font-size:10.5pt;margin-top:2mm}}.heading .booked-on{{font-size:8.6pt;margin-top:1.1mm;color:#5d646a;font-weight:700}}.meta{{background:#f0f5fa;border:1.5px solid #9cb6cc;border-radius:6px;padding:5mm 6mm;margin-bottom:5mm}}.meta table,.pax,.flights{{width:100%;border-collapse:collapse}}.meta td{{padding:1.4mm 1mm;font-size:10.2pt}}.meta .lab{{font-weight:700;white-space:nowrap}}.meta .val{{font-weight:800;color:#063655}}.section{{background:#063655;color:#fff;padding:2.6mm 4mm;font-size:12pt;letter-spacing:.1px;border-radius:3px 3px 0 0;margin-top:4mm}}.pax,.flights{{border:1.5px solid #9cb6cc}}.pax th,.flights th{{background:#dceaf5;color:#123b58;padding:2.8mm 3mm;text-align:left;font-size:9.7pt;border-bottom:1px solid #9cb6cc}}.pax td{{padding:2.7mm 2.5mm;border-bottom:1px solid #d3e0eb;font-size:9.4pt;color:#1f2c35;vertical-align:top}}.pax th:nth-child(1),.pax td:nth-child(1){{width:6%}}.pax th:nth-child(2),.pax td:nth-child(2){{width:31%}}.pax th:nth-child(3),.pax td:nth-child(3){{width:22%}}.pax th:nth-child(4),.pax td:nth-child(4){{width:13%}}.pax th:nth-child(5),.pax td:nth-child(5){{width:13%}}.pax th:nth-child(6),.pax td:nth-child(6){{width:15%}}.flights td{{padding:4mm 3.5mm;border-bottom:1px solid #d3e0eb;vertical-align:top;font-size:9.7pt;color:#26323a;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere}}.airport-full{{display:inline;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere;line-height:1.35;color:#5d646a}}.terminal-line{{display:inline-block;margin-top:.8mm;font-size:8.8pt;font-weight:800;color:#123b58;white-space:normal}}.airline-logo-wrap{{width:88px;height:36px;display:flex;align-items:center;justify-content:flex-start;margin:0 0 2.5mm 0;overflow:hidden}}.airline-logo{{display:block;max-width:88px;max-height:36px;object-fit:contain;object-position:left center}}.airline-logo.fallback{{opacity:.88;padding:2px}}.flight-id{{font-size:8.4pt;color:#5d646a}}.flight-meta{{display:inline-block;margin-top:.7mm;font-size:8.7pt;font-weight:600;color:#5d646a}}.flights .flight-row td:first-child{{width:29%}}.flights .flight-row td:nth-child(2){{width:27%}}.flights .flight-row td:nth-child(3){{width:15%;text-align:center}}.flights .flight-row td:nth-child(4){{width:29%}}.time{{font-size:13pt;font-weight:900;color:#123b58}}.muted{{font-family:Georgia,serif;color:#5d646a;font-size:8.7pt}}.duration{{font-weight:800;color:#123b58;text-align:center;vertical-align:middle!important}}.duration-main{{display:block;font-size:10.3pt;color:#123b58;line-height:1.25}}.stops{{display:block;margin-top:1.3mm;font-size:8.8pt;color:#5d646a;line-height:1.25}}.terminal{{display:inline-block;margin-top:1.2mm;color:#073450;font-size:8.8pt}}.dash{{color:#9cb6cc;letter-spacing:1px}}.layover td{{background:#edf4fa;text-align:center;padding:2.5mm;font-size:9.6pt;font-weight:800;color:#123b58}}.fare{{margin-top:4mm;background:#f7fafc;border:1.5px solid #9cb6cc;border-radius:6px;padding:0;overflow:hidden;font-size:9.6pt;break-inside:avoid;page-break-inside:avoid}}.fare-title{{background:#e5eff7;color:#123b58;font-size:10.2pt;font-weight:900;padding:2.4mm 3.5mm;border-bottom:1px solid #b8cad9;letter-spacing:.15px}}.payment-table{{width:100%;border-collapse:collapse}}.payment-table td{{padding:2.1mm 3.5mm;border-bottom:1px solid #d7e2eb;vertical-align:middle}}.payment-table .pay-label{{text-align:left;font-weight:700;color:#334b5c}}.payment-table .pay-amount{{text-align:right;font-weight:800;color:#123b58;white-space:nowrap}}.payment-table .payment-total td{{border-bottom:0;background:#eef5fa;font-size:10.6pt;font-weight:900;color:#073450;padding-top:2.7mm;padding-bottom:2.7mm}}.payment-table .payment-total td:last-child{{text-align:right;color:#e65100;white-space:nowrap}}.terms{{border:1.5px solid #9cb6cc;border-radius:6px;padding:4mm 5mm;margin-top:5mm}}.terms h3{{margin:0 0 2mm;color:#123b58;font-size:11.5pt;border-bottom:1px solid #c6d5e2;padding-bottom:2mm}}.terms ul{{margin:0;padding-left:5mm}}.terms li{{margin:1.8mm 0;font-size:9pt;color:#26323a}}.keep{{break-inside:avoid;page-break-inside:avoid}}tr{{break-inside:avoid;page-break-inside:avoid}}strong{{font-weight:800}}
+@page{{size:{page_size};margin:12mm 10mm 8mm 10mm}}*{{box-sizing:border-box}}body{{margin:0;color:#12324b;font-family:"MTBLiberationSerifBold",Georgia,serif;font-size:10.2pt;line-height:1.28}}.top{{height:33mm;position:relative;border-bottom:2.5px solid #f4a62a;margin-bottom:5mm}}.brand{{position:absolute;left:0;top:0;width:45%;height:26mm;display:flex;align-items:center}}.brand-logo{{max-width:1.55in;max-height:1.05in;object-fit:contain}}.heading{{position:absolute;right:0;top:3mm;text-align:right;color:#073450}}.heading h1{{margin:0;font-size:21pt;letter-spacing:.3px}}.heading div{{font-size:10.5pt;margin-top:2mm}}.heading .booked-on{{font-size:8.6pt;margin-top:1.1mm;color:#5d646a;font-weight:700}}.meta{{background:#f0f5fa;border:1.5px solid #9cb6cc;border-radius:6px;padding:5mm 6mm;margin-bottom:5mm}}.meta table,.pax,.flights{{width:100%;border-collapse:collapse}}.meta td{{padding:1.4mm 1mm;font-size:10.2pt}}.meta .lab{{font-weight:700;white-space:nowrap}}.meta .val{{font-weight:800;color:#063655}}.meta .pnr-val{{font-weight:900;color:#e65100;font-size:11.2pt;letter-spacing:.2px}}.section{{background:#063655;color:#fff;padding:2.6mm 4mm;font-size:12pt;letter-spacing:.1px;border-radius:3px 3px 0 0;margin-top:4mm}}.pax,.flights{{border:1.5px solid #9cb6cc}}.pax th,.flights th{{background:#dceaf5;color:#123b58;padding:2.8mm 3mm;text-align:left;font-size:9.7pt;border-bottom:1px solid #9cb6cc}}.pax td{{padding:2.7mm 2.5mm;border-bottom:1px solid #d3e0eb;font-size:9.4pt;color:#1f2c35;vertical-align:top}}.pax th:nth-child(1),.pax td:nth-child(1){{width:5%}}.pax th:nth-child(2),.pax td:nth-child(2){{width:27%}}.pax th:nth-child(3),.pax td:nth-child(3){{width:18%}}.pax th:nth-child(4),.pax td:nth-child(4){{width:11%}}.pax th:nth-child(5),.pax td:nth-child(5){{width:10%}}.pax th:nth-child(6),.pax td:nth-child(6){{width:29%}}.pax.has-ancillary th:nth-child(1),.pax.has-ancillary td:nth-child(1){{width:4%}}.pax.has-ancillary th:nth-child(2),.pax.has-ancillary td:nth-child(2){{width:23%}}.pax.has-ancillary th:nth-child(3),.pax.has-ancillary td:nth-child(3){{width:16%}}.pax.has-ancillary th:nth-child(4),.pax.has-ancillary td:nth-child(4){{width:9%}}.pax.has-ancillary th:nth-child(5),.pax.has-ancillary td:nth-child(5){{width:9%}}.pax.has-ancillary th:nth-child(6),.pax.has-ancillary td:nth-child(6){{width:23%}}.pax.has-ancillary th:nth-child(7),.pax.has-ancillary td:nth-child(7){{width:16%}}.baggage-cell{{font-size:8.5pt}}.bag-line{{display:flex;align-items:flex-start;gap:1.2mm;margin:.7mm 0;line-height:1.2}}.bag-icon{{width:13px;height:13px;min-width:13px;color:#123b58;vertical-align:middle}}.ancillary-cell{{font-size:8.5pt;font-weight:700;color:#334b5c}}.flights td{{padding:4mm 3.5mm;border-bottom:1px solid #d3e0eb;vertical-align:top;font-size:9.7pt;color:#26323a;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere}}.airport-full{{display:inline;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere;line-height:1.35;color:#5d646a}}.terminal-line{{display:inline-block;margin-top:.8mm;font-size:8.8pt;font-weight:800;color:#123b58;white-space:normal}}.airline-logo-wrap{{width:88px;height:36px;display:flex;align-items:center;justify-content:flex-start;margin:0 0 2.5mm 0;overflow:hidden}}.airline-logo{{display:block;max-width:88px;max-height:36px;object-fit:contain;object-position:left center}}.airline-logo.fallback{{opacity:.88;padding:2px}}.flight-id{{font-size:8.4pt;color:#5d646a}}.flight-meta{{display:inline-block;margin-top:.7mm;font-size:8.7pt;font-weight:600;color:#5d646a}}.flights .flight-row td:first-child{{width:29%}}.flights .flight-row td:nth-child(2){{width:27%}}.flights .flight-row td:nth-child(3){{width:15%;text-align:center}}.flights .flight-row td:nth-child(4){{width:29%}}.time{{font-size:13pt;font-weight:900;color:#123b58}}.muted{{font-family:Georgia,serif;color:#5d646a;font-size:8.7pt}}.duration{{font-weight:800;color:#123b58;text-align:center;vertical-align:middle!important}}.duration-main{{display:inline;font-size:10.1pt;color:#123b58;line-height:1.25}}.stops{{display:inline;font-size:8.8pt;color:#5d646a;line-height:1.25}}.duration-join{{display:inline;color:#8aa0b2;font-weight:700;padding:0 .7mm}}.terminal{{display:inline-block;margin-top:1.2mm;color:#073450;font-size:8.8pt}}.dash{{color:#9cb6cc;letter-spacing:1px}}.layover td{{background:#edf4fa;text-align:center;padding:2.5mm;font-size:9.6pt;font-weight:800;color:#123b58}}.fare{{margin-top:4mm;background:#f7fafc;border:1.5px solid #9cb6cc;border-radius:6px;padding:0;overflow:hidden;font-size:9.6pt;break-inside:avoid;page-break-inside:avoid}}.fare-title{{background:#e5eff7;color:#123b58;font-size:10.2pt;font-weight:900;padding:2.4mm 3.5mm;border-bottom:1px solid #b8cad9;letter-spacing:.15px}}.payment-table{{width:100%;border-collapse:collapse}}.payment-table td{{padding:2.1mm 3.5mm;border-bottom:1px solid #d7e2eb;vertical-align:middle}}.payment-table .pay-label{{text-align:left;font-weight:700;color:#334b5c}}.payment-table .pay-amount{{text-align:right;font-weight:800;color:#123b58;white-space:nowrap}}.payment-table .payment-total td{{border-bottom:0;background:#eef5fa;font-size:10.6pt;font-weight:900;color:#073450;padding-top:2.7mm;padding-bottom:2.7mm}}.payment-table .payment-total td:last-child{{text-align:right;color:#e65100;white-space:nowrap}}.terms{{border:1.5px solid #9cb6cc;border-radius:6px;padding:4mm 5mm;margin-top:5mm}}.terms h3{{margin:0 0 2mm;color:#123b58;font-size:11.5pt;border-bottom:1px solid #c6d5e2;padding-bottom:2mm}}.terms ul{{margin:0;padding-left:5mm}}.terms li{{margin:1.8mm 0;font-size:9pt;color:#26323a}}.keep{{break-inside:avoid;page-break-inside:avoid}}tr{{break-inside:avoid;page-break-inside:avoid}}strong{{font-weight:800}}
 </style></head><body>
 <div class="top"><div class="brand">{logo_html}</div><div class="heading"><h1>E-TICKET ITINERARY</h1><div>Flight Booking Confirmation</div>{booked_on_html}</div></div>
-<div class="meta"><table><tr><td class="lab">Trip ID:</td><td class="val">{_esc(data.get('booking_id') or data.get('trip_id'))}</td><td class="lab">Travel Date:</td><td class="val">{_esc(data.get('travel_date') or (segs[0].get('dep_date') if segs else ''))}</td></tr><tr><td class="lab">Airline PNR:</td><td class="val">{_esc(data.get('airline_pnr'))}</td><td class="lab">GDS PNR:</td><td class="val">{_esc(data.get('gds_pnr'))}</td></tr><tr><td class="lab">Status:</td><td class="val">{_esc(data.get('status') or 'CONFIRMED')}</td><td class="lab">Customer Mobile:</td><td class="val">{_esc(customer_mobile)}</td></tr></table></div>
-<div class="section">PASSENGER INFORMATION</div><table class="pax"><thead><tr><th>#</th><th>Passenger Name</th><th>Ticket Number</th><th>Type</th><th>DOB</th><th>Baggage</th></tr></thead><tbody>{pax_rows}</tbody></table>
+<div class="meta"><table><tr><td class="lab">Trip ID:</td><td class="val">{_esc(data.get('booking_id') or data.get('trip_id'))}</td><td class="lab">Travel Date:</td><td class="val">{_esc(data.get('travel_date') or (segs[0].get('dep_date') if segs else ''))}</td></tr><tr><td class="lab">Airline PNR:</td><td class="val pnr-val">{_esc(data.get('airline_pnr'))}</td><td class="lab">GDS PNR:</td><td class="val">{_esc(data.get('gds_pnr'))}</td></tr><tr><td class="lab">Status:</td><td class="val">{_esc(data.get('status') or 'CONFIRMED')}</td><td class="lab">Customer Mobile:</td><td class="val">{_esc(customer_mobile)}</td></tr></table></div>
+<div class="section">PASSENGER INFORMATION</div><table class="{pax_table_class}"><thead><tr><th>#</th><th>Passenger Name</th><th>{_esc(ticket_heading)}</th><th>Type</th><th>DOB</th><th>Baggage</th>{('<th>Special Ancillary</th>' if has_ancillary else '')}</tr></thead><tbody>{pax_rows}</tbody></table>
 <div class="section">FLIGHT DETAILS &amp; SCHEDULE{(' (CONNECTING ITINERARY)' if len(segs)>1 else '')}</div><table class="flights"><thead><tr><th>Flight &amp; Aircraft</th><th>Departure</th><th>Duration &amp; Stops</th><th>Arrival</th></tr></thead><tbody>{flight_rows}</tbody></table>
 {fare_html}<div class="terms keep"><h3>General Instructions</h3><ul>{terms_html}</ul></div>
 </body></html>'''

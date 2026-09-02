@@ -8,18 +8,18 @@ from ai_retry import call_with_high_demand_retry
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 SCHEMA={"type":"object","properties":{
  "booking_id":{"type":"string"},"booking_date":{"type":"string"},"airline_pnr":{"type":"string"},"gds_pnr":{"type":"string"},
- "status":{"type":"string"},"mobile":{"type":"string"},"baggage_summary":{"type":"string"},
+ "status":{"type":"string"},"mobile":{"type":"string"},"baggage_summary":{"type":"string"},"special_ancillary_summary":{"type":"string"},
  "segments":{"type":"array","items":{"type":"object","properties":{
   "flight":{"type":"string"},"flight_number":{"type":"string"},"aircraft":{"type":"string"},"cabin":{"type":"string"},"fare_type":{"type":"string"},
   "dep_time":{"type":"string"},"dep_city":{"type":"string"},"dep_code":{"type":"string"},"dep_date":{"type":"string"},"dep_airport":{"type":"string"},"dep_terminal":{"type":"string"},
   "arr_time":{"type":"string"},"arr_city":{"type":"string"},"arr_code":{"type":"string"},"arr_date":{"type":"string"},"arr_airport":{"type":"string"},"arr_terminal":{"type":"string"},
   "duration":{"type":"string"},"stops":{"type":"string"},"layover":{"type":"string"}
  },"required":["flight","flight_number","aircraft","cabin","fare_type","dep_time","dep_city","dep_code","dep_date","dep_airport","dep_terminal","arr_time","arr_city","arr_code","arr_date","arr_airport","arr_terminal","duration","stops","layover"]}},
- "passengers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"title":{"type":"string"},"ticket_number":{"type":"string"},"type":{"type":"string"},"dob":{"type":"string"},"baggage":{"type":"string"}},"required":["name","title","ticket_number","type","dob","baggage"]}},
+ "passengers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"title":{"type":"string"},"ticket_number":{"type":"string"},"type":{"type":"string"},"dob":{"type":"string"},"baggage":{"type":"string"},"special_ancillary":{"type":"string"}},"required":["name","title","ticket_number","type","dob","baggage","special_ancillary"]}},
  "base_fare":{"type":"number"},"taxes":{"type":"number"},
  "gross_total":{"type":"number"},
  "payment_items":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"amount":{"type":"number"}},"required":["label","amount"]}}
-},"required":["booking_id","booking_date","airline_pnr","gds_pnr","status","mobile","baggage_summary","segments","passengers","base_fare","taxes","gross_total","payment_items"]}
+},"required":["booking_id","booking_date","airline_pnr","gds_pnr","status","mobile","baggage_summary","special_ancillary_summary","segments","passengers","base_fare","taxes","gross_total","payment_items"]}
 
 
 ENDPOINT_ROW_SCHEMA = {
@@ -168,6 +168,7 @@ Extract ONLY the booking data required for our customer-facing Air Print:
 - aircraft type/model when it is explicitly printed by the supplier (example: Airbus A320neo); otherwise return an empty string
 - fare_type: copy the exact printed fare family/type such as SAVER/FLEX/SPECIAL. If absent, leave blank.
 - baggage_summary: copy the COMPLETE supplier baggage allowance when printed, including BOTH check-in and cabin baggage. Example: `Check-in: 15KG (1 piece), Cabin: 7KG (1 piece)`. Never drop cabin baggage.
+- special_ancillary_summary: copy ONLY explicitly BOOKED/CONFIRMED special ancillaries such as paid seat/seat number, meal, extra baggage beyond normal allowance, priority boarding, wheelchair, lounge, sports equipment or another SSR/service. Normal included check-in/cabin baggage is NOT a special ancillary. If nothing special is booked, leave blank.
 - every separate flight sector, including connecting/onward/return sectors
 - departure/arrival date, local time, city, and the COMPLETE airport/location wording exactly as printed by the supplier. Never shorten a long airport name. Preserve airport qualifiers such as International, Domestic, Airport, Terminal, Gate-area wording, city/airport combinations and punctuation when they are part of the supplier text. Use dep_airport / arr_airport for the full printed airport text and dep_code / arr_code for a printed 3-letter IATA code.
 - terminal is CRITICAL WHEN PRESENT IN THE SOURCE: capture T1/T2/T3, Terminal 1/2/3, 2A/2B, domestic/international terminal labels, etc. in dep_terminal / arr_terminal.
@@ -190,6 +191,7 @@ For each passenger:
 - IMPORTANT: keep the title ONLY in the `title` field. The `name` field must contain the passenger name without a leading title. Example: supplier `Mr. Govind Sinha` -> title=`Mr.` and name=`Govind Sinha`. Never return `title=Mr.` with `name=Mr. Govind Sinha`.
 - If the supplier does not explicitly print a title, use smart contextual inference only when the source itself provides enough evidence (for example a title in nearby text). Do NOT guess a person's gender from their name alone. If there is no reliable evidence, use a neutral title appropriate to the passenger type: "Mr./Ms." for an adult, "Child" for a child, and "Infant" for an infant.
 - Preserve date of birth when printed. Never invent a DOB. For children and infants, DOB is especially important and must be returned whenever it is present in the supplier source.
+- `special_ancillary` must contain only that passenger’s explicitly booked/confirmed ancillary/SSR when the supplier maps it to the passenger (examples: Seat 12A, Veg Meal, Extra Baggage 10KG, Wheelchair). Otherwise leave it blank.
 If fare is not printed, return base_fare=0, taxes=0, gross_total=0 and payment_items=[]. Return ONLY JSON matching the supplied schema.'''
 
 
@@ -205,12 +207,14 @@ TOP LEVEL:
 - airline_pnr / gds_pnr only if explicitly printed with that meaning.
 - mobile only if explicitly a customer/passenger contact. Never airline/support number.
 - baggage_summary must preserve the complete printed baggage wording, including check-in AND cabin baggage.
+- special_ancillary_summary contains only explicitly booked/confirmed ancillary/SSR services. Do not treat normal included baggage as an ancillary.
 
 PASSENGERS:
 - Preserve explicit name/title/type/DOB.
 - ticket_number only when an actual passenger ticket/e-ticket number is printed.
 - PNR, Trip ID and booking ID are never ticket numbers.
 - Preserve complete baggage wording when printed.
+- Preserve passenger-specific special_ancillary only when explicitly booked/confirmed and visibly associated with that passenger.
 
 VISUAL ROW RULE:
 For each flight number, inspect its Departure cell and Arrival cell separately from top to bottom. Airport names may wrap across multiple lines, and terminal can be embedded in the airport name or appear as a final continuation line. Capture all lines belonging to that one cell before moving to the other endpoint.
@@ -752,6 +756,28 @@ def _verify_endpoint_rows(client, model, original_paths, source_text=''):
         return {'segments': []}
     return json.loads(rr.text)
 
+def _apply_special_ancillary_summary(data):
+    """Recover only explicit ancillary charge/service labels; standard baggage is excluded."""
+    current = re.sub(r'\s+', ' ', str(data.get('special_ancillary_summary') or '')).strip()
+    labels = []
+    for item in data.get('payment_items') or []:
+        label = re.sub(r'\s+', ' ', str((item or {}).get('label') or '')).strip()
+        if not label:
+            continue
+        if re.search(
+            r'(?i)\b(?:seat(?:\s+selection)?|meal|priority(?:\s+boarding)?|wheelchair|'
+            r'lounge|sports?\s+equipment|special\s+service|SSR|extra\s+baggage|'
+            r'excess\s+baggage|additional\s+baggage)\b',
+            label,
+        ):
+            # Generic normal "Baggage" is not automatically special; only extra/excess/additional.
+            if label.lower() not in {x.lower() for x in labels}:
+                labels.append(label)
+    if not current and labels:
+        data['special_ancillary_summary'] = ', '.join(labels)
+    return data
+
+
 def _enforce_terminal_endpoint_truth(data):
     """Final terminal safety gate.
 
@@ -847,9 +873,9 @@ def _recover_source_only_fields(data, raw_text):
         # Keep airport wording unchanged; never reconstruct it by appending a terminal.
 
     for pax in data.get('passengers') or []:
-        for key in ('name','title','ticket_number','type','dob','baggage'):
+        for key in ('name','title','ticket_number','type','dob','baggage','special_ancillary'):
             pax[key]=_clean_source_value(pax.get(key))
-    for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary'):
+    for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary','special_ancillary_summary'):
         data[key]=_clean_source_value(data.get(key))
 
     # STRICT TOP-LEVEL SOURCE TRUTH:
@@ -1033,6 +1059,7 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         data=_sanitize_ticket_numbers(data)
         data=_sanitize_inferred_stops(data)
         data=_apply_baggage_summary(data)
+        data=_apply_special_ancillary_summary(data)
 
         # First generic endpoint safety gate.
         data=_enforce_terminal_endpoint_truth(data)

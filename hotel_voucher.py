@@ -25,6 +25,8 @@ HOTEL_VOUCHER_SCHEMA = {
         "nights": {"type": "string"},
         "room_type": {"type": "string"},
         "occupancy_summary": {"type": "string"},
+        "room_count": {"type": "number"},
+        "extra_bed_count": {"type": "number"},
         "meal_plan": {"type": "string"},
         "base_fare": {"type": "number"},
         "taxes": {"type": "number"},
@@ -34,7 +36,7 @@ HOTEL_VOUCHER_SCHEMA = {
     "required": [
         "reservation_id", "guest_name", "mobile", "hotel_name", "hotel_address",
         "hotel_city", "check_in", "check_out", "nights", "room_type",
-        "occupancy_summary", "meal_plan", "base_fare", "taxes", "terms", "cost_components"
+        "occupancy_summary", "room_count", "extra_bed_count", "meal_plan", "base_fare", "taxes", "terms", "cost_components"
     ]
 }
 
@@ -56,6 +58,8 @@ Fields:
 - nights: number of nights if visible or safely derivable from check-in/out.
 - room_type: confirmed room/category and number of rooms if stated.
 - occupancy_summary: confirmed rooms/pax/extra-person/extra-mattress details if present.
+- room_count: confirmed number of rooms. Return 0 only when not available.
+- extra_bed_count: confirmed number of extra beds/extra mattresses. Return 0 when none or not available.
 - meal_plan: confirmed meal plan such as CP / MAP / AP / Bed & Breakfast.
 - base_fare/taxes: extract only if an actual supplier amount is explicitly printed. If unavailable, return 0.
 - terms: extract the supplier's guest-facing hotel instructions/terms when present. If no terms are
@@ -157,19 +161,48 @@ def generate_hotel_voucher(data, output_path, logo_path=None, fare=None, page_si
 
     hotel_cost=data.get('customer_hotel_cost') or {}
     if hotel_cost:
-        # A customer Hotel cost is shown as one structured room-cost element only.
-        # The old generic Base Fare / Taxes / Total Fare box is intentionally removed.
+        # Customer Hotel cost is a transparent per-night room/EB calculation.
         adaptive_cost_html=''
         def _money(v):
             try: return f"INR {float(v):,.0f}"
             except Exception: return ''
-        cells=[]
-        if hotel_cost.get('per_room') is not None:
-            cells.append(f'<td style="width:33%;text-align:left"><strong style="display:block;font-size:8.5pt">Per Room Cost</strong><span style="display:block;margin-top:2px;font-weight:800">{_money(hotel_cost.get("per_room"))}</span></td>')
-        if hotel_cost.get('eb') is not None and float(hotel_cost.get('eb') or 0)>0:
-            cells.append(f'<td style="width:34%;text-align:center"><strong style="display:block;font-size:8.5pt">Extra Bed (EB)</strong><span style="display:block;margin-top:2px;font-weight:800">{_money(hotel_cost.get("eb"))}</span></td>')
-        cells.append(f'<td style="width:33%;text-align:right"><strong style="display:block;font-size:8.5pt">Grand Total</strong><span class="total" style="display:block;margin-top:2px;font-weight:900">{_money(hotel_cost.get("total"))}</span></td>')
-        fare_html='<div class="fare"><div style="font-weight:bold;margin-bottom:6px;color:#2c3e50">HOTEL COST</div><table><tr>'+''.join(cells)+'</tr></table></div>'
+        room_rate=hotel_cost.get('room_rate_per_night',hotel_cost.get('per_room'))
+        room_count=int(float(hotel_cost.get('rooms') or data.get('room_count') or 1))
+        night_count=int(float(hotel_cost.get('nights') or 0))
+        eb_rate=hotel_cost.get('eb_rate_per_night',hotel_cost.get('eb'))
+        eb_count=int(float(hotel_cost.get('extra_beds') or data.get('extra_bed_count') or 0))
+        room_total=hotel_cost.get('room_total')
+        eb_total=hotel_cost.get('eb_total')
+        total=hotel_cost.get('total')
+
+        cost_rows=[]
+        if room_rate is not None:
+            cost_rows.append(
+                '<tr><td><strong>Room Rate / Night</strong></td>'
+                f'<td>{_money(room_rate)}</td><td>{room_count}</td><td>{night_count}</td>'
+                f'<td style="text-align:right"><b>{_money(room_total)}</b></td></tr>'
+            )
+        if eb_rate is not None and float(eb_rate or 0)>0:
+            cost_rows.append(
+                '<tr><td><strong>Extra Bed Rate / Night</strong></td>'
+                f'<td>{_money(eb_rate)}</td><td>{eb_count}</td><td>{night_count}</td>'
+                f'<td style="text-align:right"><b>{_money(eb_total)}</b></td></tr>'
+            )
+        if cost_rows:
+            fare_html=(
+                '<div class="fare"><div style="font-weight:bold;margin-bottom:6px;color:#2c3e50">HOTEL COST</div>'
+                '<table class="hotel-cost-table"><tr><th style="text-align:left">COST TYPE</th><th>RATE / NIGHT</th>'
+                '<th>QTY</th><th>NIGHTS</th><th style="text-align:right">SUBTOTAL</th></tr>'
+                + ''.join(cost_rows) +
+                f'<tr class="hotel-total-row"><td colspan="4" style="text-align:right"><strong>TOTAL HOTEL COST</strong></td>'
+                f'<td class="total" style="text-align:right"><strong>{_money(total)}</strong></td></tr></table></div>'
+            )
+        else:
+            fare_html=(
+                '<div class="fare"><table class="hotel-cost-table"><tr class="hotel-total-row">'
+                '<td><strong>TOTAL HOTEL COST</strong></td>'
+                f'<td class="total" style="text-align:right"><strong>{_money(total)}</strong></td></tr></table></div>'
+            )
     else:
         # Supplier room calculations already include their own GRAND TOTAL. Do not
         # append a second generic Total Fare element to Hotel vouchers.
@@ -210,7 +243,7 @@ ul {{ margin:4px 0; padding-left:18px; font-size:11px; }} li {{ margin-bottom:5p
 .roomy .section{{padding:13px}}.roomy .section-title{{font-size:13.5px}}.roomy .info-table td,.roomy .details-table th,.roomy .details-table td{{font-size:12.5px;padding:6px 7px}}
 .normal .info-table td,.normal .details-table th,.normal .details-table td{{font-size:12px}}
 .compact .section{{padding:8px}}.compact .section-title{{font-size:11.5px}}.compact .info-table td,.compact .details-table th,.compact .details-table td{{font-size:10px;padding:4px 5px}}.compact ul{{font-size:9px}}.compact li{{margin-bottom:3px}}
-.fare {{ background:#f0f5fa; border:1.5px solid #a0b8cd; border-radius:6px; padding:10px; margin-top:14px; margin-bottom:12px; }} .fare table {{ width:100%; border-collapse:collapse; }} .total {{ color:#e65100; font-size:10.5pt; }}
+.fare {{ background:#f0f5fa; border:1.5px solid #a0b8cd; border-radius:6px; padding:10px; margin-top:14px; margin-bottom:12px; }} .fare table {{ width:100%; border-collapse:collapse; }} .hotel-cost-table th,.hotel-cost-table td{{padding:6px 7px;border-bottom:1px solid #d7e2eb;font-size:9.2pt;text-align:center}} .hotel-cost-table th{{background:#e5eff7;color:#123b58;font-weight:900}} .hotel-cost-table .hotel-total-row td{{border-bottom:0;background:#eef5fa;padding-top:8px;font-size:10pt}} .total {{ color:#e65100; font-size:10.5pt; }}
 .map-link {{ color:#2c3e50; text-decoration:none; font-weight:bold; display:inline-block; padding:4px 8px; background:#f0f0f0; border-radius:4px; font-size:11px; }}
 
 .mtb-contact-footer{{bottom:-10mm}}
