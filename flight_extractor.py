@@ -89,6 +89,13 @@ dep_endpoint_text / arr_endpoint_text:
   cell, include it at the end of endpoint_text too.
 - Do not include departure/arrival time, date, flight duration, fare type or baggage.
 - Keep supplier wording. Do not shorten or rewrite airport names.
+- IMPORTANT: a leading city/place word inside the printed airport line is part of
+  the source and MUST be preserved. Never remove it because the city/code is also
+  printed above the line.
+  Example source `Delhi indira gandhi international, delhi` must stay exactly that.
+  Example source `Raipur airport, raipur` must stay exactly that.
+- Never change either example to `indira gandhi international, delhi` or
+  `airport, raipur`.
 
 TERMINAL:
 - dep_terminal / arr_terminal = exact terminal only when visibly printed in THAT SAME
@@ -858,22 +865,22 @@ def _recover_airport_names_from_pdf_geometry(data, original_paths):
                 break
 
         if geo_dep:
-            current=str(seg.get('dep_airport') or '').strip()
-            if (_airport_name_richness(geo_dep,dep_city,dep_code)
-                    > _airport_name_richness(current,dep_city,dep_code)):
-                seg['dep_airport']=geo_dep
-                embedded=_extract_terminal_from_endpoint_text(geo_dep)
-                if embedded:
-                    seg['dep_terminal']=embedded
+            # Geometry is literal selectable supplier text from the exact endpoint
+            # column, so it is stronger than a rewritten/shortened model result.
+            seg['dep_airport']=geo_dep
+            seg['dep_airport_source_exact']=geo_dep
+            embedded=_extract_terminal_from_endpoint_text(geo_dep)
+            if embedded:
+                seg['dep_terminal']=embedded
 
         if geo_arr:
-            current=str(seg.get('arr_airport') or '').strip()
-            if (_airport_name_richness(geo_arr,arr_city,arr_code)
-                    > _airport_name_richness(current,arr_city,arr_code)):
-                seg['arr_airport']=geo_arr
-                embedded=_extract_terminal_from_endpoint_text(geo_arr)
-                if embedded:
-                    seg['arr_terminal']=embedded
+            # Preserve the COMPLETE supplier wording, including leading city words
+            # such as `Raipur airport, raipur`.
+            seg['arr_airport']=geo_arr
+            seg['arr_airport_source_exact']=geo_arr
+            embedded=_extract_terminal_from_endpoint_text(geo_arr)
+            if embedded:
+                seg['arr_terminal']=embedded
 
     return data
 
@@ -995,11 +1002,14 @@ def _apply_verified_endpoint_rows(data, verified):
         )
 
         # A non-empty endpoint copied from its exact row is authoritative.
+        # Keep an explicit source-exact copy so the renderer cannot later shorten it.
         if dep_text:
             seg['dep_airport'] = dep_text
+            seg['dep_airport_source_exact'] = dep_text
             seg['dep_terminal'] = dep_terminal
         if arr_text:
             seg['arr_airport'] = arr_text
+            seg['arr_airport_source_exact'] = arr_text
             seg['arr_terminal'] = arr_terminal
 
     return data

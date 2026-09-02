@@ -75,6 +75,44 @@ def _b2b_scrub_data(data):
     return result
 
 
+
+def _airport_source_display_html(airport, terminal=''):
+    """Render supplier airport wording without semantic cleanup.
+
+    The only permitted transformation is separating an explicitly printed terminal
+    onto its own line. City names, airport words, punctuation and wording are never
+    removed merely because they duplicate the city/code shown above.
+    """
+    airport=re.sub(r'\s+',' ',_text(airport)).strip()
+    terminal=re.sub(r'\s+',' ',_text(terminal)).strip()
+
+    terminal_pat=(
+        r'\b(?:Terminal\s*(?:No\.?\s*)?[A-Za-z0-9-]+|'
+        r'T\s*[1-9]\d*[A-Za-z]?|[1-9][A-Za-z]?\s*Terminal|'
+        r'(?:Domestic|International)\s+Terminal)\b'
+    )
+
+    embedded=re.search(terminal_pat,airport,re.I)
+    if embedded and not terminal:
+        terminal=re.sub(r'\s+',' ',embedded.group(0)).strip()
+
+    display=airport
+    if terminal and display:
+        # Avoid printing the same source terminal twice. This does NOT alter any
+        # city/airport wording.
+        display=re.sub(re.escape(terminal), ' ', display, count=1, flags=re.I)
+        # Handle equivalent embedded form if terminal formatting differs slightly.
+        display=re.sub(terminal_pat, ' ', display, count=1, flags=re.I)
+        display=re.sub(r'\s+',' ',display).strip()
+
+    parts=[]
+    if display:
+        parts.append(f'<span class="airport-full">{_esc(display)}</span>')
+    if terminal:
+        parts.append(f'<span class="terminal-line">{_esc(terminal)}</span>')
+    return '<br>'.join(parts) + ('<br>' if parts else '')
+
+
 def _optional_paren(v):
     value=_text(v)
     return f" ({_esc(value)})" if value else ""
@@ -510,66 +548,13 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
         arr_place_html=f'<strong>{arr_place}</strong><br>' if arr_place else ""
         dep_terminal=_text(s.get('dep_terminal'))
         arr_terminal=_text(s.get('arr_terminal'))
-        dep_airport=_text(s.get('dep_airport'))
-        arr_airport=_text(s.get('arr_airport'))
-        # V173 TERMINAL ENDPOINT LOCK:
-        # Never append a free-floating terminal value in the renderer. The full
-        # validated airport endpoint text is authoritative. Genuine terminals are
-        # already bound to the correct airport by the extractor.
-        def airport_with_terminal(airport, terminal, city='', code=''):
-            airport=re.sub(r'\s+',' ',_text(airport)).strip()
-            terminal=re.sub(r'\s+',' ',_text(terminal)).strip()
-            city=re.sub(r'\s+',' ',_text(city)).strip()
-            code=re.sub(r'[^A-Z]','',_text(code).upper())[:3]
-
-            # Recover a terminal embedded in the supplier endpoint text.
-            terminal_pat=(
-                r'\b(?:Terminal\s*(?:No\.?\s*)?[A-Za-z0-9-]+|'
-                r'T\s*[1-9]\d*[A-Za-z]?|[1-9][A-Za-z]?\s*Terminal|'
-                r'(?:Domestic|International)\s+Terminal)\b'
-            )
-            embedded=re.search(terminal_pat,airport,re.I)
-            if embedded and not terminal:
-                terminal=re.sub(r'\s+',' ',embedded.group(0)).strip()
-
-            # Remove leading duplicate city/IATA wrappers for PDF display only.
-            display=airport
-            if city:
-                display=re.sub(
-                    r'(?i)^\s*'+re.escape(city)+r'\s*(?:\('+re.escape(code)+r'\))?\s*[-,:|]*\s*'
-                    if code else
-                    r'(?i)^\s*'+re.escape(city)+r'\s*[-,:|]*\s*',
-                    '',
-                    display,
-                    count=1,
-                )
-            if code:
-                display=re.sub(
-                    r'(?i)^\s*\(?'+re.escape(code)+r'\)?\s*[-,:|]*\s*',
-                    '',
-                    display,
-                    count=1,
-                )
-
-            # Terminal has its own clean line, so remove it from airport-name display.
-            display=re.sub(terminal_pat,' ',display,flags=re.I)
-            display=re.sub(r'\s+',' ',display).strip(' -,:|()')
-
-            # Do not print duplicate city/code as if it were an airport name.
-            if display and city and display.lower()==city.lower():
-                display=''
-            if display and code and display.upper()==code:
-                display=''
-
-            parts=[]
-            if display:
-                parts.append(f'<span class="airport-full">{_esc(display)}</span>')
-            if terminal:
-                parts.append(f'<span class="terminal-line">{_esc(terminal)}</span>')
-            return '<br>'.join(parts) + ('<br>' if parts else '')
-
-        dep_airport_html=airport_with_terminal(dep_airport, dep_terminal, dep_city, s.get('dep_code'))
-        arr_airport_html=airport_with_terminal(arr_airport, arr_terminal, arr_city, s.get('arr_code'))
+        dep_airport=_text(s.get('dep_airport_source_exact') or s.get('dep_airport'))
+        arr_airport=_text(s.get('arr_airport_source_exact') or s.get('arr_airport'))
+        # V189 STRICT SOURCE-TRUTH DISPLAY:
+        # Airport wording is printed exactly as extracted from the supplier endpoint.
+        # Never strip leading city/code words such as Delhi or Raipur.
+        dep_airport_html=_airport_source_display_html(dep_airport, dep_terminal)
+        arr_airport_html=_airport_source_display_html(arr_airport, arr_terminal)
         duration=_text(s.get("duration"))
         stops=_text(s.get('stops'))
         if re.fullmatch(r'0(?:\s*stops?)?', stops, re.I):
