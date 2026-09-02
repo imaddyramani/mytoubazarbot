@@ -77,14 +77,23 @@ def _b2b_scrub_data(data):
 
 
 def _airport_source_display_html(airport, terminal=''):
-    """Render supplier airport wording without semantic cleanup.
+    """Render locked supplier airport wording without semantic cleanup.
 
-    The only permitted transformation is separating an explicitly printed terminal
-    onto its own line. City names, airport words, punctuation and wording are never
-    removed merely because they duplicate the city/code shown above.
+    V190 defense-in-depth: if an endpoint still contains obvious cross-column
+    contamination, print blank rather than put unreliable information on a ticket.
     """
     airport=re.sub(r'\s+',' ',_text(airport)).strip()
     terminal=re.sub(r'\s+',' ',_text(terminal)).strip()
+
+    suspicious = bool(airport and (
+        re.search(r'(?i)\b(?:operated\s+by|fare\s*type|family\s*fare|cabin|duration|stops?|non\s*[- ]?stop|baggage|pnr)\b',airport)
+        or re.search(r'(?i)(?:^|\s)by\s+[A-Z0-9]{2,3}(?:\s|$)',airport)
+        or re.search(r'(?i)(?:^|\s)\d{1,2}\s*(?:h|hr|hrs|hour|hours)\b(?:\s*\d{0,2}\s*(?:m|min|mins|minute|minutes)\b)?',airport)
+        or re.search(r'\b\d{1,2}:\d{2}\b',airport)
+        or airport.endswith(('(', '[', '{', ':'))
+    ))
+    if suspicious:
+        airport=''
 
     terminal_pat=(
         r'\b(?:Terminal\s*(?:No\.?\s*)?[A-Za-z0-9-]+|'

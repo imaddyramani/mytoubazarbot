@@ -144,6 +144,54 @@ FINAL SELF-CHECK FOR EVERY ENDPOINT:
 Return ONLY JSON matching the schema.
 """
 
+
+FOCUSED_ENDPOINT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "flight_number": {"type": "string"},
+        "dep_code": {"type": "string"},
+        "dep_time": {"type": "string"},
+        "dep_endpoint_text": {"type": "string"},
+        "dep_terminal": {"type": "string"},
+        "dep_terminal_evidence": {"type": "string"},
+        "arr_code": {"type": "string"},
+        "arr_time": {"type": "string"},
+        "arr_endpoint_text": {"type": "string"},
+        "arr_terminal": {"type": "string"},
+        "arr_terminal_evidence": {"type": "string"}
+    },
+    "required": [
+        "flight_number","dep_code","dep_time","dep_endpoint_text",
+        "dep_terminal","dep_terminal_evidence","arr_code","arr_time",
+        "arr_endpoint_text","arr_terminal","arr_terminal_evidence"
+    ]
+}
+
+FOCUSED_ENDPOINT_PROMPT = """You are MyTourBazar's SINGLE-SECTOR AIR ENDPOINT TRANSCRIBER.
+
+You will be given ONE target flight sector identity plus the supplier ticket/PDF/image.
+Your only task is to transcribe the Departure and Arrival endpoint cells belonging to
+THAT exact sector. Ignore every other flight row and every other column.
+
+ABSOLUTE RULES:
+- SOURCE PRESENT = COPY EXACTLY. SOURCE ABSENT/UNCLEAR = BLANK.
+- Do not use airport knowledge. Do not infer airport names or terminals.
+- Never copy text from Flight/Aircraft, Duration/Stops, Fare, Cabin, Baggage,
+  Passenger, Operated-by, or another sector.
+- Never include strings such as `Operated by 6E`, `by 6E`, `2h 10m`, `Non stop`,
+  `Family fare`, `Cabin: Economy`, or dates/times inside endpoint_text.
+- Preserve all wrapped airport/location lines inside the endpoint cell in source order.
+- Preserve leading city/place words exactly. `Raipur airport, raipur` must remain
+  `Raipur airport, raipur`; `Delhi indira gandhi international, delhi` must remain whole.
+- If the source prints `DEL(INDIRA GANDHI AIRPORT, DELHI)`, copy that complete visible
+  endpoint wording; do not truncate it.
+- Terminal belongs only to the same endpoint cell. If not visibly printed there, blank.
+- If the target sector cannot be isolated confidently, return blank endpoint text rather
+  than borrowing from another row.
+
+Return ONLY JSON matching the schema.
+"""
+
 FARE_SCHEMA={"type":"object","properties":{
     "gross_total":{"type":"number"},
     "base_fare":{"type":"number"},
@@ -654,39 +702,36 @@ def _airport_name_richness(value, city='', code=''):
 
 
 def _pdf_layout_lines(pdf_path):
-    """Extract selectable PDF text SPANS with source coordinates.
-
-    Important: use each span independently instead of joining an entire visual line.
-    Supplier PDFs often place Duration and Arrival text on the same y-coordinate.
-    Joining those spans can create false airport strings such as:
-      `2h m Raipur airport, raipur`
-    """
-    lines=[]
+    """Extract selectable PDF text spans with exact source coordinates."""
+    spans=[]
     try:
         import fitz
         doc=fitz.open(str(pdf_path))
         for page_no,page in enumerate(doc):
             payload=page.get_text('dict') or {}
+            page_rect=page.rect
             for block in payload.get('blocks') or []:
                 if block.get('type',0) != 0:
                     continue
                 for line in block.get('lines') or []:
-                    spans=line.get('spans') or []
-                    for span in spans:
-                        text=re.sub(r'\s+',' ',str(span.get('text') or '')).strip()
-                        if not text:
+                    for span in line.get('spans') or []:
+                        raw=str(span.get('text') or '')
+                        value=re.sub(r'\s+',' ',raw).strip()
+                        if not value:
                             continue
                         bbox=span.get('bbox') or line.get('bbox') or (0,0,0,0)
-                        lines.append({
+                        spans.append({
                             'page':page_no,
+                            'page_width':float(page_rect.width),
+                            'page_height':float(page_rect.height),
                             'x0':float(bbox[0]),'y0':float(bbox[1]),
                             'x1':float(bbox[2]),'y1':float(bbox[3]),
-                            'text':text,
+                            'text':value,
                         })
         doc.close()
     except Exception:
         return []
-    return lines
+    return spans
 
 
 def _line_center(line):
@@ -701,39 +746,108 @@ def _line_contains_iata(line, code):
     return bool(re.search(r'(?<![A-Z])'+re.escape(code)+r'(?![A-Z])',line.get('text',''),re.I))
 
 
+def _compact_alnum(value):
+    return re.sub(r'[^A-Z0-9]','',str(value or '').upper())
+
+
+def _normalized_clock(value):
+    raw=str(value or '').upper()
+    raw=re.sub(r'\bHRS?\b','',raw)
+    raw=re.sub(r'\s+','',raw)
+    return raw
+
+
+def _span_matches_time(span, value):
+    target=_normalized_clock(value)
+    if not target:
+        return False
+    return target in _normalized_clock(span.get('text','')) or _normalized_clock(span.get('text','')) in target
+
+
+def _span_matches_flight(span, value):
+    target=_compact_alnum(value)
+    if not target:
+        return False
+    current=_compact_alnum(span.get('text',''))
+    if not current:
+        return False
+    # Require the numeric flight-number portion; carrier code alone (e.g. `6E`)
+    # is too common elsewhere on supplier tickets and must not anchor a sector row.
+    nums=re.findall(r'\d{2,5}',target)
+    flight_digits=nums[-1] if nums else ''
+    if flight_digits and flight_digits not in current:
+        return False
+    return target in current or current in target or bool(flight_digits and flight_digits in current)
+
+
 def _bad_airport_candidate_text(text):
     text=re.sub(r'\s+',' ',str(text or '')).strip()
     if not text:
         return True
     if re.fullmatch(r'(?i)(?:terminal\s*\w+|t\s*\d+\w?|[A-Z]{3}|[A-Z]{3}\s+terminal\s*\w+)',text):
         return True
-
-    # Reject flight-duration fragments anywhere in an airport candidate.
-    # Examples: 2h, 2h 10m, 45m, 2 h m, 1hr 30min.
-    if re.search(
-        r'(?i)(?:^|\s)\d{1,2}\s*(?:h|hr|hrs|hour|hours)\b'
-        r'(?:\s*\d{0,2}\s*(?:m|min|mins|minute|minutes)\b)?',
-        text,
-    ):
+    if re.search(r'(?i)\b(?:operated\s+by|flight\s*&?\s*aircraft|aircraft|fare\s*type|family\s*fare|'
+                 r'cabin|economy|business|duration|stops?|non\s*[- ]?stop|direct|baggage|passenger|'
+                 r'pnr|booking|trip\s*id|status|meal|flight\s*no)\b',text):
         return True
-    if re.fullmatch(
-        r'(?i)\s*\d{1,3}\s*(?:m|min|mins|minute|minutes)\s*',
-        text,
-    ):
+    # Airline/operator contamination like "by 6E" or "operated by UK".
+    if re.search(r'(?i)(?:^|\s)by\s+[A-Z0-9]{2,3}(?:\s|$)',text):
         return True
-
-    if re.search(
-        r'(?i)\b(?:fare\s*type|family\s*fare|cabin|economy|business|duration|stops?|'
-        r'baggage|passenger|pnr|booking|trip\s*id|status|meal|aircraft|flight\s*no)\b',
-        text,
-    ):
+    # Duration fragments anywhere inside candidate text.
+    if re.search(r'(?i)(?:^|\s)\d{1,2}\s*(?:h|hr|hrs|hour|hours)\b'
+                 r'(?:\s*\d{0,2}\s*(?:m|min|mins|minute|minutes)\b)?',text):
+        return True
+    if re.fullmatch(r'(?i)\s*\d{1,3}\s*(?:m|min|mins|minute|minutes)\s*',text):
         return True
     if re.search(r'\b\d{1,2}:\d{2}\b',text):
         return True
-    # Date-like line.
     if re.search(r'(?i)\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\b',text) and re.search(r'\b20\d{2}\b',text):
         return True
     return False
+
+
+def _endpoint_is_suspicious(text):
+    """Final reject gate for contaminated endpoint text."""
+    value=re.sub(r'\s+',' ',str(text or '')).strip()
+    if not value:
+        return True
+    if _bad_airport_candidate_text(value):
+        return True
+    # Reject obvious orphan punctuation/truncation endings.
+    if value.endswith(('(', '[', '{', ':')):
+        return True
+    # A bare code/city/terminal is not a usable airport/location description.
+    if re.fullmatch(r'(?i)[A-Z]{3}(?:\s*[-,:()]\s*)?',value):
+        return True
+    return False
+
+
+def _separate_endpoint_code_prefix(value, code=''):
+    """Separate a printed IATA wrapper from the airport/location field.
+
+    This is structural field separation, not semantic rewriting. The raw source can be
+    retained separately, while the airport field avoids duplicating the IATA already
+    printed in the city/code line.
+
+    Examples:
+      DEL(INDIRA GANDHI AIRPORT, DELHI) -> INDIRA GANDHI AIRPORT, DELHI
+      DEL - Indira Gandhi International Airport -> Indira Gandhi International Airport
+      Delhi indira gandhi international, delhi -> unchanged
+    """
+    raw=re.sub(r'\s+',' ',str(value or '')).strip()
+    code=re.sub(r'[^A-Z]','',str(code or '').upper())[:3]
+    if not raw or not code:
+        return raw
+    # Complete CODE(...) wrapper: keep everything inside exactly, plus any terminal tail.
+    m=re.match(r'^\s*'+re.escape(code)+r'\s*\((.*)\)\s*(.*)$',raw,re.I)
+    if m:
+        inside=m.group(1).strip(); tail=m.group(2).strip()
+        return re.sub(r'\s+',' ',(inside+' '+tail).strip())
+    # Simple leading CODE delimiter. Remove only the exact IATA token + punctuation.
+    m=re.match(r'^\s*'+re.escape(code)+r'\s*[-–—:|]\s*(.+)$',raw,re.I)
+    if m:
+        return re.sub(r'\s+',' ',m.group(1)).strip()
+    return raw
 
 
 def _airport_candidate_score(text, city='', code=''):
@@ -745,142 +859,265 @@ def _airport_candidate_score(text, city='', code=''):
     words=re.findall(r"[A-Za-z][A-Za-z.'-]*",core)
     score=len(words)
     if re.search(r'(?i)\b(?:airport|aerodrome|airfield)\b',core):
-        score += 14
+        score += 16
     if re.search(r'(?i)\b(?:international|domestic)\b',core):
-        score += 4
+        score += 5
+    if re.search(r'(?i)\bterminal\b|\bT\s*\d+\b',text):
+        score += 2
     if len(words) < 2 and not re.search(r'(?i)\bairport\b',core):
-        score -= 6
+        score -= 8
     return score
 
 
-def _geometry_endpoint_candidate(lines, anchor_line, city='', code='', x_half_width=145.0):
-    """Recover the printed airport-name line(s) from the SAME endpoint column."""
-    ax,ay=_line_center(anchor_line)
-    strict_half=max(70.0,min(float(x_half_width),125.0))
-    same=[
-        ln for ln in lines
-        if ln['page']==anchor_line['page']
-        and abs(_line_center(ln)[0]-ax) <= strict_half
-        and (ay-22.0) <= _line_center(ln)[1] <= (ay+115.0)
-    ]
-    same=sorted(same,key=lambda ln:(ln['y0'],ln['x0']))
-    if not same:
+def _group_spans_in_zone(spans, page, x0, x1, y0, y1, y_tol=3.4):
+    """Group only spans inside one endpoint column; cross-column text can never join."""
+    selected=[]
+    for sp in spans:
+        if sp['page'] != page:
+            continue
+        cx,cy=_line_center(sp)
+        if x0 <= cx <= x1 and y0 <= cy <= y1:
+            selected.append(sp)
+    selected=sorted(selected,key=lambda s:(s['y0'],s['x0']))
+    groups=[]
+    for sp in selected:
+        cy=_line_center(sp)[1]
+        target=None
+        for g in reversed(groups[-3:]):
+            if abs(g['cy']-cy) <= y_tol:
+                target=g; break
+        if target is None:
+            target={'cy':cy,'spans':[]}
+            groups.append(target)
+        target['spans'].append(sp)
+        target['cy']=sum(_line_center(x)[1] for x in target['spans'])/len(target['spans'])
+    lines=[]
+    for g in groups:
+        ss=sorted(g['spans'],key=lambda s:s['x0'])
+        value=' '.join(s['text'] for s in ss)
+        value=re.sub(r'\s+',' ',value).strip()
+        if not value: continue
+        lines.append({
+            'page':page,'x0':min(s['x0'] for s in ss),'x1':max(s['x1'] for s in ss),
+            'y0':min(s['y0'] for s in ss),'y1':max(s['y1'] for s in ss),
+            'text':value,'cy':g['cy'],
+        })
+    return sorted(lines,key=lambda x:(x['cy'],x['x0']))
+
+
+def _nearby_time_score(spans, anchor, expected_time, x0, x1):
+    if not expected_time:
+        return 0
+    ay=_line_center(anchor)[1]
+    for sp in spans:
+        if sp['page'] != anchor['page']:
+            continue
+        cx,cy=_line_center(sp)
+        if x0 <= cx <= x1 and abs(cy-ay) <= 58 and _span_matches_time(sp,expected_time):
+            return 10
+    return 0
+
+
+def _nearby_flight_score(spans, page, row_y, flight_number, dep_x):
+    if not flight_number:
+        return 0
+    for sp in spans:
+        if sp['page'] != page:
+            continue
+        cx,cy=_line_center(sp)
+        if cx >= dep_x or abs(cy-row_y) > 85:
+            continue
+        if _span_matches_flight(sp,flight_number):
+            return 14
+    return 0
+
+
+def _best_segment_geometry_pair(spans, seg):
+    dep_code=str(seg.get('dep_code') or '').strip().upper()
+    arr_code=str(seg.get('arr_code') or '').strip().upper()
+    if not dep_code or not arr_code:
+        return None
+    dep_anchors=[sp for sp in spans if _line_contains_iata(sp,dep_code)]
+    arr_anchors=[sp for sp in spans if _line_contains_iata(sp,arr_code)]
+    candidates=[]
+    for dl in dep_anchors:
+        dx,dy=_line_center(dl)
+        for al in arr_anchors:
+            if al['page'] != dl['page']:
+                continue
+            ax,ay=_line_center(al)
+            if dx >= ax or abs(dy-ay) > 72:
+                continue
+            sep=ax-dx
+            if sep < 120:
+                continue
+            # Endpoint column bounds for validation scoring.
+            dep_left=dx-sep*0.32; dep_right=dx+sep*0.40
+            arr_left=ax-sep*0.40; arr_right=ax+sep*0.32
+            score=100-abs(dy-ay)
+            score += _nearby_time_score(spans,dl,seg.get('dep_time'),dep_left,dep_right)
+            score += _nearby_time_score(spans,al,seg.get('arr_time'),arr_left,arr_right)
+            score += _nearby_flight_score(spans,dl['page'],(dy+ay)/2.0,seg.get('flight_number'),dx)
+            candidates.append((score,dl,al))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x:x[0],reverse=True)
+    score,dl,al=candidates[0]
+    return {'score':score,'dep':dl,'arr':al,'row_y':(_line_center(dl)[1]+_line_center(al)[1])/2.0}
+
+
+def _airport_block_from_zone(spans, page, x0, x1, top, bottom, city='', code='', anchor_y=0):
+    lines=_group_spans_in_zone(spans,page,x0,x1,top,bottom)
+    if not lines:
         return ''
+
+    eligible=[]
+    for ln in lines:
+        txt=ln['text']
+        # Pure endpoint header line such as "Delhi (DEL)" or "RPR" is not airport body.
+        stripped=re.sub(r'(?i)\b'+re.escape(str(code or ''))+r'\b',' ',txt) if code else txt
+        if city:
+            stripped=re.sub(r'(?i)^\s*'+re.escape(str(city).strip())+r'\s*[-,:()]*\s*$','',stripped)
+        stripped=re.sub(r'[()\-,:|\s]+',' ',stripped).strip()
+        if not stripped:
+            continue
+        terminal_only=bool(_extract_terminal_from_endpoint_text(txt))
+        if _bad_airport_candidate_text(txt) and not terminal_only:
+            continue
+        score=_airport_candidate_score(txt,city,code)
+        terminal_only=terminal_only and score < 2
+        # Airport body is normally below the code/time/date block. Allow a small tolerance.
+        if ln['cy'] < anchor_y-5:
+            continue
+        if score >= 2 or terminal_only:
+            eligible.append((ln,score,terminal_only))
+
+    if not eligible:
+        return ''
+
+    # Build contiguous source blocks; wrapped airport lines must remain together.
+    blocks=[]
+    current=[]
+    last=None
+    for item in eligible:
+        ln=item[0]
+        if last is None or (ln['y0']-last['y1']) <= 13.5:
+            current.append(item)
+        else:
+            if current: blocks.append(current)
+            current=[item]
+        last=ln
+    if current: blocks.append(current)
 
     scored=[]
-    for idx,ln in enumerate(same):
-        score=_airport_candidate_score(ln['text'],city,code)
-        if score > -999:
-            # Prefer source lines close to the endpoint city/code row.
-            distance=abs(_line_center(ln)[1]-ay)
-            score += max(0,6-int(distance/18))
-            scored.append((score,idx))
+    for block in blocks:
+        value=' '.join(x[0]['text'] for x in block)
+        value=re.sub(r'\s+',' ',value).strip()
+        if _endpoint_is_suspicious(value):
+            continue
+        total=sum(max(0,x[1]) for x in block)
+        if re.search(r'(?i)\b(?:airport|aerodrome|airfield)\b',value): total += 10
+        if re.search(r'(?i)\b(?:international|domestic)\b',value): total += 4
+        # Prefer blocks close to row anchor but not the code/date line itself.
+        first_y=block[0][0]['cy']
+        total += max(0,8-int(abs(first_y-anchor_y)/15))
+        scored.append((total,value))
     if not scored:
         return ''
-
-    scored.sort(reverse=True)
-    best_score,best_idx=scored[0]
-    if best_score < 4:
-        return ''
-
-    # Combine wrapped continuation lines around the best airport line when they are
-    # vertically adjacent and belong to the same endpoint column.
-    chosen=[best_idx]
-    for step in (-1,1):
-        j=best_idx+step
-        if 0 <= j < len(same):
-            a=same[best_idx]
-            b=same[j]
-            gap=min(abs(b['y0']-a['y1']),abs(a['y0']-b['y1']))
-            if gap <= 10.0 and not _bad_airport_candidate_text(b['text']):
-                if _airport_candidate_score(b['text'],city,code) >= 2:
-                    chosen.append(j)
-
-    chosen=sorted(set(chosen))
-    candidate=' '.join(same[j]['text'] for j in chosen)
-    candidate=re.sub(r'\s+',' ',candidate).strip()
-
-    if not _endpoint_has_substantive_airport_name(candidate,city,code):
-        return ''
-    return candidate
+    scored.sort(key=lambda x:x[0],reverse=True)
+    best=scored[0][1]
+    return best if _endpoint_has_substantive_airport_name(best,city,code) else ''
 
 
 def _recover_airport_names_from_pdf_geometry(data, original_paths):
-    """Source-only fallback for selectable PDFs.
+    """V190 deterministic sector/column endpoint engine for selectable PDFs.
 
-    It never maps an IATA code to an airport from world knowledge. It only copies
-    richer airport wording that is physically printed near that endpoint's own code
-    in the supplier PDF.
+    Key difference from V184-V189: first lock ONE visual sector row, then split it into
+    independent Departure and Arrival columns. Cross-column text is never eligible.
     """
     data=data or {}
-    pdf_lines=[]
+    all_spans=[]
     for path in original_paths or []:
         try:
             path=Path(path)
             if path.suffix.lower()=='.pdf' and path.exists():
-                pdf_lines.extend(_pdf_layout_lines(path))
+                all_spans.extend(_pdf_layout_lines(path))
         except Exception:
             continue
-    if not pdf_lines:
+    if not all_spans:
         return data
 
-    for seg in data.get('segments') or []:
-        dep_code=str(seg.get('dep_code') or '').strip().upper()
-        arr_code=str(seg.get('arr_code') or '').strip().upper()
-        dep_city=str(seg.get('dep_city') or '').strip()
-        arr_city=str(seg.get('arr_city') or '').strip()
-        if not dep_code or not arr_code:
-            continue
+    matches=[]
+    for idx,seg in enumerate(data.get('segments') or []):
+        match=_best_segment_geometry_pair(all_spans,seg)
+        if match:
+            match['idx']=idx
+            matches.append(match)
 
-        dep_anchors=[ln for ln in pdf_lines if _line_contains_iata(ln,dep_code)]
-        arr_anchors=[ln for ln in pdf_lines if _line_contains_iata(ln,arr_code)]
-        pairs=[]
-        for dl in dep_anchors:
-            dx,dy=_line_center(dl)
-            for al in arr_anchors:
-                if al['page'] != dl['page']:
-                    continue
-                ax,ay=_line_center(al)
-                if abs(dy-ay) > 65:
-                    continue
-                if dx >= ax:
-                    continue
-                # Prefer same visual row, then wider left-to-right separation.
-                score=100-abs(dy-ay)+min(40,(ax-dx)/12)
-                pairs.append((score,dl,al))
-        if not pairs:
-            continue
-        pairs.sort(key=lambda x:x[0],reverse=True)
+    # Determine a safe vertical band for each matched row. Midpoint to next matched row
+    # prevents one connecting sector from borrowing the next sector's airport text.
+    by_page={}
+    for m in matches:
+        by_page.setdefault(m['dep']['page'],[]).append(m)
+    for page,items in by_page.items():
+        items.sort(key=lambda m:m['row_y'])
+        for i,m in enumerate(items):
+            prev_y=items[i-1]['row_y'] if i>0 else None
+            next_y=items[i+1]['row_y'] if i+1<len(items) else None
+            top=max(m['row_y']-12, ((prev_y+m['row_y'])/2.0) if prev_y is not None else m['row_y']-12)
+            default_bottom=m['row_y']+125
+            bottom=min(default_bottom, ((m['row_y']+next_y)/2.0)-2 if next_y is not None else default_bottom)
+            if bottom <= top+28:
+                bottom=top+90
+            m['top']=top; m['bottom']=bottom
 
-        # Try best pairs until one yields a source-backed airport name.
-        geo_dep=''; geo_arr=''
-        for _,dl,al in pairs[:6]:
-            separation=max(120.0,_line_center(al)[0]-_line_center(dl)[0])
-            half=max(90.0,min(180.0,separation*0.38))
-            if not geo_dep:
-                geo_dep=_geometry_endpoint_candidate(pdf_lines,dl,dep_city,dep_code,half)
-            if not geo_arr:
-                geo_arr=_geometry_endpoint_candidate(pdf_lines,al,arr_city,arr_code,half)
-            if geo_dep and geo_arr:
-                break
+    segments=data.get('segments') or []
+    for m in matches:
+        seg=segments[m['idx']]
+        dl,al=m['dep'],m['arr']
+        dx,dy=_line_center(dl); ax,ay=_line_center(al)
+        sep=max(120.0,ax-dx)
+        page_width=max(float(dl.get('page_width') or 0),float(al.get('page_width') or 0),ax+sep*0.35)
 
-        if geo_dep:
-            # Geometry is literal selectable supplier text from the exact endpoint
-            # column, so it is stronger than a rewritten/shortened model result.
-            seg['dep_airport']=geo_dep
-            seg['dep_airport_source_exact']=geo_dep
-            embedded=_extract_terminal_from_endpoint_text(geo_dep)
-            if embedded:
-                seg['dep_terminal']=embedded
+        # If a flight-number span is visible, use its right edge to hard-stop the left
+        # boundary of Departure. This permanently blocks "Operated by 6E" leakage.
+        flight_right=None
+        for sp in all_spans:
+            if sp['page'] != dl['page']:
+                continue
+            cx,cy=_line_center(sp)
+            if cx < dx and abs(cy-m['row_y']) <= 85 and _span_matches_flight(sp,seg.get('flight_number')):
+                flight_right=max(flight_right or sp['x1'],sp['x1'])
+        dep_left=((flight_right+dx)/2.0) if flight_right is not None else dx-sep*0.30
+        dep_right=dx+sep*0.38
+        arr_left=ax-sep*0.38
+        arr_right=min(page_width,ax+sep*0.34)
 
-        if geo_arr:
-            # Preserve the COMPLETE supplier wording, including leading city words
-            # such as `Raipur airport, raipur`.
-            seg['arr_airport']=geo_arr
-            seg['arr_airport_source_exact']=geo_arr
-            embedded=_extract_terminal_from_endpoint_text(geo_arr)
-            if embedded:
-                seg['arr_terminal']=embedded
+        geo_dep=_airport_block_from_zone(
+            all_spans,dl['page'],dep_left,dep_right,m['top'],m['bottom'],
+            str(seg.get('dep_city') or ''),str(seg.get('dep_code') or ''),dy,
+        )
+        geo_arr=_airport_block_from_zone(
+            all_spans,al['page'],arr_left,arr_right,m['top'],m['bottom'],
+            str(seg.get('arr_city') or ''),str(seg.get('arr_code') or ''),ay,
+        )
+
+        if geo_dep and not _endpoint_is_suspicious(geo_dep):
+            dep_field=_separate_endpoint_code_prefix(geo_dep,seg.get('dep_code'))
+            seg['dep_endpoint_source_raw']=geo_dep
+            seg['dep_airport']=dep_field
+            seg['dep_airport_source_exact']=dep_field
+            seg['dep_airport_source_locked']=True
+            embedded=_extract_terminal_from_endpoint_text(dep_field)
+            if embedded: seg['dep_terminal']=embedded
+        if geo_arr and not _endpoint_is_suspicious(geo_arr):
+            arr_field=_separate_endpoint_code_prefix(geo_arr,seg.get('arr_code'))
+            seg['arr_endpoint_source_raw']=geo_arr
+            seg['arr_airport']=arr_field
+            seg['arr_airport_source_exact']=arr_field
+            seg['arr_airport_source_locked']=True
+            embedded=_extract_terminal_from_endpoint_text(arr_field)
+            if embedded: seg['arr_terminal']=embedded
 
     return data
 
@@ -1004,12 +1241,16 @@ def _apply_verified_endpoint_rows(data, verified):
         # A non-empty endpoint copied from its exact row is authoritative.
         # Keep an explicit source-exact copy so the renderer cannot later shorten it.
         if dep_text:
-            seg['dep_airport'] = dep_text
-            seg['dep_airport_source_exact'] = dep_text
+            dep_field=_separate_endpoint_code_prefix(dep_text,seg.get('dep_code'))
+            seg['dep_endpoint_source_raw'] = dep_text
+            seg['dep_airport'] = dep_field
+            seg['dep_airport_source_exact'] = dep_field
             seg['dep_terminal'] = dep_terminal
         if arr_text:
-            seg['arr_airport'] = arr_text
-            seg['arr_airport_source_exact'] = arr_text
+            arr_field=_separate_endpoint_code_prefix(arr_text,seg.get('arr_code'))
+            seg['arr_endpoint_source_raw'] = arr_text
+            seg['arr_airport'] = arr_field
+            seg['arr_airport_source_exact'] = arr_field
             seg['arr_terminal'] = arr_terminal
 
     return data
@@ -1059,6 +1300,75 @@ def _verify_endpoint_rows(client, model, original_paths, source_text=''):
     if not rr.text:
         return {'segments': []}
     return json.loads(rr.text)
+
+
+def _focused_endpoint_verify(client, model, original_paths, seg, source_text=''):
+    """One sector per model call: prevents connection-row cross-contamination."""
+    identity=(
+        f"TARGET SECTOR ONLY:\n"
+        f"Flight: {seg.get('flight_number','')}\n"
+        f"Departure: {seg.get('dep_code','')} {seg.get('dep_time','')}\n"
+        f"Arrival: {seg.get('arr_code','')} {seg.get('arr_time','')}\n"
+    )
+    contents=[FOCUSED_ENDPOINT_PROMPT,identity]
+    if source_text:
+        contents.append('\nSOURCE TEXT (supporting only; visual row ownership wins):\n'+str(source_text)[:18000])
+    added=0
+    for p in original_paths or []:
+        try:
+            p=Path(p)
+            if not p.exists(): continue
+            suffix=p.suffix.lower()
+            mime='application/pdf' if suffix=='.pdf' else ('image/png' if suffix=='.png' else ('image/webp' if suffix=='.webp' else 'image/jpeg'))
+            contents.append(types.Part.from_bytes(data=p.read_bytes(),mime_type=mime)); added+=1
+        except Exception:
+            continue
+    if not added and not source_text:
+        return {}
+    rr=call_with_high_demand_retry(lambda: client.models.generate_content(
+        model=model,contents=contents,
+        config=types.GenerateContentConfig(response_mime_type='application/json',response_schema=FOCUSED_ENDPOINT_SCHEMA,temperature=0)
+    ))
+    return json.loads(rr.text) if rr.text else {}
+
+
+def _apply_focused_endpoint(seg,row):
+    if not row: return seg
+    dep_text,dep_terminal=_compose_verified_endpoint(row.get('dep_endpoint_text'),row.get('dep_terminal'),row.get('dep_terminal_evidence'))
+    arr_text,arr_terminal=_compose_verified_endpoint(row.get('arr_endpoint_text'),row.get('arr_terminal'),row.get('arr_terminal_evidence'))
+    # Never replace a deterministic selectable-PDF lock with AI text.
+    if not seg.get('dep_airport_source_locked') and dep_text and not _endpoint_is_suspicious(dep_text):
+        dep_field=_separate_endpoint_code_prefix(dep_text,seg.get('dep_code'))
+        seg['dep_endpoint_source_raw']=dep_text; seg['dep_airport']=dep_field; seg['dep_airport_source_exact']=dep_field; seg['dep_terminal']=dep_terminal
+    if not seg.get('arr_airport_source_locked') and arr_text and not _endpoint_is_suspicious(arr_text):
+        arr_field=_separate_endpoint_code_prefix(arr_text,seg.get('arr_code'))
+        seg['arr_endpoint_source_raw']=arr_text; seg['arr_airport']=arr_field; seg['arr_airport_source_exact']=arr_field; seg['arr_terminal']=arr_terminal
+    return seg
+
+
+def _endpoint_needs_focused_verify(seg,key):
+    exact=str(seg.get(key+'_airport_source_exact') or '').strip()
+    current=str(seg.get(key+'_airport') or '').strip()
+    return (not exact) or _endpoint_is_suspicious(exact) or _endpoint_is_suspicious(current)
+
+
+def _final_endpoint_safety_gate(data):
+    """Never print contaminated source-critical airport text."""
+    for seg in data.get('segments') or []:
+        for prefix in ('dep','arr'):
+            exact_key=prefix+'_airport_source_exact'; airport_key=prefix+'_airport'
+            exact=re.sub(r'\s+',' ',str(seg.get(exact_key) or '')).strip()
+            airport=re.sub(r'\s+',' ',str(seg.get(airport_key) or '')).strip()
+            if exact and _endpoint_is_suspicious(exact):
+                seg.pop(exact_key,None); exact=''
+            chosen=exact or airport
+            if chosen and _endpoint_is_suspicious(chosen):
+                # Blank is safer than wrong on an air ticket.
+                seg[airport_key]=''
+            elif chosen:
+                seg[airport_key]=chosen
+    return data
+
 
 def _apply_special_ancillary_summary(data):
     """Recover only explicit ancillary charge/service labels; standard baggage is excluded."""
@@ -1400,6 +1710,21 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
             data = _recover_airport_names_from_pdf_geometry(data, original_paths)
         except Exception:
             pass
+
+        # V190 FOCUSED PER-SECTOR VISUAL FALLBACK:
+        # Only unresolved/suspicious endpoints are reread, one flight sector at a time.
+        # This is especially important for scanned/image tickets where PDF text geometry
+        # is unavailable. Deterministic selectable-PDF locks always win.
+        for seg in data.get('segments') or []:
+            if _endpoint_needs_focused_verify(seg,'dep') or _endpoint_needs_focused_verify(seg,'arr'):
+                try:
+                    focused=_focused_endpoint_verify(client,model,original_paths,seg,source_text=source_text)
+                    _apply_focused_endpoint(seg,focused)
+                except Exception:
+                    pass
+
+        # Final source-critical gate: reject contamination/truncation rather than print it.
+        data=_final_endpoint_safety_gate(data)
 
         # Fare recovery: if the main extraction misses a clearly printed supplier
         # total, run a focused multimodal fare pass before declaring the fare absent.
