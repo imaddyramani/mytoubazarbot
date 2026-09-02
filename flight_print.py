@@ -3,6 +3,7 @@ from html import escape
 import base64
 import re
 import io
+import copy
 from weasyprint import HTML
 from PIL import Image, ImageChops
 from print_settings import apply_css_settings
@@ -45,6 +46,34 @@ def _display_person_name(person):
             rest=rest[mm.end():].strip()
         return f"{shown} {rest}".strip()
     return f"{title} {name}".strip() if title else name
+
+
+def _b2b_replace_text(value):
+    text=str(value or "")
+    text=re.sub(r"(?i)\bsales@mytourbazar\.com\b","our company",text)
+    text=re.sub(r"(?i)\b(?:www\.)?mytourbazar\.com\b","our company",text)
+    text=re.sub(r"(?i)@mytourbazar\b","our company",text)
+    text=re.sub(r"(?i)\bmy\s*tour\s*bazar\b","our company",text)
+    text=re.sub(r"(?i)\bmytourbazar\b","our company",text)
+    return text
+
+
+def _b2b_scrub_data(data):
+    def scrub(obj):
+        if isinstance(obj,dict):
+            return {k:scrub(v) for k,v in obj.items()}
+        if isinstance(obj,list):
+            return [scrub(v) for v in obj]
+        if isinstance(obj,tuple):
+            return tuple(scrub(v) for v in obj)
+        if isinstance(obj,str):
+            return _b2b_replace_text(obj)
+        return obj
+    result=scrub(copy.deepcopy(data or {}))
+    result["b2b"]=True
+    result["brand_neutral"]=True
+    return result
+
 
 def _optional_paren(v):
     value=_text(v)
@@ -347,73 +376,66 @@ def _reconciled_supplier_total(data, rows=None):
 
 
 def _payment_breakdown(data, updated_total):
-    """Return a non-negative line-by-line payment breakdown.
+    """Return payment rows using ONLY supplier-provided cost field names.
 
-    Supplier labels/order are preserved. A customer selling fare is distributed
-    proportionally across genuine positive charge rows. The reconciled supplier
-    total is used as the denominator so a bad extracted gross_total cannot create
-    a negative tax/fee row.
+    Any difference between extracted component rows and the verified supplier total,
+    and any customer selling markup/reduction, is distributed proportionally across
+    the AVAILABLE source cost rows. The renderer never invents an `Other Supplier
+    Charges` row. If that exact row genuinely exists in the supplier source, it is
+    naturally preserved because it came through payment_items.
     """
     rows=_clean_payment_rows(data)
-    source_sum=sum(float(x["amount"]) for x in rows)
+    source_sum=sum(max(0.0,float(x["amount"])) for x in rows)
     supplier_total=_reconciled_supplier_total(data,rows)
 
-    # gross_total can legitimately be higher than known rows if a supplier charge
-    # was omitted by extraction. Preserve the difference as an explicit positive row.
-    if supplier_total > source_sum + 0.5:
-        rows.append({
-            "label":"Other Supplier Charges",
-            "amount":supplier_total-source_sum,
-        })
-        source_sum=supplier_total
-
     if updated_total is None:
-        return rows, supplier_total
+        target=max(0.0,float(supplier_total or source_sum or 0))
+    else:
+        try:
+            target=max(0.0,float(updated_total))
+        except Exception:
+            target=max(0.0,float(supplier_total or source_sum or 0))
 
-    try:
-        target=float(updated_total)
-    except Exception:
-        target=supplier_total
-    target=max(0.0,target)
-
-    denominator=supplier_total if supplier_total > 0 else source_sum
-    if rows and denominator > 0:
-        factor=target/denominator
+    if rows and source_sum > 0:
+        # Always distribute to the source-provided fields themselves.
+        factor=target/source_sum
         adjusted=[
             {"label":row["label"],"amount":max(0,round(float(row["amount"])*factor))}
             for row in rows
         ]
 
-        # Keep the printed sum exact, but NEVER make any row negative.
+        # Make printed rows add to the exact target without ever going negative.
         diff=round(target)-sum(x["amount"] for x in adjusted)
-        if adjusted and diff:
-            if diff > 0:
-                adjusted[-1]["amount"] += diff
-            else:
-                remaining=-diff
-                # Remove rounding excess from the largest rows first.
-                for idx in sorted(range(len(adjusted)),key=lambda i:adjusted[i]["amount"],reverse=True):
-                    reducible=min(remaining,adjusted[idx]["amount"])
-                    adjusted[idx]["amount"] -= reducible
-                    remaining -= reducible
-                    if remaining <= 0:
-                        break
+        if adjusted and diff>0:
+            adjusted[-1]["amount"] += diff
+        elif adjusted and diff<0:
+            remaining=-diff
+            for idx in sorted(range(len(adjusted)),key=lambda i:adjusted[i]["amount"],reverse=True):
+                reducible=min(remaining,adjusted[idx]["amount"])
+                adjusted[idx]["amount"] -= reducible
+                remaining -= reducible
+                if remaining<=0:
+                    break
 
-        # Final defensive guarantee: no negative monetary component can ever print.
         for row in adjusted:
             row["amount"]=max(0,row["amount"])
 
         final_diff=round(target)-sum(x["amount"] for x in adjusted)
-        if adjusted and final_diff > 0:
+        if adjusted and final_diff>0:
             adjusted[-1]["amount"] += final_diff
 
         return adjusted,target
 
-    if target > 0:
+    if target>0:
+        # Only when the supplier gave no usable component rows at all.
         return [{"label":"Total Fare","amount":round(target)}],target
     return [],target
 
 def generate_flight_ticket(data, updated_total, output_path, logo_path=None, page_size="A4", text_scale_override=None, logo_scale_override=None):
+    b2b=bool((data or {}).get("b2b") or (data or {}).get("brand_neutral"))
+    if b2b:
+        data=_b2b_scrub_data(data)
+        logo_path=None
     segs=data.get('segments') or []
     passengers=data.get('passengers') or []
     base=tax=None
@@ -429,7 +451,10 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
             pass
 
     logo=_uri(logo_path)
-    logo_html=f'<a href="{MYTOURBAZAR_LOGO_URL}"><img class="brand-logo" src="{logo}"></a>' if logo else ''
+    if b2b:
+        logo_html='<div class="b2b-brand">our company</div>'
+    else:
+        logo_html=f'<a href="{MYTOURBAZAR_LOGO_URL}"><img class="brand-logo" src="{logo}"></a>' if logo else ''
     customer_mobile=_text(data.get('mobile'))  # STRICT: no fallback to airline/PNR/other numbers.
     baggage_summary=_text(data.get("baggage_summary"))
     ancillary_summary=_text(data.get("special_ancillary_summary"))
@@ -620,7 +645,7 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     )
 
     html=f'''<!doctype html><html><head><meta charset="utf-8"><style>
-@page{{size:{page_size};margin:12mm 10mm 8mm 10mm}}*{{box-sizing:border-box}}body{{margin:0;color:#12324b;font-family:"MTBLiberationSerifBold",Georgia,serif;font-size:10.2pt;line-height:1.28}}.top{{height:33mm;position:relative;border-bottom:2.5px solid #f4a62a;margin-bottom:5mm}}.brand{{position:absolute;left:0;top:0;width:45%;height:26mm;display:flex;align-items:center}}.brand-logo{{max-width:1.55in;max-height:1.05in;object-fit:contain}}.heading{{position:absolute;right:0;top:3mm;text-align:right;color:#073450}}.heading h1{{margin:0;font-size:21pt;letter-spacing:.3px}}.heading div{{font-size:10.5pt;margin-top:2mm}}.heading .booked-on{{font-size:8.6pt;margin-top:1.1mm;color:#5d646a;font-weight:700}}.meta{{background:#f0f5fa;border:1.5px solid #9cb6cc;border-radius:6px;padding:5mm 6mm;margin-bottom:5mm}}.meta table,.pax,.flights{{width:100%;border-collapse:collapse}}.meta td{{padding:1.4mm 1mm;font-size:10.2pt}}.meta .lab{{font-weight:700;white-space:nowrap}}.meta .val{{font-weight:800;color:#063655}}.meta .pnr-val{{font-weight:900;color:#e65100;font-size:11.2pt;letter-spacing:.2px}}.section{{background:#063655;color:#fff;padding:2.6mm 4mm;font-size:12pt;letter-spacing:.1px;border-radius:3px 3px 0 0;margin-top:4mm}}.pax,.flights{{border:1.5px solid #9cb6cc}}.pax th,.flights th{{background:#dceaf5;color:#123b58;padding:2.6mm 2.4mm;text-align:center;font-size:9.7pt;border-bottom:1px solid #9cb6cc;vertical-align:middle}}.flights thead th:nth-child(1),.flights thead th:nth-child(2),.flights thead th:nth-child(4){{text-align:center!important;vertical-align:middle!important}}.duration-head{{text-align:center!important;vertical-align:middle!important;line-height:1.12}}.duration-head span{{display:block}}.duration-head .duration-head-stop{{margin-top:.55mm}}.pax td{{padding:2.6mm 2.0mm;border-bottom:1px solid #d3e0eb;font-size:9.4pt;color:#1f2c35;vertical-align:middle;text-align:center}}.pax th:nth-child(1),.pax td:nth-child(1){{width:4%}}.pax th:nth-child(2),.pax td:nth-child(2){{width:32%}}.pax th:nth-child(3),.pax td:nth-child(3){{width:16%}}.pax th:nth-child(4),.pax td:nth-child(4){{width:10%}}.pax th:nth-child(5),.pax td:nth-child(5){{width:12%}}.pax th:nth-child(6),.pax td:nth-child(6){{width:26%}}.pax.has-ancillary th:nth-child(1),.pax.has-ancillary td:nth-child(1){{width:4%}}.pax.has-ancillary th:nth-child(2),.pax.has-ancillary td:nth-child(2){{width:27%}}.pax.has-ancillary th:nth-child(3),.pax.has-ancillary td:nth-child(3){{width:14%}}.pax.has-ancillary th:nth-child(4),.pax.has-ancillary td:nth-child(4){{width:9%}}.pax.has-ancillary th:nth-child(5),.pax.has-ancillary td:nth-child(5){{width:10%}}.pax.has-ancillary th:nth-child(6),.pax.has-ancillary td:nth-child(6){{width:21%}}.pax.has-ancillary th:nth-child(7),.pax.has-ancillary td:nth-child(7){{width:15%}}.pax-name{{font-size:11.3pt!important;font-weight:800;line-height:1.18;overflow-wrap:anywhere}}.pax-pnr{{font-weight:800;color:#123b58}}.pax-index,.pax-type,.pax-dob{{white-space:nowrap}}.baggage-cell{{font-size:8.7pt;text-align:center!important}}.bag-line{{display:flex;align-items:center;justify-content:center;gap:1.2mm;margin:.7mm auto;line-height:1.2;text-align:left;width:fit-content;max-width:100%}}.bag-icon{{width:15px;height:15px;min-width:15px;color:#123b58;vertical-align:middle}}.ancillary-cell{{font-size:8.5pt;font-weight:700;color:#334b5c;text-align:center!important}}.flights td{{padding:3.6mm 3mm;border-bottom:1px solid #d3e0eb;vertical-align:middle;font-size:9.7pt;color:#26323a;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere;text-align:center}}.airport-full{{display:inline-block;margin-top:.7mm;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere;line-height:1.25;color:#4c5963;font-size:8.8pt;font-weight:700}}.terminal-line{{display:inline-block;margin-top:.45mm;font-size:8.7pt;font-weight:800;color:#123b58;white-space:normal}}.airline-logo-wrap{{width:96px;height:42px;display:flex;align-items:center;justify-content:center;margin:0 auto 1.8mm auto;overflow:visible}}.airline-logo{{display:block;max-width:92px;max-height:38px;width:auto;height:auto;object-fit:contain;object-position:center center}}.airline-logo.fallback{{opacity:.88;max-width:52px;max-height:34px;padding:2px}}.flight-id{{font-size:8.4pt;color:#5d646a}}.flight-meta{{display:inline-block;margin-top:.7mm;font-size:8.7pt;font-weight:600;color:#5d646a}}.flights .flight-row td:first-child{{width:27%;text-align:center}}.flights .flight-row td:nth-child(2){{width:29%;text-align:center}}.flights .flight-row td:nth-child(3){{width:15%;text-align:center}}.flights .flight-row td:nth-child(4){{width:29%;text-align:center}}.time{{font-size:12.3pt;font-weight:900;color:#123b58;line-height:1.18}}.muted{{font-family:Georgia,serif;color:#5d646a;font-size:8.7pt}}.duration{{font-weight:800;color:#123b58;text-align:center!important;vertical-align:middle!important;white-space:normal;padding-left:1.2mm!important;padding-right:1.2mm!important}}.duration-main{{display:block;font-size:10.2pt;color:#123b58;line-height:1.2;white-space:nowrap;text-align:center}}.stops{{display:block;margin-top:.8mm;font-size:8.7pt;color:#5d646a;line-height:1.15;white-space:nowrap;text-align:center}}.duration-join{{display:none}}.terminal{{display:inline-block;margin-top:1.2mm;color:#073450;font-size:8.8pt}}.dash{{color:#9cb6cc;letter-spacing:1px}}.layover td{{background:#edf4fa;text-align:center;padding:2.5mm;font-size:9.6pt;font-weight:800;color:#123b58}}.fare{{margin-top:4mm;background:#f7fafc;border:1.5px solid #9cb6cc;border-radius:6px;padding:0;overflow:hidden;font-size:9.6pt;break-inside:avoid;page-break-inside:avoid}}.fare-title{{background:#e5eff7;color:#123b58;font-size:10.2pt;font-weight:900;padding:2.4mm 3.5mm;border-bottom:1px solid #b8cad9;letter-spacing:.15px}}.payment-table{{width:100%;border-collapse:collapse}}.payment-table td{{padding:2.1mm 3.5mm;border-bottom:1px solid #d7e2eb;vertical-align:middle}}.payment-table .pay-label{{text-align:left;font-weight:700;color:#334b5c}}.payment-table .pay-amount{{text-align:right;font-weight:800;color:#123b58;white-space:nowrap}}.payment-table .payment-total td{{border-bottom:0;background:#eef5fa;font-size:10.6pt;font-weight:900;color:#073450;padding-top:2.7mm;padding-bottom:2.7mm}}.payment-table .payment-total td:last-child{{text-align:right;color:#e65100;white-space:nowrap}}.terms{{border:1.5px solid #9cb6cc;border-radius:6px;padding:4mm 5mm;margin-top:5mm}}.terms h3{{margin:0 0 2mm;color:#123b58;font-size:11.5pt;border-bottom:1px solid #c6d5e2;padding-bottom:2mm}}.terms ul{{margin:0;padding-left:5mm}}.terms li{{margin:1.8mm 0;font-size:9pt;color:#26323a}}.keep{{break-inside:avoid;page-break-inside:avoid}}tr{{break-inside:avoid;page-break-inside:avoid}}strong{{font-weight:800}}
+@page{{size:{page_size};margin:12mm 10mm 8mm 10mm}}*{{box-sizing:border-box}}body{{margin:0;color:#12324b;font-family:"MTBLiberationSerifBold",Georgia,serif;font-size:10.2pt;line-height:1.28}}.top{{height:33mm;position:relative;border-bottom:2.5px solid #f4a62a;margin-bottom:5mm}}.brand{{position:absolute;left:0;top:0;width:45%;height:26mm;display:flex;align-items:center}}.brand-logo{{max-width:1.55in;max-height:1.05in;object-fit:contain}}.b2b-brand{{font-size:15pt;font-weight:900;color:#073450;text-transform:lowercase;letter-spacing:.2px}}.heading{{position:absolute;right:0;top:3mm;text-align:right;color:#073450}}.heading h1{{margin:0;font-size:21pt;letter-spacing:.3px}}.heading div{{font-size:10.5pt;margin-top:2mm}}.heading .booked-on{{font-size:8.6pt;margin-top:1.1mm;color:#5d646a;font-weight:700}}.meta{{background:#f0f5fa;border:1.5px solid #9cb6cc;border-radius:6px;padding:5mm 6mm;margin-bottom:5mm}}.meta table,.pax,.flights{{width:100%;border-collapse:collapse}}.meta td{{padding:1.4mm 1mm;font-size:10.2pt}}.meta .lab{{font-weight:700;white-space:nowrap}}.meta .val{{font-weight:800;color:#063655}}.meta .pnr-val{{font-weight:900;color:#e65100;font-size:11.2pt;letter-spacing:.2px}}.section{{background:#063655;color:#fff;padding:2.6mm 4mm;font-size:12pt;letter-spacing:.1px;border-radius:3px 3px 0 0;margin-top:4mm}}.pax,.flights{{border:1.5px solid #9cb6cc}}.pax th,.flights th{{background:#dceaf5;color:#123b58;padding:2.6mm 2.4mm;text-align:center;font-size:9.7pt;border-bottom:1px solid #9cb6cc;vertical-align:middle}}.flights thead th:nth-child(1),.flights thead th:nth-child(2),.flights thead th:nth-child(4){{text-align:center!important;vertical-align:middle!important}}.duration-head{{text-align:center!important;vertical-align:middle!important;line-height:1.12}}.duration-head span{{display:block}}.duration-head .duration-head-stop{{margin-top:.55mm}}.pax td{{padding:2.6mm 2.0mm;border-bottom:1px solid #d3e0eb;font-size:9.4pt;color:#1f2c35;vertical-align:middle;text-align:center}}.pax th:nth-child(1),.pax td:nth-child(1){{width:4%}}.pax th:nth-child(2),.pax td:nth-child(2){{width:32%}}.pax th:nth-child(3),.pax td:nth-child(3){{width:16%}}.pax th:nth-child(4),.pax td:nth-child(4){{width:10%}}.pax th:nth-child(5),.pax td:nth-child(5){{width:12%}}.pax th:nth-child(6),.pax td:nth-child(6){{width:26%}}.pax.has-ancillary th:nth-child(1),.pax.has-ancillary td:nth-child(1){{width:4%}}.pax.has-ancillary th:nth-child(2),.pax.has-ancillary td:nth-child(2){{width:27%}}.pax.has-ancillary th:nth-child(3),.pax.has-ancillary td:nth-child(3){{width:14%}}.pax.has-ancillary th:nth-child(4),.pax.has-ancillary td:nth-child(4){{width:9%}}.pax.has-ancillary th:nth-child(5),.pax.has-ancillary td:nth-child(5){{width:10%}}.pax.has-ancillary th:nth-child(6),.pax.has-ancillary td:nth-child(6){{width:21%}}.pax.has-ancillary th:nth-child(7),.pax.has-ancillary td:nth-child(7){{width:15%}}.pax-name{{font-size:11.3pt!important;font-weight:800;line-height:1.18;overflow-wrap:anywhere}}.pax-pnr{{font-weight:800;color:#123b58}}.pax-index,.pax-type,.pax-dob{{white-space:nowrap}}.baggage-cell{{font-size:8.7pt;text-align:center!important}}.bag-line{{display:flex;align-items:center;justify-content:center;gap:1.2mm;margin:.7mm auto;line-height:1.2;text-align:left;width:fit-content;max-width:100%}}.bag-icon{{width:15px;height:15px;min-width:15px;color:#123b58;vertical-align:middle}}.ancillary-cell{{font-size:8.5pt;font-weight:700;color:#334b5c;text-align:center!important}}.flights td{{padding:3.6mm 3mm;border-bottom:1px solid #d3e0eb;vertical-align:middle;font-size:9.7pt;color:#26323a;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere;text-align:center}}.airport-full{{display:inline-block;margin-top:.7mm;white-space:normal;overflow:visible;word-break:normal;overflow-wrap:anywhere;line-height:1.25;color:#4c5963;font-size:8.8pt;font-weight:700}}.terminal-line{{display:inline-block;margin-top:.45mm;font-size:8.7pt;font-weight:800;color:#123b58;white-space:normal}}.airline-logo-wrap{{width:96px;height:42px;display:flex;align-items:center;justify-content:center;margin:0 auto 1.8mm auto;overflow:visible}}.airline-logo{{display:block;max-width:92px;max-height:38px;width:auto;height:auto;object-fit:contain;object-position:center center}}.airline-logo.fallback{{opacity:.88;max-width:52px;max-height:34px;padding:2px}}.flight-id{{font-size:8.4pt;color:#5d646a}}.flight-meta{{display:inline-block;margin-top:.7mm;font-size:8.7pt;font-weight:600;color:#5d646a}}.flights .flight-row td:first-child{{width:27%;text-align:center}}.flights .flight-row td:nth-child(2){{width:29%;text-align:center}}.flights .flight-row td:nth-child(3){{width:15%;text-align:center}}.flights .flight-row td:nth-child(4){{width:29%;text-align:center}}.time{{font-size:12.3pt;font-weight:900;color:#123b58;line-height:1.18}}.muted{{font-family:Georgia,serif;color:#5d646a;font-size:8.7pt}}.duration{{font-weight:800;color:#123b58;text-align:center!important;vertical-align:middle!important;white-space:normal;padding-left:1.2mm!important;padding-right:1.2mm!important}}.duration-main{{display:block;font-size:10.2pt;color:#123b58;line-height:1.2;white-space:nowrap;text-align:center}}.stops{{display:block;margin-top:.8mm;font-size:8.7pt;color:#5d646a;line-height:1.15;white-space:nowrap;text-align:center}}.duration-join{{display:none}}.terminal{{display:inline-block;margin-top:1.2mm;color:#073450;font-size:8.8pt}}.dash{{color:#9cb6cc;letter-spacing:1px}}.layover td{{background:#edf4fa;text-align:center;padding:2.5mm;font-size:9.6pt;font-weight:800;color:#123b58}}.fare{{margin-top:4mm;background:#f7fafc;border:1.5px solid #9cb6cc;border-radius:6px;padding:0;overflow:hidden;font-size:9.6pt;break-inside:avoid;page-break-inside:avoid}}.fare-title{{background:#e5eff7;color:#123b58;font-size:10.2pt;font-weight:900;padding:2.4mm 3.5mm;border-bottom:1px solid #b8cad9;letter-spacing:.15px}}.payment-table{{width:100%;border-collapse:collapse}}.payment-table td{{padding:2.1mm 3.5mm;border-bottom:1px solid #d7e2eb;vertical-align:middle}}.payment-table .pay-label{{text-align:left;font-weight:700;color:#334b5c}}.payment-table .pay-amount{{text-align:right;font-weight:800;color:#123b58;white-space:nowrap}}.payment-table .payment-total td{{border-bottom:0;background:#eef5fa;font-size:10.6pt;font-weight:900;color:#073450;padding-top:2.7mm;padding-bottom:2.7mm}}.payment-table .payment-total td:last-child{{text-align:right;color:#e65100;white-space:nowrap}}.terms{{border:1.5px solid #9cb6cc;border-radius:6px;padding:4mm 5mm;margin-top:5mm}}.terms h3{{margin:0 0 2mm;color:#123b58;font-size:11.5pt;border-bottom:1px solid #c6d5e2;padding-bottom:2mm}}.terms ul{{margin:0;padding-left:5mm}}.terms li{{margin:1.8mm 0;font-size:9pt;color:#26323a}}.keep{{break-inside:avoid;page-break-inside:avoid}}tr{{break-inside:avoid;page-break-inside:avoid}}strong{{font-weight:800}}
 </style></head><body>
 <div class="top"><div class="brand">{logo_html}</div><div class="heading"><h1>E-TICKET ITINERARY</h1><div>Flight Booking Confirmation</div>{booked_on_html}</div></div>
 <div class="meta"><table><tr><td class="lab">Trip ID:</td><td class="val">{_esc(data.get('booking_id') or data.get('trip_id'))}</td><td class="lab">Travel Date:</td><td class="val">{_esc(data.get('travel_date') or (segs[0].get('dep_date') if segs else ''))}</td></tr><tr><td class="lab">Airline PNR:</td><td class="val pnr-val">{_esc(data.get('airline_pnr'))}</td><td class="lab">GDS PNR:</td><td class="val">{_esc(data.get('gds_pnr'))}</td></tr><tr><td class="lab">Status:</td><td class="val">{_esc(data.get('status') or 'CONFIRMED')}</td><td class="lab">Customer Mobile:</td><td class="val">{_esc(customer_mobile)}</td></tr></table></div>

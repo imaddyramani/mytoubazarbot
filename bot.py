@@ -1654,6 +1654,101 @@ def find_reference_for_reply(replied):
         if low and low in hay.lower(): return r.get("reference")
     return ""
 
+
+async def _direct_saved_b2b_print(message, context, reference, record, query=None):
+    """Directly white-label an already generated Tour or Air PDF.
+
+    No intermediate Basic/Detailed/Quotation/Voucher/footer selection is shown.
+    The existing document's detail level, document mode, fare, page size and content
+    are preserved; only agency branding is removed.
+    """
+    if not record:
+        await message.reply_text("❌ Saved document not found.", reply_markup=main_keyboard())
+        return
+
+    kind = record.get("type")
+    if kind not in ("package", "flight"):
+        await message.reply_text("❌ B2B direct print is currently available for Tour and Air PDFs.")
+        return
+
+    if query is not None:
+        await safe_callback_edit(
+            query,
+            "🏢 *Generating B2B white-label PDF directly...*",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.reply_text("🏢 *Generating B2B white-label PDF directly...*", parse_mode="Markdown")
+
+    data = copy.deepcopy(record.get("data") or {})
+    fare = record.get("fare")
+    page_size = record.get("page_size") or "A4"
+    text_scale = float(record.get("text_scale") or load_settings().get("text_scale", 1.0))
+    logo_scale = float(record.get("logo_scale") or get_logo_scale(kind))
+    document_mode = record.get("document_mode") or data.get("document_mode") or "itinerary"
+
+    # Reuse the strict recursive brand scrubber for both Tour and Air.
+    data = _b2b_neutralize_data(data, document_mode if kind == "package" else None)
+    if kind == "package":
+        data = _apply_tour_document_mode_fields(data, document_mode, b2b=True)
+        data["greeting"] = _b2b_greeting(data, document_mode)
+
+    render_record = copy.deepcopy(record)
+    render_record["b2b"] = True
+    render_record["agency_removed"] = True
+    render_record["_clean_agency"] = True
+    render_record["footer"] = False
+    render_record["footer_mode"] = "none"
+    render_record["logo_enabled"] = False
+    if kind == "package":
+        render_record["terms_choice"] = "b2b"
+        render_record["document_mode"] = document_mode
+
+    final, selected_scale, filename = await _render_saved_pdf(
+        reference,
+        render_record,
+        data,
+        kind,
+        fare,
+        page_size,
+        "none",
+        False,
+        text_scale_override=text_scale,
+        logo_scale_override=logo_scale,
+        auto_fit=False,
+        last_page="b2b" if kind == "package" else None,
+    )
+
+    # Persist the white-label copy as the current saved version so later edits
+    # cannot accidentally reintroduce MyTourBazar branding.
+    record.update({
+        "filename": filename,
+        "data": data,
+        "page_size": page_size,
+        "text_scale": selected_scale,
+        "logo_scale": logo_scale,
+        "logo_enabled": False,
+        "footer": False,
+        "footer_mode": "none",
+        "agency_removed": True,
+        "b2b": True,
+    })
+    if kind == "package":
+        record["terms_choice"] = "b2b"
+        record["document_mode"] = document_mode
+    update_record(reference, record)
+
+    caption = "📄 B2B Tour" if kind == "package" else "📄 B2B Air Itinerary"
+    with open(final, "rb") as fh:
+        sent_pdf = await message.reply_document(
+            document=fh,
+            filename=filename,
+            caption=_record_caption(reference, caption, "White-label • agency details removed"),
+            reply_markup=generated_document_keyboard(reference, kind),
+        )
+    _register_reference_message(reference, sent_pdf)
+
+
 async def reply_reference_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route owner replies. Fare-entry replies are handled first so Telegram's
     reply-to-message feature cannot get swallowed by a ConversationHandler.
@@ -1835,6 +1930,13 @@ async def reply_reference_edit(update: Update, context: ContextTypes.DEFAULT_TYP
     if not instruction:
         await msg.reply_text(f"✏️ I found *{reference}*. Please tell me what you want changed.", parse_mode="Markdown")
         return
+
+    # V188: a B2B / white-label reply on an already generated Tour or Air PDF is
+    # a DIRECT print conversion, not a generic edit and not another option menu.
+    if record.get("type") in ("package", "flight") and _smart_requested_b2b(instruction):
+        await _direct_saved_b2b_print(msg, context, reference, record)
+        raise ApplicationHandlerStop
+
     # Lightweight reply actions for generated Tour PDFs. These are intentionally
     # handled before the general Smart Edit path so a simple reply like +10000 or
     # Start Date: 20/09/2026 does exactly the requested action.
@@ -4559,7 +4661,16 @@ def _normalize_guest_counts(data):
     if eb<=0:
         m=re.search(r'(\d+)\s*(?:extra\s*bed|eb)', raw, re.I); eb=int(m.group(1)) if m else eb
     data['adult_count']=adults; data['child_count']=child; data['child_cwb_count']=cwb; data['child_cnb_count']=cnb; data['extra_bed_count']=eb
-    data['guest_profile']=f'{adults} Adult(s) • {child} Child • {cwb} Child CWB • {cnb} Child CNB • {eb} Extra Bed(s)'
+
+    # Passenger Profile should show only real/non-zero categories.
+    # Example: 2 Adults + 1 EB -> "2 Adult(s) • 1 Extra Bed"
+    profile_parts=[]
+    if adults>0: profile_parts.append(f'{adults} Adult' + ('s' if adults!=1 else ''))
+    if child>0: profile_parts.append(f'{child} Child' + ('ren' if child!=1 else ''))
+    if cwb>0: profile_parts.append(f'{cwb} Child CWB')
+    if cnb>0: profile_parts.append(f'{cnb} Child CNB')
+    if eb>0: profile_parts.append(f'{eb} Extra Bed' + ('s' if eb!=1 else ''))
+    data['guest_profile']=' • '.join(profile_parts) if profile_parts else str(data.get('guests') or '').strip()
     return data
 
 def _num_cost(v):
@@ -7167,9 +7278,11 @@ I will show the detailed Transit text I understood before regenerating the PDF."
 
     if query.data.startswith('mod_b2b:'):
         reference=query.data.split(':',1)[1]
-        pending=context.user_data.setdefault(f'modify:{reference}',{})
-        pending['b2b']=True; pending['clean_agency']=True; pending['tour_last_page']='b2b'
-        await safe_callback_edit(query,'🏢 B2B Print selected. This is strict white-label mode: MyTourBazar will be removed from greeting/body/footer/watermark/terms, and company references will use “our company”.',reply_markup=modify_keyboard(reference,'package')); return
+        record=load_record(reference)
+        if not record:
+            await query.message.reply_text('❌ Saved Tour document not found.',reply_markup=main_keyboard()); return
+        await _direct_saved_b2b_print(query.message,context,reference,record,query=query)
+        return
 
     if query.data.startswith('mod_mode:'):
         _,reference,mode=query.data.split(':',2)

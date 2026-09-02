@@ -175,7 +175,7 @@ def generate_pdf(data, output_path, logo_path=None, page_size="A4", text_scale_o
         <table class='schedule transit'><thead><tr>
         <th>DATE</th><th>SEGMENT &amp; MODE</th><th>ROUTE DETAILS</th><th>DEPARTURE</th><th>ARRIVAL</th>
         </tr></thead><tbody>{transit_rows}</tbody></table>
-        <div class='transit-ticket-note'><strong>Important:</strong> Please check the original ticket / e-ticket for the latest and exact departure/arrival timings, terminal information and any operational updates before travel.</div>"""
+        <div class='transit-ticket-note'><strong>NOTE -</strong> Please check the original ticket copies for reliable information</div>"""
     elif data.get("transit_done_by_self"):
         transit_section = """
         <div class='section'>TRANSIT &amp; CONNECTION SCHEDULE</div>
@@ -406,8 +406,12 @@ def generate_pdf(data, output_path, logo_path=None, page_size="A4", text_scale_o
         c['supplier_total']=supplier_total
         c['final_total']=final_total
         def _rate_cell(value, count):
-            if not value:
-                return '—'
+            raw=str(value or '').strip()
+            numeric=_num(value)
+            # Cost table keeps Adult/Child/CWB/CNB/EB fields visible, but missing
+            # or zero supplier/customer data must read as --, never as a real INR 0.
+            if not raw or numeric<=0:
+                return '--'
             if count > 0:
                 return f"{esc(value)} × {count}"
             return esc(value)
