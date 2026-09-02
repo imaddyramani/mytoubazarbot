@@ -647,7 +647,13 @@ def _airport_name_richness(value, city='', code=''):
 
 
 def _pdf_layout_lines(pdf_path):
-    """Extract selectable PDF text lines with source coordinates."""
+    """Extract selectable PDF text SPANS with source coordinates.
+
+    Important: use each span independently instead of joining an entire visual line.
+    Supplier PDFs often place Duration and Arrival text on the same y-coordinate.
+    Joining those spans can create false airport strings such as:
+      `2h m Raipur airport, raipur`
+    """
     lines=[]
     try:
         import fitz
@@ -659,17 +665,17 @@ def _pdf_layout_lines(pdf_path):
                     continue
                 for line in block.get('lines') or []:
                     spans=line.get('spans') or []
-                    text=''.join(str(s.get('text') or '') for s in spans)
-                    text=re.sub(r'\s+',' ',text).strip()
-                    if not text:
-                        continue
-                    bbox=line.get('bbox') or (0,0,0,0)
-                    lines.append({
-                        'page':page_no,
-                        'x0':float(bbox[0]),'y0':float(bbox[1]),
-                        'x1':float(bbox[2]),'y1':float(bbox[3]),
-                        'text':text,
-                    })
+                    for span in spans:
+                        text=re.sub(r'\s+',' ',str(span.get('text') or '')).strip()
+                        if not text:
+                            continue
+                        bbox=span.get('bbox') or line.get('bbox') or (0,0,0,0)
+                        lines.append({
+                            'page':page_no,
+                            'x0':float(bbox[0]),'y0':float(bbox[1]),
+                            'x1':float(bbox[2]),'y1':float(bbox[3]),
+                            'text':text,
+                        })
         doc.close()
     except Exception:
         return []
@@ -694,6 +700,21 @@ def _bad_airport_candidate_text(text):
         return True
     if re.fullmatch(r'(?i)(?:terminal\s*\w+|t\s*\d+\w?|[A-Z]{3}|[A-Z]{3}\s+terminal\s*\w+)',text):
         return True
+
+    # Reject flight-duration fragments anywhere in an airport candidate.
+    # Examples: 2h, 2h 10m, 45m, 2 h m, 1hr 30min.
+    if re.search(
+        r'(?i)(?:^|\s)\d{1,2}\s*(?:h|hr|hrs|hour|hours)\b'
+        r'(?:\s*\d{0,2}\s*(?:m|min|mins|minute|minutes)\b)?',
+        text,
+    ):
+        return True
+    if re.fullmatch(
+        r'(?i)\s*\d{1,3}\s*(?:m|min|mins|minute|minutes)\s*',
+        text,
+    ):
+        return True
+
     if re.search(
         r'(?i)\b(?:fare\s*type|family\s*fare|cabin|economy|business|duration|stops?|'
         r'baggage|passenger|pnr|booking|trip\s*id|status|meal|aircraft|flight\s*no)\b',
@@ -728,10 +749,11 @@ def _airport_candidate_score(text, city='', code=''):
 def _geometry_endpoint_candidate(lines, anchor_line, city='', code='', x_half_width=145.0):
     """Recover the printed airport-name line(s) from the SAME endpoint column."""
     ax,ay=_line_center(anchor_line)
+    strict_half=max(70.0,min(float(x_half_width),125.0))
     same=[
         ln for ln in lines
         if ln['page']==anchor_line['page']
-        and abs(_line_center(ln)[0]-ax) <= x_half_width
+        and abs(_line_center(ln)[0]-ax) <= strict_half
         and (ay-22.0) <= _line_center(ln)[1] <= (ay+115.0)
     ]
     same=sorted(same,key=lambda ln:(ln['y0'],ln['x0']))

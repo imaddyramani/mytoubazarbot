@@ -1097,17 +1097,30 @@ def _hotel_cost_confirmation(cost):
 def _parse_markup_input(value, supplier_total=0, pax_count=1):
     """Natural Air/Bus customer-fare parser.
 
-    Examples:
-      15000 / total 15000 / make total 15000 -> final customer total
-      403 per pax / 7814 pp / +800 per person / 300 each -> supplier + amount × eligible pax
-      +1200 / add 1200 / markup 1200 total -> supplier + total markup
-      -300 / reduce 300 -> supplier - markup
+    OWNER RULE FOR PER-PAX INPUT:
+      Supplier PP = supplier total / eligible pax
+
+      `7615 pp` / `7615 per pax` / `7615 per person` / `7615 each`
+          -> desired SELLING fare per pax when the amount is at/above supplier PP
+          -> final total = selling PP × eligible pax
+
+      `403 pp` with no prefix, when 403 is below supplier PP
+          -> smart interpretation = markup INR 403 per eligible pax
+
+      `+403 pp` / `markup 403 pp` / `add 403 per pax`
+          -> explicit markup per eligible pax
+
+      `-200 pp` / `reduce 200 per pax`
+          -> explicit reduction per eligible pax
+
+      `68535 total` / plain `68535`
+          -> final booking total
     """
     raw = str(value or "").strip().replace(",", "")
     low = raw.lower().replace("₹", " ")
     low = re.sub(r"(?i)\b(?:inr|rs\.?)\b", " ", low)
     if not low.strip():
-        raise ValueError("Write the final total or markup naturally.")
+        raise ValueError("Write the final total or per-pax selling fare naturally.")
 
     numbers = re.findall(r"(?<![A-Za-z])([0-9]+(?:\.[0-9]+)?)", low)
     if not numbers:
@@ -1118,33 +1131,56 @@ def _parse_markup_input(value, supplier_total=0, pax_count=1):
     per_person = bool(re.search(r"(?i)\b(?:per\s*(?:person|pax|passenger)|each|pp)\b", low))
     minus = bool(re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b", low))
     plus = bool(re.search(r"(?i)^\s*\+|\b(?:add|plus|increase|markup|mark\s*up)\b", low))
+    explicit_selling = bool(re.search(
+        r"(?i)\b(?:sell(?:ing)?|customer\s*(?:fare|rate|price)|"
+        r"final\s*(?:fare|rate|price)|make\s+(?:it\s+)?|set\s+(?:it\s+)?(?:to\s+)?)\b",
+        low,
+    ))
     final_hint = bool(re.search(
         r"(?i)\b(?:final\s*(?:fare|total|amount)|customer\s*(?:fare|total|amount)|"
         r"make\s+(?:it\s+)?total|set\s+(?:the\s+)?total|direct\s+total|total\s+amount|total\s+fare)\b",
         low,
     ))
 
-    # OWNER RULE:
-    # `403 per pax`, `800 per person`, `300 each`, `500 pp` are ALL markups
-    # on the supplier booking fare. No + / markup prefix is required.
-    # Infant/INF exclusion is handled by the caller's eligible pax count.
-    is_markup = plus or minus
+    base = float(supplier_total or 0)
+
     if per_person:
-        base = float(supplier_total or 0)
         if base <= 0:
             raise ValueError(
-                "Per-pax markup needs the original supplier fare. "
+                "Per-pax selling fare needs the original supplier fare. "
                 "If there is no supplier fare, enter the final booking total directly."
             )
-        delta = amount * pax_count
-        fare = base - delta if minus else base + delta
-    elif is_markup:
-        base = float(supplier_total or 0)
+
+        supplier_pp = base / pax_count
+
+        if plus or minus:
+            # Explicit markup/reduction always wins.
+            delta = amount * pax_count
+            fare = base - delta if minus else base + delta
+        elif explicit_selling:
+            # Explicitly requested customer/selling PP.
+            fare = amount * pax_count
+        elif amount >= supplier_pp:
+            # Plain 7615 pp when supplier PP is 7212:
+            # owner is giving the desired customer selling PP.
+            fare = amount * pax_count
+        else:
+            # Smart shorthand: a plain amount materially below supplier PP is
+            # treated as markup per pax. Example supplier PP 7212, reply `403 pp`.
+            fare = base + (amount * pax_count)
+
+    elif plus or minus:
         if base <= 0:
             raise ValueError("A markup needs an original supplier fare. Otherwise enter the final total directly.")
         fare = base - amount if minus else base + amount
-    elif final_hint or re.fullmatch(r"\s*(?:₹|inr|rs\.?)?\s*[0-9]+(?:\.[0-9]+)?\s*(?:total|final)?\s*", raw, re.I):
+
+    elif final_hint or re.fullmatch(
+        r"\s*(?:₹|inr|rs\.?)?\s*[0-9]+(?:\.[0-9]+)?\s*(?:total|final)?\s*",
+        raw,
+        re.I,
+    ):
         fare = amount
+
     else:
         # Plain amount without per-pax/markup wording = final booking total.
         fare = amount
@@ -1153,6 +1189,38 @@ def _parse_markup_input(value, supplier_total=0, pax_count=1):
         raise ValueError("Updated fare cannot be negative.")
     return float(fare)
 
+
+def _fare_pp_mode(value, supplier_total, pax_count):
+    """Describe how a per-pax reply is interpreted for confirmation text."""
+    raw=str(value or "").strip().replace(",","")
+    low=raw.lower().replace("₹"," ")
+    low=re.sub(r"(?i)\b(?:inr|rs\.?)\b"," ",low)
+    nums=re.findall(r"(?<![A-Za-z])([0-9]+(?:\.[0-9]+)?)",low)
+    amount=float(nums[0]) if nums else 0.0
+    pax_count=max(1,int(pax_count or 1))
+    supplier_total=float(supplier_total or 0)
+    supplier_pp=(supplier_total/pax_count) if supplier_total>0 else 0.0
+    minus=bool(re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b",low))
+    plus=bool(re.search(r"(?i)^\s*\+|\b(?:add|plus|increase|markup|mark\s*up)\b",low))
+    explicit_selling=bool(re.search(
+        r"(?i)\b(?:sell(?:ing)?|customer\s*(?:fare|rate|price)|"
+        r"final\s*(?:fare|rate|price)|make\s+(?:it\s+)?|set\s+(?:it\s+)?(?:to\s+)?)\b",
+        low,
+    ))
+    if minus:
+        return "reduce",amount,supplier_pp
+    if plus:
+        return "markup",amount,supplier_pp
+    if explicit_selling or amount >= supplier_pp:
+        return "selling_pp",amount,supplier_pp
+    return "smart_markup",amount,supplier_pp
+
+
+def _fare_num(value):
+    value=float(value or 0)
+    if abs(value-round(value)) < 0.005:
+        return f"{round(value):,.0f}"
+    return f"{value:,.2f}"
 
 def _is_infant_passenger(p):
     raw=" ".join(str((p or {}).get(k) or "") for k in ("type","title","name")).lower()
@@ -1185,28 +1253,55 @@ def _fare_include_infants(text):
 
 
 def _fare_cost_confirmation(value, supplier_total, final_fare, pax_count):
-    raw = str(value or "").strip()
-    low = raw.lower()
-    nums = re.findall(r"([0-9]+(?:\.[0-9]+)?)", raw.replace(",", ""))
-    amount = float(nums[0]) if nums else 0
-    per_person = bool(re.search(r"(?i)\b(?:per\s*(?:person|pax|passenger)|each|pp)\b", low))
-    markup = bool(re.search(r"(?i)^\s*[+-]|\b(?:add|plus|increase|markup|mark\s*up|reduce|less|minus|deduct|discount)\b", low))
-    sign = "−" if re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b", low) else "+"
+    raw=str(value or "").strip()
+    low=raw.lower()
+    nums=re.findall(r"([0-9]+(?:\.[0-9]+)?)",raw.replace(",",""))
+    amount=float(nums[0]) if nums else 0
+    pax_count=max(1,int(pax_count or 1))
+    supplier_total=float(supplier_total or 0)
+    per_person=bool(re.search(r"(?i)\b(?:per\s*(?:person|pax|passenger)|each|pp)\b",low))
+    markup=bool(re.search(r"(?i)^\s*[+-]|\b(?:add|plus|increase|markup|mark\s*up|reduce|less|minus|deduct|discount)\b",low))
+
     if per_person and supplier_total:
-        return (
-            f"✅ *Cost understood:*\n"
-            f"Supplier Fare: *INR {supplier_total:,.0f}*\n"
-            f"Per-pax Markup: {sign} INR {amount:,.0f} × {max(1,int(pax_count or 1))} eligible pax\n"
-            f"Infant: *Excluded by default*\n"
-            f"Final Customer Fare: *INR {final_fare:,.0f}*"
-        )
+        mode,entered,supplier_pp=_fare_pp_mode(raw,supplier_total,pax_count)
+
+        if mode in ("selling_pp","smart_markup","markup","reduce"):
+            if mode=="selling_pp":
+                selling_pp=entered
+                markup_pp=selling_pp-supplier_pp
+                interpretation="Selling fare per pax"
+            elif mode=="reduce":
+                markup_pp=-entered
+                selling_pp=supplier_pp-entered
+                interpretation="Per-pax reduction"
+            else:
+                markup_pp=entered
+                selling_pp=supplier_pp+entered
+                interpretation=(
+                    "Per-pax markup"
+                    if mode=="markup"
+                    else "Smart per-pax markup"
+                )
+
+            return (
+                f"✅ *Cost understood:*\n"
+                f"Supplier Total: *INR {_fare_num(supplier_total)}*\n"
+                f"Eligible Pax: *{pax_count}*\n"
+                f"Supplier Fare PP: *INR {_fare_num(supplier_pp)}*\n\n"
+                f"Interpretation: *{interpretation}*\n"
+                f"Your Selling Fare PP: *INR {_fare_num(selling_pp)}*\n"
+                f"Markup PP: *INR {_fare_num(markup_pp)}*\n\n"
+                f"Final Customer Total: *INR {_fare_num(final_fare)}*\n"
+                f"Infant: *Excluded by default*"
+            )
+
+    sign="−" if re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b",low) else "+"
     if markup and supplier_total:
         return (
-            f"✅ *Cost understood:* Supplier INR {supplier_total:,.0f} {sign} "
-            f"INR {amount:,.0f} → *Final INR {final_fare:,.0f}*"
+            f"✅ *Cost understood:* Supplier INR {_fare_num(supplier_total)} {sign} "
+            f"INR {_fare_num(amount)} → *Final INR {_fare_num(final_fare)}*"
         )
-    return f"✅ *Cost understood:* Final customer fare → *INR {final_fare:,.0f}*"
-
+    return f"✅ *Cost understood:* Final customer fare → *INR {_fare_num(final_fare)}*"
 
 def _is_payment_total_label(label):
     """True for summary rows that must not be counted again as charge components."""
@@ -1644,16 +1739,59 @@ async def reply_reference_edit(update: Update, context: ContextTypes.DEFAULT_TYP
         if instruction:
             supplier_total = float(context.user_data.get("pending_fare_supplier_total", 0) or 0)
             try:
-                fare = _parse_markup_input(instruction, supplier_total)
+                if pending_kind == "hotel":
+                    hdata = copy.deepcopy(context.user_data.get("pending_hotel_data") or {})
+                    hotel_cost = _parse_hotel_cost_input(instruction, supplier_total, hdata)
+                    hdata["customer_hotel_cost"] = hotel_cost
+                    context.user_data["pending_hotel_data"] = hdata
+                    fare = float(hotel_cost.get("total") or 0) or None
+                else:
+                    source_data = (
+                        context.user_data.get("pending_flight_data")
+                        if pending_kind == "flight"
+                        else context.user_data.get("pending_bus_data")
+                    )
+                    include_infants = _fare_include_infants(instruction)
+                    pax_count = _fare_pax_count(
+                        source_data or {},
+                        include_infants=include_infants,
+                    )
+                    fare = _parse_markup_input(
+                        instruction,
+                        supplier_total,
+                        pax_count,
+                    )
             except ValueError as exc:
                 await msg.reply_text(
-                    f"❌ {exc}\n\nUse `8500`, `+500`, or `-300` as applicable.",
+                    f"❌ {exc}\n\n"
+                    + (
+                        "Examples: `3500 per room per night`, `EB 1200 per night`, `total 25000`."
+                        if pending_kind == "hotel"
+                        else "Examples: `7615 pp` (selling PP), `+403 pp` (markup PP), `68535 total`."
+                    ),
                     parse_mode="Markdown",
                 )
                 return True
 
             context.user_data.pop("pending_fare_kind", None)
             context.user_data[f"pending_{pending_kind}_fare"] = fare
+
+            if pending_kind in ("flight", "bus"):
+                await msg.reply_text(
+                    _fare_cost_confirmation(
+                        instruction,
+                        supplier_total,
+                        fare,
+                        pax_count,
+                    ),
+                    parse_mode="Markdown",
+                )
+            elif pending_kind == "hotel":
+                await msg.reply_text(
+                    _hotel_cost_confirmation(hotel_cost),
+                    parse_mode="Markdown",
+                )
+
             try:
                 await ask_footer_choice(msg, context, pending_kind)
             except Exception as exc:
@@ -7347,9 +7485,9 @@ I will show the detailed Transit text I understood before regenerating the PDF."
                 prompt=("🏨 *Add Hotel Cost*\n\nEnter: `3500 per room per night`\n`room 4200 and EB 1200 per night`\n`total 25000`\n\nNo prefix is required. I will calculate rooms × nights and EB × nights automatically. A direct total is also accepted.")
         elif supplier_total > 0:
             prompt=(f"💰 *Supplier fare: INR {supplier_total:,.0f}.*\n\n"
-                    "Write the customer cost naturally — *no prefix is required*.\n`pp`, `per pax`, `per person` and `each` all mean per-passenger markup.\n\n"
+                    "Write the customer cost naturally — *no prefix is required*.\n`pp`, `per pax`, `per person` and `each` mean your selling fare per pax; use `+` or `markup` for an explicit markup.\n\n"
                     "Examples:\n"
-                    "`403 per pax` → supplier fare + (403 × Adult/Child pax)\n`7814 pp` → supplier fare + (7814 × Adult/Child pax)\n`+800 per person` → supplier fare + (800 × Adult/Child pax)\n`300 each` → supplier fare + (300 × Adult/Child pax)\n"
+                    "`7615 pp` → selling fare INR 7,615 × Adult/Child pax\n`403 pp` → smart markup when it is below supplier PP\n`+403 per person` → explicit markup INR 403 × Adult/Child pax\n`68535 total` → final booking total INR 68,535\n"
                     "`add markup 300 per pax`\n`403 per pax including infant` → include INF too\n"
                     "`markup 1200 total`\n"
                     "`15000 total`\n"
