@@ -1208,17 +1208,77 @@ def _fare_cost_confirmation(value, supplier_total, final_fare, pax_count):
     return f"✅ *Cost understood:* Final customer fare → *INR {final_fare:,.0f}*"
 
 
+def _is_payment_total_label(label):
+    """True for summary rows that must not be counted again as charge components."""
+    text=re.sub(r"\s+"," ",str(label or "")).strip().lower()
+    if not text:
+        return False
+    return bool(re.fullmatch(
+        r"(?:grand\s+total|gross\s+total|total\s+fare|total\s+amount|"
+        r"booking\s+total|net\s+(?:amount|payable)|amount\s+(?:paid|payable)|"
+        r"final\s+(?:fare|amount|total)|total\s+price|payable\s+amount)",
+        text,
+        re.I,
+    ))
+
+
+def _supplier_component_total(data):
+    """Sum distinct non-negative supplier charge rows, excluding summary totals."""
+    total=0.0
+    found=False
+    for item in ((data or {}).get("payment_items") or []):
+        if not isinstance(item,dict):
+            continue
+        label=str(item.get("label") or "").strip()
+        if not label or _is_payment_total_label(label):
+            continue
+        try:
+            amount=float(item.get("amount") or 0)
+        except Exception:
+            continue
+        if amount < 0:
+            continue
+        total += amount
+        found=True
+    return total if found else 0.0
+
+
 def _supplier_total(data):
-    """Return the supplier payable total without dropping surcharges/ancillaries."""
+    """Reconcile the supplier payable total before owner markup is applied.
+
+    Priority:
+    - A valid gross/payable total is used when it agrees with the charge rows.
+    - If charge rows are materially HIGHER than gross_total, gross_total is treated
+      as a bad extraction because genuine non-negative charge rows cannot add up to
+      more than the payable amount. The component sum wins.
+    - If gross_total is higher than the known component sum, gross_total can still
+      be valid because an omitted supplier charge may exist.
+    """
+    data=data or {}
     try:
-        gross=float((data or {}).get("gross_total",0) or 0)
-        if gross>0:
-            return gross
-        items=(data or {}).get("payment_items") or []
-        total=sum(float(x.get("amount") or 0) for x in items if isinstance(x,dict))
-        if total>0:
-            return total
-        return float((data or {}).get("base_fare",0) or 0)+float((data or {}).get("taxes",0) or 0)
+        gross=float(data.get("gross_total",0) or 0)
+    except Exception:
+        gross=0.0
+
+    components=_supplier_component_total(data)
+
+    # If line items exceed gross by more than a tiny extraction/rounding tolerance,
+    # the gross field is inconsistent. Use the complete charge-line sum.
+    if components > 0 and gross > 0:
+        tolerance=max(2.0, gross*0.01)
+        if components > gross + tolerance:
+            return components
+        return gross
+
+    if gross > 0:
+        return gross
+    if components > 0:
+        return components
+
+    try:
+        base=float(data.get("base_fare",0) or 0)
+        taxes=float(data.get("taxes",0) or 0)
+        return max(0.0,base+taxes)
     except Exception:
         return 0.0
 

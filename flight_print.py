@@ -271,57 +271,147 @@ def _baggage_html(value, pax_type=""):
     return ''.join(lines)
 
 
-def _payment_breakdown(data, updated_total):
-    """Return a professional line-by-line payment breakdown.
+def _is_payment_total_label(label):
+    text=re.sub(r'\s+',' ',_text(label)).strip().lower()
+    if not text:
+        return False
+    return bool(re.fullmatch(
+        r'(?:grand\s+total|gross\s+total|total\s+fare|total\s+amount|'
+        r'booking\s+total|net\s+(?:amount|payable)|amount\s+(?:paid|payable)|'
+        r'final\s+(?:fare|amount|total)|total\s+price|payable\s+amount)',
+        text,
+        re.I,
+    ))
 
-    Supplier labels/order are preserved. When the owner enters a new final selling
-    fare, the difference/markup is distributed proportionally across every charge
-    line so the displayed components add up exactly to the requested total.
-    """
+
+def _clean_payment_rows(data):
+    """Supplier charge rows only; summary total rows are deliberately excluded."""
     rows=[]
-    for item in (data.get("payment_items") or []):
+    for item in ((data or {}).get("payment_items") or []):
+        if not isinstance(item,dict):
+            continue
         label=_text(item.get("label"))
-        try: amount=float(item.get("amount") or 0)
-        except Exception: amount=0
-        if label and amount >= 0:
+        if not label or _is_payment_total_label(label):
+            continue
+        try:
+            amount=float(item.get("amount") or 0)
+        except Exception:
+            amount=0
+        if amount >= 0:
             rows.append({"label":label,"amount":amount})
+
     if not rows:
-        try: base=float(data.get("base_fare") or 0)
+        try: base=float((data or {}).get("base_fare") or 0)
         except Exception: base=0
-        try: tax=float(data.get("taxes") or 0)
+        try: tax=float((data or {}).get("taxes") or 0)
         except Exception: tax=0
-        if base > 0: rows.append({"label":"Base Fare","amount":base})
-        if tax > 0: rows.append({"label":"Taxes & Fees","amount":tax})
-    source_sum=sum(x["amount"] for x in rows)
-    try: supplier_total=float(data.get("gross_total") or 0)
-    except Exception: supplier_total=0
-    if supplier_total <= 0:
-        supplier_total=source_sum
-    # If the source grand total is higher than the extracted line sum, keep the
-    # document arithmetically honest instead of silently losing money. This is a
-    # fallback only; the extractor is instructed to recover every supplier line.
-    if supplier_total > 0 and supplier_total-source_sum > 0.5:
-        rows.append({"label":"Other Supplier Charges","amount":supplier_total-source_sum})
+        if base > 0:
+            rows.append({"label":"Base Fare","amount":base})
+        if tax > 0:
+            rows.append({"label":"Taxes & Fees","amount":tax})
+    return rows
+
+
+def _reconciled_supplier_total(data, rows=None):
+    """Return a payable total that is arithmetically consistent with source rows."""
+    rows=_clean_payment_rows(data) if rows is None else rows
+    component_sum=sum(max(0.0,float(x.get("amount") or 0)) for x in rows)
+
+    try:
+        gross=float((data or {}).get("gross_total") or 0)
+    except Exception:
+        gross=0
+
+    if component_sum > 0 and gross > 0:
+        tolerance=max(2.0,gross*0.01)
+        # Critical source-truth safeguard:
+        # if all genuine charge lines total MORE than gross_total, do not scale
+        # against that impossible smaller gross value.
+        if component_sum > gross + tolerance:
+            return component_sum
+        return gross
+
+    if gross > 0:
+        return gross
+    if component_sum > 0:
+        return component_sum
+
+    try:
+        return max(
+            0.0,
+            float((data or {}).get("base_fare") or 0)
+            + float((data or {}).get("taxes") or 0),
+        )
+    except Exception:
+        return 0.0
+
+
+def _payment_breakdown(data, updated_total):
+    """Return a non-negative line-by-line payment breakdown.
+
+    Supplier labels/order are preserved. A customer selling fare is distributed
+    proportionally across genuine positive charge rows. The reconciled supplier
+    total is used as the denominator so a bad extracted gross_total cannot create
+    a negative tax/fee row.
+    """
+    rows=_clean_payment_rows(data)
+    source_sum=sum(float(x["amount"]) for x in rows)
+    supplier_total=_reconciled_supplier_total(data,rows)
+
+    # gross_total can legitimately be higher than known rows if a supplier charge
+    # was omitted by extraction. Preserve the difference as an explicit positive row.
+    if supplier_total > source_sum + 0.5:
+        rows.append({
+            "label":"Other Supplier Charges",
+            "amount":supplier_total-source_sum,
+        })
         source_sum=supplier_total
+
     if updated_total is None:
         return rows, supplier_total
-    try: target=float(updated_total)
-    except Exception: target=supplier_total
-    if target < 0: target=0
+
+    try:
+        target=float(updated_total)
+    except Exception:
+        target=supplier_total
+    target=max(0.0,target)
+
     denominator=supplier_total if supplier_total > 0 else source_sum
     if rows and denominator > 0:
         factor=target/denominator
-        adjusted=[]
-        for row in rows:
-            adjusted.append({"label":row["label"],"amount":round(row["amount"]*factor)})
-        # absorb rounding in the final line so printed rows equal the exact requested total
-        if adjusted:
-            diff=round(target)-sum(x["amount"] for x in adjusted)
-            adjusted[-1]["amount"] += diff
-        return adjusted, target
+        adjusted=[
+            {"label":row["label"],"amount":max(0,round(float(row["amount"])*factor))}
+            for row in rows
+        ]
+
+        # Keep the printed sum exact, but NEVER make any row negative.
+        diff=round(target)-sum(x["amount"] for x in adjusted)
+        if adjusted and diff:
+            if diff > 0:
+                adjusted[-1]["amount"] += diff
+            else:
+                remaining=-diff
+                # Remove rounding excess from the largest rows first.
+                for idx in sorted(range(len(adjusted)),key=lambda i:adjusted[i]["amount"],reverse=True):
+                    reducible=min(remaining,adjusted[idx]["amount"])
+                    adjusted[idx]["amount"] -= reducible
+                    remaining -= reducible
+                    if remaining <= 0:
+                        break
+
+        # Final defensive guarantee: no negative monetary component can ever print.
+        for row in adjusted:
+            row["amount"]=max(0,row["amount"])
+
+        final_diff=round(target)-sum(x["amount"] for x in adjusted)
+        if adjusted and final_diff > 0:
+            adjusted[-1]["amount"] += final_diff
+
+        return adjusted,target
+
     if target > 0:
-        return [{"label":"Total Fare","amount":round(target)}], target
-    return [], target
+        return [{"label":"Total Fare","amount":round(target)}],target
+    return [],target
 
 def generate_flight_ticket(data, updated_total, output_path, logo_path=None, page_size="A4", text_scale_override=None, logo_scale_override=None):
     segs=data.get('segments') or []
@@ -331,10 +421,10 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     if updated_total is not None:
         try:
             source_base=float(data.get('base_fare',0) or 0); source_tax=float(data.get('taxes',0) or 0)
-            compatibility_total=float(data.get('gross_total') or 0) or (source_base+source_tax)
+            compatibility_total=_reconciled_supplier_total(data)
             if compatibility_total>0:
                 base=round(float(updated_total)*source_base/compatibility_total) if source_base>0 else 0
-                tax=round(float(updated_total)-base) if source_tax>0 else 0
+                tax=max(0,round(float(updated_total)-base)) if source_tax>0 else 0
         except Exception:
             pass
 
