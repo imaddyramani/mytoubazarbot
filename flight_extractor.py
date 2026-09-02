@@ -80,6 +80,9 @@ For EACH flight sector:
 
 dep_endpoint_text / arr_endpoint_text:
 - Copy the COMPLETE airport/location wording printed inside that endpoint's own cell.
+- AIRPORT NAME IS IMPORTANT: if a full airport name is visibly printed, you MUST copy it.
+  Never collapse `Delhi - Indira Gandhi International Airport Terminal 1` into only
+  `DEL Terminal 1`, `Delhi Terminal 1`, or another shortened form.
 - Include ALL airport-name continuation lines belonging to that same cell.
 - If the terminal is written inside the airport name, include it.
 - If the terminal is printed on the NEXT LINE but still inside the same Departure/Arrival
@@ -124,6 +127,12 @@ then arr_endpoint_text must become:
 and arr_terminal=`Terminal 2`.
 
 If layout is ambiguous, leave terminal blank rather than assigning it to the wrong endpoint.
+
+FINAL SELF-CHECK FOR EVERY ENDPOINT:
+- If the supplier visibly prints a proper airport name, endpoint_text must contain it.
+- A result containing only an IATA code + terminal is incomplete when the airport name
+  is visible in that same source cell.
+- Do not use world knowledge to fill an airport name that the supplier does not print.
 
 Return ONLY JSON matching the schema.
 """
@@ -583,6 +592,269 @@ def _norm_code_key(value):
     return re.sub(r'[^A-Z]', '', str(value or '').upper())[:3]
 
 
+
+def _endpoint_airport_core(value, city='', code=''):
+    """Remove endpoint city/code/terminal wrappers only for richness comparison."""
+    text=re.sub(r'\s+',' ',str(value or '')).strip()
+    if not text:
+        return ''
+    # Remove leading city and IATA wrappers, but never invent anything.
+    for prefix in (city, code):
+        prefix=re.sub(r'\s+',' ',str(prefix or '')).strip()
+        if prefix:
+            text=re.sub(r'(?i)^\s*'+re.escape(prefix)+r'\s*(?:\([A-Z]{3}\))?\s*[-,:|]*\s*','',text,count=1)
+    if code:
+        text=re.sub(r'(?i)^\s*\(?'+re.escape(str(code).strip())+r'\)?\s*[-,:|]*\s*','',text,count=1)
+    # Remove a terminal token for the purpose of deciding whether a real airport name remains.
+    text=re.sub(
+        r'(?i)\b(?:Terminal\s*(?:No\.?\s*)?[A-Za-z0-9-]+|'
+        r'T\s*[1-9]\d*[A-Za-z]?|[1-9][A-Za-z]?\s*Terminal|'
+        r'(?:Domestic|International)\s+Terminal)\b',
+        ' ',
+        text,
+    )
+    text=re.sub(r'\s+',' ',text).strip(' -,:|()')
+    return text
+
+
+def _endpoint_has_substantive_airport_name(value, city='', code=''):
+    core=_endpoint_airport_core(value,city,code)
+    if not core:
+        return False
+    if city and core.lower()==str(city).strip().lower():
+        return False
+    if code and core.upper()==str(code).strip().upper():
+        return False
+    words=re.findall(r"[A-Za-z][A-Za-z.'-]*",core)
+    # Airport/Aerodrome wording is strong evidence. For suppliers that omit the word
+    # "Airport", accept a proper multi-word printed name such as Lokpriya Gopinath Bordoloi.
+    if re.search(r'(?i)\b(?:airport|aerodrome|airfield)\b',core):
+        return True
+    return len(words) >= 3
+
+
+def _airport_name_richness(value, city='', code=''):
+    core=_endpoint_airport_core(value,city,code)
+    if not core:
+        return 0
+    words=re.findall(r"[A-Za-z][A-Za-z.'-]*",core)
+    score=len(words)
+    if re.search(r'(?i)\b(?:airport|aerodrome|airfield)\b',core):
+        score += 8
+    if re.search(r'(?i)\b(?:international|domestic)\b',core):
+        score += 3
+    return score
+
+
+def _pdf_layout_lines(pdf_path):
+    """Extract selectable PDF text lines with source coordinates."""
+    lines=[]
+    try:
+        import fitz
+        doc=fitz.open(str(pdf_path))
+        for page_no,page in enumerate(doc):
+            payload=page.get_text('dict') or {}
+            for block in payload.get('blocks') or []:
+                if block.get('type',0) != 0:
+                    continue
+                for line in block.get('lines') or []:
+                    spans=line.get('spans') or []
+                    text=''.join(str(s.get('text') or '') for s in spans)
+                    text=re.sub(r'\s+',' ',text).strip()
+                    if not text:
+                        continue
+                    bbox=line.get('bbox') or (0,0,0,0)
+                    lines.append({
+                        'page':page_no,
+                        'x0':float(bbox[0]),'y0':float(bbox[1]),
+                        'x1':float(bbox[2]),'y1':float(bbox[3]),
+                        'text':text,
+                    })
+        doc.close()
+    except Exception:
+        return []
+    return lines
+
+
+def _line_center(line):
+    return ((float(line['x0'])+float(line['x1']))/2.0,
+            (float(line['y0'])+float(line['y1']))/2.0)
+
+
+def _line_contains_iata(line, code):
+    code=re.sub(r'[^A-Z]','',str(code or '').upper())[:3]
+    if not code:
+        return False
+    return bool(re.search(r'(?<![A-Z])'+re.escape(code)+r'(?![A-Z])',line.get('text',''),re.I))
+
+
+def _bad_airport_candidate_text(text):
+    text=re.sub(r'\s+',' ',str(text or '')).strip()
+    if not text:
+        return True
+    if re.fullmatch(r'(?i)(?:terminal\s*\w+|t\s*\d+\w?|[A-Z]{3}|[A-Z]{3}\s+terminal\s*\w+)',text):
+        return True
+    if re.search(
+        r'(?i)\b(?:fare\s*type|family\s*fare|cabin|economy|business|duration|stops?|'
+        r'baggage|passenger|pnr|booking|trip\s*id|status|meal|aircraft|flight\s*no)\b',
+        text,
+    ):
+        return True
+    if re.search(r'\b\d{1,2}:\d{2}\b',text):
+        return True
+    # Date-like line.
+    if re.search(r'(?i)\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\b',text) and re.search(r'\b20\d{2}\b',text):
+        return True
+    return False
+
+
+def _airport_candidate_score(text, city='', code=''):
+    if _bad_airport_candidate_text(text):
+        return -999
+    core=_endpoint_airport_core(text,city,code)
+    if not core:
+        return -999
+    words=re.findall(r"[A-Za-z][A-Za-z.'-]*",core)
+    score=len(words)
+    if re.search(r'(?i)\b(?:airport|aerodrome|airfield)\b',core):
+        score += 14
+    if re.search(r'(?i)\b(?:international|domestic)\b',core):
+        score += 4
+    if len(words) < 2 and not re.search(r'(?i)\bairport\b',core):
+        score -= 6
+    return score
+
+
+def _geometry_endpoint_candidate(lines, anchor_line, city='', code='', x_half_width=145.0):
+    """Recover the printed airport-name line(s) from the SAME endpoint column."""
+    ax,ay=_line_center(anchor_line)
+    same=[
+        ln for ln in lines
+        if ln['page']==anchor_line['page']
+        and abs(_line_center(ln)[0]-ax) <= x_half_width
+        and (ay-22.0) <= _line_center(ln)[1] <= (ay+115.0)
+    ]
+    same=sorted(same,key=lambda ln:(ln['y0'],ln['x0']))
+    if not same:
+        return ''
+
+    scored=[]
+    for idx,ln in enumerate(same):
+        score=_airport_candidate_score(ln['text'],city,code)
+        if score > -999:
+            # Prefer source lines close to the endpoint city/code row.
+            distance=abs(_line_center(ln)[1]-ay)
+            score += max(0,6-int(distance/18))
+            scored.append((score,idx))
+    if not scored:
+        return ''
+
+    scored.sort(reverse=True)
+    best_score,best_idx=scored[0]
+    if best_score < 4:
+        return ''
+
+    # Combine wrapped continuation lines around the best airport line when they are
+    # vertically adjacent and belong to the same endpoint column.
+    chosen=[best_idx]
+    for step in (-1,1):
+        j=best_idx+step
+        if 0 <= j < len(same):
+            a=same[best_idx]
+            b=same[j]
+            gap=min(abs(b['y0']-a['y1']),abs(a['y0']-b['y1']))
+            if gap <= 10.0 and not _bad_airport_candidate_text(b['text']):
+                if _airport_candidate_score(b['text'],city,code) >= 2:
+                    chosen.append(j)
+
+    chosen=sorted(set(chosen))
+    candidate=' '.join(same[j]['text'] for j in chosen)
+    candidate=re.sub(r'\s+',' ',candidate).strip()
+
+    if not _endpoint_has_substantive_airport_name(candidate,city,code):
+        return ''
+    return candidate
+
+
+def _recover_airport_names_from_pdf_geometry(data, original_paths):
+    """Source-only fallback for selectable PDFs.
+
+    It never maps an IATA code to an airport from world knowledge. It only copies
+    richer airport wording that is physically printed near that endpoint's own code
+    in the supplier PDF.
+    """
+    data=data or {}
+    pdf_lines=[]
+    for path in original_paths or []:
+        try:
+            path=Path(path)
+            if path.suffix.lower()=='.pdf' and path.exists():
+                pdf_lines.extend(_pdf_layout_lines(path))
+        except Exception:
+            continue
+    if not pdf_lines:
+        return data
+
+    for seg in data.get('segments') or []:
+        dep_code=str(seg.get('dep_code') or '').strip().upper()
+        arr_code=str(seg.get('arr_code') or '').strip().upper()
+        dep_city=str(seg.get('dep_city') or '').strip()
+        arr_city=str(seg.get('arr_city') or '').strip()
+        if not dep_code or not arr_code:
+            continue
+
+        dep_anchors=[ln for ln in pdf_lines if _line_contains_iata(ln,dep_code)]
+        arr_anchors=[ln for ln in pdf_lines if _line_contains_iata(ln,arr_code)]
+        pairs=[]
+        for dl in dep_anchors:
+            dx,dy=_line_center(dl)
+            for al in arr_anchors:
+                if al['page'] != dl['page']:
+                    continue
+                ax,ay=_line_center(al)
+                if abs(dy-ay) > 65:
+                    continue
+                if dx >= ax:
+                    continue
+                # Prefer same visual row, then wider left-to-right separation.
+                score=100-abs(dy-ay)+min(40,(ax-dx)/12)
+                pairs.append((score,dl,al))
+        if not pairs:
+            continue
+        pairs.sort(key=lambda x:x[0],reverse=True)
+
+        # Try best pairs until one yields a source-backed airport name.
+        geo_dep=''; geo_arr=''
+        for _,dl,al in pairs[:6]:
+            separation=max(120.0,_line_center(al)[0]-_line_center(dl)[0])
+            half=max(90.0,min(180.0,separation*0.38))
+            if not geo_dep:
+                geo_dep=_geometry_endpoint_candidate(pdf_lines,dl,dep_city,dep_code,half)
+            if not geo_arr:
+                geo_arr=_geometry_endpoint_candidate(pdf_lines,al,arr_city,arr_code,half)
+            if geo_dep and geo_arr:
+                break
+
+        if geo_dep:
+            current=str(seg.get('dep_airport') or '').strip()
+            if (_airport_name_richness(geo_dep,dep_city,dep_code)
+                    > _airport_name_richness(current,dep_city,dep_code)):
+                seg['dep_airport']=geo_dep
+                embedded=_extract_terminal_from_endpoint_text(geo_dep)
+                if embedded:
+                    seg['dep_terminal']=embedded
+
+        if geo_arr:
+            current=str(seg.get('arr_airport') or '').strip()
+            if (_airport_name_richness(geo_arr,arr_city,arr_code)
+                    > _airport_name_richness(current,arr_city,arr_code)):
+                seg['arr_airport']=geo_arr
+                embedded=_extract_terminal_from_endpoint_text(geo_arr)
+                if embedded:
+                    seg['arr_terminal']=embedded
+
+    return data
+
 def _extract_terminal_from_endpoint_text(value):
     """Derive terminal only from this endpoint's own copied text."""
     text = re.sub(r'\s+', ' ', str(value or '')).strip()
@@ -1005,6 +1277,15 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         # independently verifies booking_date, customer mobile and terminal ownership.
         needs_detail_reread=(
             any(not str(seg.get(k) or '').strip() for seg in (data.get('segments') or []) for k in useful_fields)
+            or any(
+                not _endpoint_has_substantive_airport_name(
+                    seg.get('dep_airport'),seg.get('dep_city'),seg.get('dep_code')
+                )
+                or not _endpoint_has_substantive_airport_name(
+                    seg.get('arr_airport'),seg.get('arr_city'),seg.get('arr_code')
+                )
+                for seg in (data.get('segments') or [])
+            )
             or any(str(seg.get('dep_terminal') or '').strip() or str(seg.get('arr_terminal') or '').strip() for seg in (data.get('segments') or []))
             or bool(str(data.get('booking_date') or '').strip())
             or bool(str(data.get('mobile') or '').strip())
@@ -1077,6 +1358,15 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
             data = _apply_verified_endpoint_rows(data, verified_endpoints)
         except Exception:
             # Never block Air Print if a supplemental verification call fails.
+            pass
+
+        # V184 selectable-PDF geometry recovery:
+        # if the row verifier still returns a shortened endpoint such as
+        # `DEL Terminal 1`, recover the richer printed airport name from that exact
+        # departure/arrival column. This uses supplier PDF coordinates only.
+        try:
+            data = _recover_airport_names_from_pdf_geometry(data, original_paths)
+        except Exception:
             pass
 
         # Fare recovery: if the main extraction misses a clearly printed supplier

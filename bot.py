@@ -1099,7 +1099,7 @@ def _parse_markup_input(value, supplier_total=0, pax_count=1):
 
     Examples:
       15000 / total 15000 / make total 15000 -> final customer total
-      403 per pax / +800 per person / add markup 300 per pax -> supplier + amount × eligible pax
+      403 per pax / 7814 pp / +800 per person / 300 each -> supplier + amount × eligible pax
       +1200 / add 1200 / markup 1200 total -> supplier + total markup
       -300 / reduce 300 -> supplier - markup
     """
@@ -7347,9 +7347,9 @@ I will show the detailed Transit text I understood before regenerating the PDF."
                 prompt=("🏨 *Add Hotel Cost*\n\nEnter: `3500 per room per night`\n`room 4200 and EB 1200 per night`\n`total 25000`\n\nNo prefix is required. I will calculate rooms × nights and EB × nights automatically. A direct total is also accepted.")
         elif supplier_total > 0:
             prompt=(f"💰 *Supplier fare: INR {supplier_total:,.0f}.*\n\n"
-                    "Write the customer cost naturally — *no prefix is required*.\n\n"
+                    "Write the customer cost naturally — *no prefix is required*.\n`pp`, `per pax`, `per person` and `each` all mean per-passenger markup.\n\n"
                     "Examples:\n"
-                    "`403 per pax` → supplier fare + (403 × Adult/Child pax)\n`+800 per person` → markup × Adult/Child pax\n"
+                    "`403 per pax` → supplier fare + (403 × Adult/Child pax)\n`7814 pp` → supplier fare + (7814 × Adult/Child pax)\n`+800 per person` → supplier fare + (800 × Adult/Child pax)\n`300 each` → supplier fare + (300 × Adult/Child pax)\n"
                     "`add markup 300 per pax`\n`403 per pax including infant` → include INF too\n"
                     "`markup 1200 total`\n"
                     "`15000 total`\n"
