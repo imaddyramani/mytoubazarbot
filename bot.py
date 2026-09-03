@@ -3372,9 +3372,7 @@ async def process_hotel_voucher(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END if 'hotel' != 'tour' else None
     context.user_data['_source_processing'] = 'hotel'
     _cancel_source_auto_process(context)
-    if not AI_API_KEY:
-        await update.message.reply_text("❌ GROQ_API_KEY is not configured in Northflank.", reply_markup=main_keyboard())
-        return
+    # Hotel Print extraction is local and does not require GROQ_API_KEY.
     files=context.user_data.get("voucher_files", [])
     source_text=context.user_data.get("voucher_text", "")
     if not files and not source_text:
@@ -3402,7 +3400,7 @@ async def process_hotel_voucher(update: Update, context: ContextTypes.DEFAULT_TY
         for f in files:
             mime="application/pdf" if f.lower().endswith(".pdf") else "image/jpeg"
             parts.append({"path":f,"mime_type":mime})
-        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_hotel_voucher, parts, source_text, AI_API_KEY, AI_MODEL), ['🏨 Reading hotel confirmation pages...','🔍 Extracting guest, reservation, rooms and stay details...'], 25, 92)
+        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_hotel_voucher, parts, source_text, AI_API_KEY, AI_MODEL), ['🏨 Reading hotel confirmation locally...','🔍 Extracting guest, reservation, rooms and stay details locally...'], 25, 92)
         # The extraction is complete and structured data is now self-contained. Clear the
         # source list before fare/costing actions so a delayed callback can never try to
         # reopen a deleted incoming voucher file.
