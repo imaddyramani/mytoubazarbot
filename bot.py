@@ -16,7 +16,8 @@ from telegram import (
     Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
     InlineKeyboardButton, InlineKeyboardMarkup
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, ApplicationHandlerStop, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters
@@ -4578,9 +4579,16 @@ async def _run_with_progress(status, chat_message, work, labels, start_pct=30, e
 
     token = set_retry_notifier(_retry_notifier)
     task = asyncio.create_task(work())
+    started_at = time.monotonic()
+    max_seconds = max(60, int(os.getenv('EXTRACTION_TIMEOUT_SECONDS', '150')))
     tick = 0
     try:
         while not task.done():
+            if time.monotonic() - started_at >= max_seconds:
+                task.cancel()
+                raise RuntimeError(
+                    f"Extraction stopped after {max_seconds} seconds instead of waiting indefinitely. Please retry the supplier file."
+                )
             now = time.monotonic()
             retry_until = float(retry_state.get("until") or 0)
             if retry_until > now:
@@ -8161,6 +8169,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, NetworkError):
+        logger.warning("Temporary Telegram network interruption; polling will reconnect automatically: %s", context.error)
+        return
     logger.exception("Unhandled exception", exc_info=context.error)
 
 
@@ -8170,7 +8181,16 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing in .env")
 
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(False).build()
+    request = HTTPXRequest(connect_timeout=20, read_timeout=60, write_timeout=60, pool_timeout=20)
+    polling_request = HTTPXRequest(connect_timeout=20, read_timeout=45, write_timeout=30, pool_timeout=20)
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .get_updates_request(polling_request)
+        .concurrent_updates(False)
+        .build()
+    )
 
     voucher_conversation = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🏨 Hotel Print$"), hotel_voucher_start)],
