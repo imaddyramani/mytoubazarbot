@@ -49,6 +49,7 @@ def call_with_high_demand_retry(call: Callable[[], Any]) -> Any:
     is invoked from the worker thread with (attempt, delay_seconds, exception).
     """
     attempt = 0
+    max_retries = max(0, int(__import__('os').getenv('AI_HIGH_DEMAND_MAX_RETRIES', '2')))
     while True:
         try:
             return call()
@@ -56,6 +57,10 @@ def call_with_high_demand_retry(call: Callable[[], Any]) -> Any:
             if not is_high_demand_error(exc):
                 raise
             attempt += 1
+            if attempt > max_retries:
+                raise RuntimeError(
+                    "AI service remained busy after bounded retries. Please process the same supplier file again."
+                ) from exc
             delay = _delay_for_attempt(attempt)
             notifier = _retry_notifier.get()
             if notifier is not None:
