@@ -1,7 +1,15 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
+import gc
+import os
 import re
+
+# Keep native OCR/image libraries from starting many worker threads in small
+# hosting containers.  Multiple threads increase peak memory without helping
+# much for the small, bounded page set used here.
+os.environ.setdefault('OMP_THREAD_LIMIT','1')
+os.environ.setdefault('OMP_NUM_THREADS','1')
 
 
 def extract_image_text(path, max_chars=30000):
@@ -9,32 +17,42 @@ def extract_image_text(path, max_chars=30000):
     try:
         import pytesseract
         from PIL import Image, ImageOps
-        image=Image.open(path)
-        image=ImageOps.exif_transpose(image).convert('L')
-        if max(image.size)>2400:
-            image.thumbnail((2400,2400))
-        return (pytesseract.image_to_string(image,config='--psm 6') or '')[:max_chars]
+        with Image.open(path) as source:
+            image=ImageOps.exif_transpose(source).convert('L')
+            if max(image.size)>1800:
+                image.thumbnail((1800,1800))
+            try:
+                return (pytesseract.image_to_string(image,config='--psm 6',timeout=25) or '')[:max_chars]
+            finally:
+                image.close()
     except Exception:
         return ''
 
 
-def extract_pdf_text_with_local_ocr(path,max_chars=60000,max_ocr_pages=7):
+def extract_pdf_text_with_local_ocr(path,max_chars=60000,max_ocr_pages=4):
     """Use embedded text first; OCR a bounded first/last page set only if scanned."""
     text=extract_pdf_text(path,max_chars)
-    if len(re.sub(r'\s+',' ',text).strip())>=120:
+    if len(re.sub(r'\s+',' ',text).strip())>=50:
         return text[:max_chars]
     try:
         import fitz, pytesseract
         from PIL import Image
         doc=fitz.open(str(path)); n=len(doc)
-        indices=list(range(min(4,n)))
-        if n>4:
-            indices += list(range(max(4,n-3),n))
+        # Ticket facts are normally on the first pages, while fare/baggage
+        # conditions can be at the end. Never rasterise every page.
+        indices=list(range(min(2,n)))
+        if n>2:
+            indices += list(range(max(2,n-2),n))
         chunks=[]
         for i in list(dict.fromkeys(indices))[:max_ocr_pages]:
-            pix=doc[i].get_pixmap(matrix=fitz.Matrix(1.7,1.7),alpha=False)
-            image=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
-            chunks.append(pytesseract.image_to_string(image,config='--psm 6') or '')
+            pix=doc[i].get_pixmap(matrix=fitz.Matrix(1.2,1.2),colorspace=fitz.csGRAY,alpha=False)
+            image=Image.frombytes('L',(pix.width,pix.height),pix.samples)
+            try:
+                chunks.append(pytesseract.image_to_string(image,config='--psm 6',timeout=25) or '')
+            finally:
+                image.close()
+                del image, pix
+                gc.collect()
             if sum(len(x) for x in chunks)>=max_chars: break
         doc.close()
         return '\n'.join(chunks)[:max_chars]
