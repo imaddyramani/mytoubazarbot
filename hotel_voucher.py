@@ -9,7 +9,7 @@ from weasyprint import HTML
 
 from print_settings import apply_css_settings
 from ai_retry import call_with_high_demand_retry
-from performance_utils import extract_pdf_text
+from performance_utils import extract_pdf_text, collect_local_document_text
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 HOTEL_VOUCHER_SCHEMA = {
@@ -92,41 +92,49 @@ def _fast_hotel_pdf_text(path):
     except Exception:
         return extract_pdf_text(path,24000)
 
+def _hotel_local_value(text,labels,max_len=140):
+    label='|'.join(labels)
+    m=re.search(r'(?im)^\s*(?:'+label+r')\s*[:#\-]?\s*([^\r\n|]{1,'+str(max_len)+r'})',text)
+    return re.sub(r'\s+',' ',m.group(1)).strip(' :-|') if m else ''
+
+def _hotel_local_amount(text,labels):
+    value=_hotel_local_value(text,labels,80)
+    m=re.search(r'(?:INR|Rs\.?|₹)?\s*([0-9][0-9,]*(?:\.\d+)?)',value,re.I)
+    return float(m.group(1).replace(',','')) if m else 0.0
+
+def _extract_hotel_local(text):
+    raw=str(text or '')
+    rooms=_hotel_local_value(raw,[r'(?:No\.?\s*of\s*)?Rooms?',r'Room\s*Count'],20)
+    extra=_hotel_local_value(raw,[r'Extra\s*(?:Bed|Mattress)(?:\s*Count)?'],20)
+    try: room_count=int(re.search(r'\d+',rooms).group()) if re.search(r'\d+',rooms) else 0
+    except Exception: room_count=0
+    try: extra_count=int(re.search(r'\d+',extra).group()) if re.search(r'\d+',extra) else 0
+    except Exception: extra_count=0
+    base=_hotel_local_amount(raw,[r'Base\s*(?:Fare|Amount)',r'Room\s*(?:Fare|Charges?|Total)'])
+    taxes=_hotel_local_amount(raw,[r'Tax(?:es)?',r'GST'])
+    total=_hotel_local_amount(raw,[r'Grand\s*Total',r'Total\s*Amount',r'Amount\s*Payable'])
+    if not base and total: base=max(0,total-taxes)
+    return {
+        'reservation_id':_hotel_local_value(raw,[r'(?:Reservation|Confirmation|Booking)\s*(?:ID|Number|No\.?|Reference)']),
+        'guest_name':_hotel_local_value(raw,[r'(?:Lead\s*)?Guest\s*(?:Name)?',r'Booked\s*For']),
+        'mobile':_hotel_local_value(raw,[r'(?:Guest|Customer|Contact)\s*(?:Mobile|Phone)',r'Mobile\s*(?:No\.?|Number)?']),
+        'hotel_name':_hotel_local_value(raw,[r'Hotel\s*(?:Name)?',r'Property\s*(?:Name)?']),
+        'hotel_address':_hotel_local_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address']),
+        'hotel_city':_hotel_local_value(raw,[r'Hotel\s*City',r'City',r'Destination']),
+        'check_in':_hotel_local_value(raw,[r'Check[\s-]*in(?:\s*Date)?',r'Arrival\s*Date']),
+        'check_out':_hotel_local_value(raw,[r'Check[\s-]*out(?:\s*Date)?',r'Departure\s*Date']),
+        'nights':_hotel_local_value(raw,[r'(?:No\.?\s*of\s*)?Nights?'],20),
+        'room_type':_hotel_local_value(raw,[r'Room\s*(?:Type|Category)',r'Accommodation']),
+        'occupancy_summary':_hotel_local_value(raw,[r'Occupancy(?:\s*Summary)?',r'Pax',r'Guests?']),
+        'room_count':room_count,'extra_bed_count':extra_count,
+        'meal_plan':_hotel_local_value(raw,[r'Meal\s*Plan',r'Board\s*Basis',r'Meals?']),
+        'base_fare':base,'taxes':taxes,'terms':[],'cost_components':[],
+    }
+
 
 def extract_hotel_voucher(file_parts, source_text, api_key, model):
-    client = genai.Client(api_key=api_key)
-    contents = [HOTEL_VOUCHER_PROMPT]
-    if source_text:
-        contents.append("\nSOURCE TEXT:\n" + str(source_text)[:18000])
-    opened = []
-    try:
-        for item in file_parts:
-            path = Path(item["path"])
-            opened.append(path)
-            if path.suffix.lower()=='.pdf':
-                local=_fast_hotel_pdf_text(path)
-                if len(local.strip())>=350:
-                    contents.append("\nLOCAL SELECTABLE HOTEL PDF TEXT:\n"+local)
-                    continue
-            contents.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=item["mime_type"]))
-        response = call_with_high_demand_retry(lambda: client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=HOTEL_VOUCHER_SCHEMA,
-                temperature=0,
-                max_output_tokens=2800,
-            ),
-        ))
-        if not response.text:
-            raise RuntimeError("Gemini returned an empty hotel voucher response.")
-        return json.loads(response.text)
-    finally:
-        # Source lifecycle is owned by bot.process_hotel_voucher. Keeping the file
-        # alive until the structured result has been committed prevents delayed
-        # fare/cost callbacks from seeing a stale missing path.
-        pass
+    text=collect_local_document_text(file_parts,source_text,max_chars=45000)
+    return _extract_hotel_local(text)
 
 
 def _esc(v):
