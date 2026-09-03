@@ -22,20 +22,41 @@ SCHEMA={"type":"object","properties":{
 
 PROMPT='''You are MyTourBazar's bus booking itinerary extraction assistant. Read ALL supplied PDFs, screenshots and text. Extract the confirmed bus booking exactly. Preserve passenger names, passenger titles, booking ID, PNR, operator, bus number, bus type, dates, times, cities, boarding/drop points, duration and seat numbers. For each passenger preserve an explicit title such as Mr., Mrs., Ms., Master or Miss. Keep that title ONLY in the title field; the name field must not repeat it. Example: `Mr. Govind Sinha` -> title `Mr.` and name `Govind Sinha`. If no title is printed, use smart contextual inference only when supported by the source itself; never guess gender from a name alone. Otherwise use Mr./Ms. for an adult, Child for a child and Infant for an infant. Preserve DOB whenever printed; never invent it. For children and infants, return DOB whenever present. Do not invent missing facts. Extract original supplier fare base_fare and taxes as INR numbers; if unavailable use 0. Return only JSON matching the schema.'''
 
+def _fast_bus_pdf_text(path):
+    """Keep booking pages and discard long policy/marketing sections locally."""
+    try:
+        import fitz
+        doc=fitz.open(str(path)); pages=[]
+        for i,page in enumerate(doc):
+            text=page.get_text('text') or ''; low=text.lower(); score=0
+            score += 5 if re.search(r'\b(?:bus\s+pnr|booking\s+(?:id|reference)|ticket\s+(?:id|number))\b',low) else 0
+            score += 5 if re.search(r'\b(?:passenger|traveller)\s+(?:name|details)|\bseat\s+(?:no|number|details)\b',low) else 0
+            score += 4 if re.search(r'\b(?:boarding|dropping|drop\s+point|departure|arrival)\b',low) else 0
+            score += 3 if re.search(r'\b(?:fare|tax|total\s+amount|amount\s+paid)\b',low) else 0
+            if re.search(r'\b(?:terms\s*(?:&|and)\s*conditions|privacy\s+policy|cancellation\s+policy)\b',low) and score<5: score-=8
+            pages.append((score,i,text))
+        if len(pages)<=5: chosen=pages
+        else: chosen=[x for x in pages if x[0]>=3][:8]
+        if not chosen: chosen=pages[:3]+pages[-2:]
+        doc.close()
+        return '\n\n'.join(x[2] for x in chosen)[:22000]
+    except Exception:
+        return extract_pdf_text(path,22000)
+
 def extract_bus_ticket(file_parts, source_text, api_key, model):
     client=genai.Client(api_key=api_key); contents=[PROMPT]
-    if source_text: contents.append('\nSOURCE TEXT:\n'+source_text)
+    if source_text: contents.append('\nSOURCE TEXT:\n'+str(source_text)[:16000])
     paths=[]
     try:
         for item in file_parts:
             p=Path(item['path']); paths.append(p)
             if p.suffix.lower()=='.pdf':
-                local=extract_pdf_text(p,60000)
+                local=_fast_bus_pdf_text(p)
                 if len(local.strip())>=350:
                     contents.append('\nLOCAL SELECTABLE BUS PDF TEXT:\n'+local)
                     continue
             contents.append(types.Part.from_bytes(data=p.read_bytes(),mime_type=item['mime_type']))
-        r=call_with_high_demand_retry(lambda: client.models.generate_content(model=model,contents=contents,config=types.GenerateContentConfig(response_mime_type='application/json',response_schema=SCHEMA,temperature=0)))
+        r=call_with_high_demand_retry(lambda: client.models.generate_content(model=model,contents=contents,config=types.GenerateContentConfig(response_mime_type='application/json',response_schema=SCHEMA,temperature=0,max_output_tokens=2200)))
         if not r.text: raise RuntimeError('Gemini returned an empty bus ticket response.')
         return json.loads(r.text)
     finally:
