@@ -1,4 +1,4 @@
-import json, re
+import json, re, zlib
 from pathlib import Path
 from google import genai
 from google.genai import types
@@ -682,6 +682,52 @@ def _sanitize_passenger_names(data):
             continue
         seen.add(key); row['name']=name; clean.append(row)
     data['passengers']=clean
+    return data
+
+
+def _local_source_passenger_counts(raw_text, passengers=None):
+    """Recover total/chargeable passenger counts independently of name parsing."""
+    raw=str(raw_text or '')
+    total=0; infants=0
+    m=re.search(r'(?i)\b(?:number\s+of\s+|no\.?\s+of\s+)?(?:passengers?|travell?ers?|pax)\s*[:#\-]?\s*(\d{1,2})\b',raw)
+    if m: total=int(m.group(1))
+    typed={}
+    for label,key in ((r'adults?|adt','adult'),(r'children|child|chd','child'),(r'infants?|inf','infant')):
+        hits=[]
+        for pat in (rf'(?i)\b(\d{{1,2}})\s*(?:{label})\b',rf'(?i)\b(?:{label})\s*[:#\-]?\s*(\d{{1,2}})\b'):
+            hits.extend(int(x) for x in re.findall(pat,raw))
+        if hits: typed[key]=max(hits)
+    if typed:
+        typed_total=sum(typed.values()); total=max(total,typed_total); infants=typed.get('infant',0)
+    row_numbers=[]
+    for line in raw.splitlines():
+        if re.search(r'(?i)\b(?:adult|child|infant|adt|chd|inf|mr\.?|mrs\.?|ms\.?|miss|master)\b',line):
+            m=re.match(r'^\s*(\d{1,2})[.)]?\s+',line)
+            if m: row_numbers.append(int(m.group(1)))
+    if row_numbers: total=max(total,max(row_numbers))
+    pax=list(passengers or [])
+    total=max(total,len(pax))
+    if not infants:
+        infants=sum(1 for p in pax if re.search(r'(?i)\b(?:infant|inf|baby)\b',' '.join(str(p.get(k) or '') for k in ('type','title','name'))))
+    return total,max(0,total-infants)
+
+
+def _apply_air_output_defaults(data,raw_source_text=''):
+    """Apply MyTourBazar print defaults after source-truth extraction."""
+    data=data or _local_blank_air_data()
+    source_total,source_chargeable=_local_source_passenger_counts(raw_source_text,data.get('passengers'))
+    data['_source_passenger_count']=source_total
+    data['_source_chargeable_passenger_count']=source_chargeable
+    if not str(data.get('gds_pnr') or '').strip() and str(data.get('airline_pnr') or '').strip():
+        data['gds_pnr']=data['airline_pnr']
+    if not str(data.get('booking_id') or '').strip():
+        first_seg=(data.get('segments') or [{}])[0]
+        first_pax=(data.get('passengers') or [{}])[0]
+        seed='|'.join([
+            str(data.get('airline_pnr') or ''),str(first_seg.get('flight_number') or ''),
+            str(first_seg.get('dep_date') or ''),str(first_pax.get('name') or ''),
+        ])
+        data['booking_id']=str(10000+(zlib.crc32(seed.encode('utf-8'))%90000))
     return data
 
 
@@ -2154,6 +2200,8 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     except Exception:
         pass
     data=_final_endpoint_safety_gate(data)
+
+    data=_apply_air_output_defaults(data,raw_source_text)
 
     clean=[]
     for row in (data.get('payment_items') or []):

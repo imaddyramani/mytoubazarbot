@@ -425,9 +425,10 @@ def _baggage_html(value, person=None):
     entries=_normalized_baggage_entries(value,person)
     lines=[]
     for kind,pax_type,allowance in entries:
+        label="Cabin" if kind=="cabin" else "Check-in"
         lines.append(
             f'<span class="bag-line">{_baggage_icon(kind)}'
-            f'<span>{_esc(allowance)}</span></span>'
+            f'<span><b class="bag-label">{label}:</b> {_esc(allowance)}</span></span>'
         )
     return ''.join(lines)
 

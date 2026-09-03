@@ -1238,13 +1238,16 @@ def _fare_pax_count(data, include_infants=False):
     By default Infant/INF passengers are excluded. They are included only when
     the owner's cost reply explicitly asks to include infants.
     """
-    passengers=(data or {}).get("passengers") or []
+    data=data or {}
+    passengers=data.get("passengers") or []
+    source_total=int(data.get('_source_passenger_count') or 0)
+    source_chargeable=int(data.get('_source_chargeable_passenger_count') or 0)
     if not passengers:
-        return 1
+        return max(1,source_total if include_infants else source_chargeable)
     if include_infants:
-        return max(1, len(passengers))
+        return max(1,len(passengers),source_total)
     eligible=[p for p in passengers if not _is_infant_passenger(p)]
-    return max(1, len(eligible))
+    return max(1,len(eligible),source_chargeable)
 
 
 def _fare_include_infants(text):
