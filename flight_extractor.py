@@ -2031,15 +2031,44 @@ def _local_segments_from_text(raw):
 
 
 def _local_baggage_summary(raw):
-    lines=[re.sub(r'\s+',' ',x).strip() for x in str(raw or '').splitlines()]
-    hits=[]
+    lines=[re.sub(r'\s+',' ',x).strip() for x in str(raw or '').splitlines() if str(x).strip()]
+    label=r'(?:baggage|check[- ]?in|checked(?:\s+bag(?:gage)?)?|cabin(?:\s+bag(?:gage)?)?|hand(?:\s+bag(?:gage)?)?|carry[- ]?on)'
+    value=r'(\d+(?:\.\d+)?\s*(?:kg|kgs|piece|pieces|pc|pcs))'
+    checkin=''; cabin=''
+
+    # Search a short multiline window because supplier PDFs often put the
+    # heading, baggage type and allowance in separate table cells/lines.
     for i,line in enumerate(lines):
-        if re.search(r'(?i)\b(?:baggage|check[- ]?in|checked\s+bag|cabin\s+bag|hand\s+bag|carry[- ]?on)\b',line) and re.search(r'(?i)\b\d+(?:\.\d+)?\s*(?:kg|kgs|piece|pieces|pc|pcs)\b',line):
-            hits.append(line)
-            if i+1<len(lines) and re.search(r'(?i)\b(?:cabin|hand|carry[- ]?on)\b',lines[i+1]) and re.search(r'\d',lines[i+1]):
-                hits.append(lines[i+1])
-            break
-    return ' '.join(dict.fromkeys(x for x in hits if x))
+        if not re.search(rf'(?i)\b{label}\b',line):
+            continue
+        window=' '.join(lines[max(0,i-1):min(len(lines),i+5)])
+        cm=re.search(rf'(?i)\b(?:check[- ]?in|checked(?:\s+bag(?:gage)?)?)\b[^\d]{{0,80}}{value}',window)
+        hm=re.search(rf'(?i)\b(?:cabin(?:\s+bag(?:gage)?)?|hand(?:\s+bag(?:gage)?)?|carry[- ]?on)\b[^\d]{{0,80}}{value}',window)
+        if cm and not checkin: checkin=cm.group(1)
+        if hm and not cabin: cabin=hm.group(1)
+
+        # Common table layout: "Check-in  Cabin" then "15 KG  7 KG".
+        if (not (checkin and cabin) or re.sub(r'\s+','',checkin).lower()==re.sub(r'\s+','',cabin).lower()) and re.search(r'(?i)check[- ]?in',window) and re.search(r'(?i)(?:cabin|hand|carry[- ]?on)',window):
+            values=re.findall(rf'(?i)\b{value}\b',window)
+            values=[x[0] if isinstance(x,tuple) else x for x in values]
+            if values:
+                checkin=checkin or values[0]
+                if len(values)>1 and (not cabin or re.sub(r'\s+','',checkin).lower()==re.sub(r'\s+','',cabin).lower()):
+                    cabin=values[1]
+        if checkin and cabin: break
+
+    parts=[]
+    if checkin: parts.append('Check-in: '+re.sub(r'\s+','',checkin).lower())
+    if cabin: parts.append('Cabin: '+re.sub(r'\s+','',cabin).lower())
+    if parts: return ' | '.join(parts)
+
+    # Preserve an unusual supplier wording when it still has a baggage label
+    # and a measurable allowance.
+    for i,line in enumerate(lines):
+        if re.search(rf'(?i)\b{label}\b',line):
+            window=' '.join(lines[i:min(len(lines),i+4)])
+            if re.search(rf'(?i)\b{value}\b',window): return window
+    return ''
 
 
 def _local_passengers_from_text(raw,baggage_summary=''):
