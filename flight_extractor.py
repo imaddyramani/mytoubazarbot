@@ -1916,27 +1916,72 @@ def _local_air_core_complete(data):
     return all(all(str(seg.get(k) or '').strip() for k in ('flight_number','dep_code','arr_code','dep_time','arr_time')) for seg in segs)
 
 
+def _local_air_needs_ai(data):
+    """Return True unless the local result is genuinely print-ready.
+
+    The old local-first gate considered five sector fields plus any passenger row a
+    complete ticket.  That suppressed AI even when passenger names were truncated or
+    when dates, PNR, airport names, terminals, baggage and fare details were missing.
+    """
+    if not _local_air_core_complete(data):
+        return True
+    passengers=(data or {}).get('passengers') or []
+    segments=(data or {}).get('segments') or []
+    for pax in passengers:
+        name=re.sub(r'\s+',' ',str(pax.get('name') or '')).strip(' ,-/')
+        if len(name)<3 or not re.search(r'[A-Za-z]{2}',name):
+            return True
+        if re.search(r'(?i)\b(?:adult|child|infant|ticket|pnr|baggage|flight|booking)\b',name):
+            return True
+    for seg in segments:
+        # Dates are essential for an itinerary and airport wording is frequently
+        # present in supplier PDFs but lost by deterministic text geometry.
+        if not str(seg.get('dep_date') or '').strip():
+            return True
+        if not str(seg.get('arr_date') or seg.get('dep_date') or '').strip():
+            return True
+        if not str(seg.get('dep_airport') or '').strip() or not str(seg.get('arr_airport') or '').strip():
+            return True
+    # A source may legitimately omit PNR/fare/baggage, so do not require each one;
+    # require at least one booking-level fact before trusting local-only extraction.
+    if not any(str((data or {}).get(k) or '').strip() for k in ('airline_pnr','gds_pnr','booking_id','baggage_summary')):
+        return True
+    return False
+
+
 def _merge_ai_into_local(local,ai):
     local=local or _local_blank_air_data(); ai=ai or {}
     for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary','special_ancillary_summary'):
         if not str(local.get(key) or '').strip() and str(ai.get(key) or '').strip():
             local[key]=ai.get(key)
-    if not local.get('passengers') and ai.get('passengers'):
-        local['passengers']=ai.get('passengers') or []
-    elif local.get('passengers') and ai.get('passengers'):
-        for i,p in enumerate(local['passengers']):
-            if i<len(ai['passengers']):
-                for k in ('title','ticket_number','type','dob','baggage','special_ancillary'):
-                    if not str(p.get(k) or '').strip() and str(ai['passengers'][i].get(k) or '').strip():
-                        p[k]=ai['passengers'][i].get(k)
-    if not local.get('segments') and ai.get('segments'):
-        local['segments']=ai.get('segments') or []
-    elif local.get('segments') and ai.get('segments'):
-        for i,seg in enumerate(local['segments']):
-            if i<len(ai['segments']):
-                for k in ('flight','flight_number','aircraft','cabin','fare_type','dep_time','dep_city','dep_code','dep_date','dep_airport','dep_terminal','arr_time','arr_city','arr_code','arr_date','arr_airport','arr_terminal','duration','stops','layover'):
-                    if not str(seg.get(k) or '').strip() and str(ai['segments'][i].get(k) or '').strip():
-                        seg[k]=ai['segments'][i].get(k)
+    # AI is the verification pass for semantic rows.  Start from its complete rows
+    # and only backfill values it left blank from the deterministic result.  This is
+    # crucial for correcting (not merely filling) malformed local passenger names.
+    if ai.get('passengers'):
+        verified=[]
+        for i,ap in enumerate(ai.get('passengers') or []):
+            row=dict(ap or {})
+            lp=(local.get('passengers') or [])[i] if i<len(local.get('passengers') or []) else {}
+            for k in ('name','title','ticket_number','type','dob','baggage','special_ancillary'):
+                if not str(row.get(k) or '').strip() and str(lp.get(k) or '').strip():
+                    row[k]=lp.get(k)
+            verified.append(row)
+        local['passengers']=verified
+    if ai.get('segments'):
+        verified=[]
+        local_segments=local.get('segments') or []
+        for i,aseg in enumerate(ai.get('segments') or []):
+            row=dict(aseg or {})
+            # Prefer identity matching over array position for connections/returns.
+            lp=next((x for x in local_segments if str(x.get('flight_number') or '').replace(' ','').upper()==str(row.get('flight_number') or '').replace(' ','').upper()),None)
+            if lp is None and i<len(local_segments):
+                lp=local_segments[i]
+            lp=lp or {}
+            for k in ('flight','flight_number','aircraft','cabin','fare_type','dep_time','dep_city','dep_code','dep_date','dep_airport','dep_terminal','arr_time','arr_city','arr_code','arr_date','arr_airport','arr_terminal','duration','stops','layover'):
+                if not str(row.get(k) or '').strip() and str(lp.get(k) or '').strip():
+                    row[k]=lp.get(k)
+            verified.append(row)
+        local['segments']=verified
     if not local.get('payment_items') and ai.get('payment_items'):
         local['payment_items']=ai.get('payment_items') or []
     for k in ('base_fare','taxes','gross_total'):
@@ -1958,15 +2003,17 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     data=_local_first_air_extract(raw_source_text,original_paths)
     used_ai=False
 
-    if not _local_air_core_complete(data):
+    if _local_air_needs_ai(data):
         client=genai.Client(api_key=api_key)
         contents=[AIR_LIGHT_PROMPT]
         compact=re.sub(r'\n{3,}','\n\n',str(raw_source_text or '')).strip()
         if compact:
-            contents.append('\nSUPPLIER TEXT:\n'+compact[:6500])
+            contents.append('\nSUPPLIER TEXT:\n'+compact[:30000])
         # Only scanned/image sources need a visual attachment. Selectable PDFs stay text-only.
-        if len(compact)<500:
-            for item in (file_parts or [])[:1]:
+        # Always include the original first source for verification.  Selectable
+        # text can collapse columns and is not sufficient for passenger/sector rows.
+        if file_parts:
+            for item in (file_parts or [])[:3]:
                 try:
                     p=Path(item.get('path') or '')
                     if p.exists():
@@ -1978,7 +2025,7 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
                 model=model,contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type='application/json',response_schema=SCHEMA,
-                    temperature=0,max_output_tokens=2200,
+                    temperature=0,max_output_tokens=5000,
                 )
             ))
             if r.text:

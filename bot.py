@@ -5629,9 +5629,11 @@ async def process_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flight_files = context.user_data.get("flight_files", [])
         flight_text = context.user_data.get("flight_text", "")
 
-        # PERFORMANCE MODE: selectable PDFs are converted to local text and are not sent
-        # as multimodal files. Only scanned/visual sources are uploaded to AI.
-        parts, text, perf_stats = prepare_supplier_for_ai(files, text, max_chars=120000)
+        # Keep local text for speed/searchability, but also preserve the original Tour
+        # PDF so table layout (hotels, dates, costs, day rows) remains visible to AI.
+        parts, text, perf_stats = prepare_supplier_for_ai(
+            files, text, max_chars=120000, preserve_pdf_layout=True
+        )
 
         # Flight screenshots still need visual interpretation.
         for f in flight_files:

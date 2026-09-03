@@ -33,8 +33,14 @@ def pdf_is_text_rich(path, threshold=450):
     return len(re.sub(r"\s+", " ", extract_pdf_text(path, 5000)).strip()) >= threshold
 
 
-def prepare_supplier_for_ai(file_paths, source_text="", max_chars=120000):
-    """Use local selectable text for text PDFs; only send scanned/visual PDFs to AI."""
+def prepare_supplier_for_ai(file_paths, source_text="", max_chars=120000, preserve_pdf_layout=True):
+    """Prepare supplier sources without throwing away PDF layout.
+
+    Selectable text is still extracted locally because it is fast and searchable, but
+    Tour quotations frequently encode hotels, dates, costs and day plans in tables.
+    Plain text alone loses the cell/row relationships.  Keep the original PDF attached
+    by default so the extraction model can verify the locally prepared text visually.
+    """
     text=str(source_text or "")
     parts=[]
     local_pdf_count=0
@@ -46,6 +52,8 @@ def prepare_supplier_for_ai(file_paths, source_text="", max_chars=120000):
             if len(re.sub(r"\s+"," ",t).strip()) >= 450:
                 local_pdf_count += 1
                 text += f"\n\nLOCAL SELECTABLE PDF TEXT ({p.name}):\n{t}"
+                if preserve_pdf_layout:
+                    parts.append({"path":str(p),"mime_type":"application/pdf"})
             else:
                 visual_count += 1
                 parts.append({"path":str(p),"mime_type":"application/pdf"})
