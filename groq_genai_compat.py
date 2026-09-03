@@ -31,7 +31,8 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_MODEL = "qwen/qwen3.6-27b"
 DEFAULT_AUDIO_MODEL = "whisper-large-v3-turbo"
 MAX_IMAGES = 2
-MAX_TEXT_CHARS = 14000
+MAX_TEXT_CHARS = 7500
+FREE_TPM_TARGET = 7000
 
 
 @dataclass
@@ -363,12 +364,17 @@ def _generate_content(api_key: str, model: str, contents: Any, config: GenerateC
         messages.append({"role": "system", "content": str(system_instruction)})
     messages.append({"role": "user", "content": content})
 
+    # Budget every request for Groq free/on-demand TPM limits.
+    approx_input_tokens=max(1, len(text)//4) + (1200 * len(image_urls))
+    requested_output=int(config.max_output_tokens or (2400 if config.response_mime_type == "application/json" else 3000))
+    safe_output=max(500, min(requested_output, FREE_TPM_TARGET - approx_input_tokens))
+
     payload: dict[str, Any] = {
         "model": requested_model,
         "messages": messages,
         "temperature": 0 if config.temperature is None else config.temperature,
         "stream": False,
-        "max_completion_tokens": int(config.max_output_tokens or 12000),
+        "max_completion_tokens": int(safe_output),
     }
 
     # Qwen 3.6 officially supports JSON Object Mode with image inputs.
@@ -411,6 +417,13 @@ def _generate_content(api_key: str, model: str, contents: Any, config: GenerateC
                 time.sleep(min(max(delay, 1), 65))
                 continue
 
+            if r.status_code == 413 and "tokens per minute" in r.text.lower():
+                current=int(payload.get("max_completion_tokens") or 1200)
+                if current > 600:
+                    payload["max_completion_tokens"]=max(500, min(1200, current//2))
+                    last_error=RuntimeError(f"Groq API 413 TPM limit: {r.text[:700]}")
+                    time.sleep(1.0)
+                    continue
             if r.status_code >= 400:
                 raise RuntimeError(f"Groq API {r.status_code}: {r.text[:1400]}")
 

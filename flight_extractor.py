@@ -1563,7 +1563,7 @@ def _recover_source_only_fields(data, raw_text):
                 continue
             if re.search(r'(?i)\b(?:gross\s+total|grand\s+total|total\s+amount|amount\s+payable|net\s+payable|total\s+fare|amount\s+in\s+rs)\b',label):
                 gross=max(gross,amount); continue
-            if re.search(r'(?i)\b(?:fare|tax|fee|charge|surcharge|yq|yr|gst|k3|seat|meal|baggage|ancillary|insurance|convenience|service)\b',label):
+            if re.search(r'(?i)\b(?:fare|tax(?:es)?|fee|charge|surcharge|yq|yr|gst|k3|seat|meal|baggage|ancillary|insurance|convenience|service)\b',label):
                 rows.append({'label':label,'amount':amount})
         if rows:
             data['payment_items']=rows
@@ -1598,247 +1598,427 @@ def _normalize_flight_segments(data):
     return data
 
 
-def extract_flight_ticket(file_parts, source_text, api_key, model):
-    # Keep a literal selectable-text copy for deterministic source-only recovery after AI extraction.
-    raw_source_text=_plain_source_text(file_parts, source_text)
-    # Reduce supplier noise before Gemini sees the material. This is the main speed optimisation.
-    client=genai.Client(api_key=api_key)
-    contents=[PROMPT]
-    if source_text:
-        # Keep pasted supplier text useful but cap very long legal/marketing dumps.
-        txt=str(source_text)
-        contents.append('\nSOURCE TEXT (booking-relevant text only; ignore terms/offers/policies):\n'+txt[:18000])
-    paths=[]; optimized=[]; original_paths=[]
-    work_dir=Path(__file__).resolve().parent/'data'/'tmp_flight_extract'
+# ===========================================================================
+# V194 LOCAL-FIRST AIR ENGINE
+# ===========================================================================
+_LOCAL_IATA_EXCLUDE={
+    'PNR','GDS','DOB','GST','INR','TAX','FARE','AIR','ADT','CHD','INF','SSR','PDF',
+    'THE','AND','FOR','FROM','TO','NON','STOP','CAB','BAG','KGS','KG'
+}
+
+
+def _local_blank_air_data():
+    return {
+        'booking_id':'','booking_date':'','airline_pnr':'','gds_pnr':'','status':'','mobile':'',
+        'baggage_summary':'','special_ancillary_summary':'','segments':[],'passengers':[],
+        'base_fare':0.0,'taxes':0.0,'gross_total':0.0,'payment_items':[],
+    }
+
+
+def _local_label_value(raw, labels, max_len=70):
+    if not raw:
+        return ''
+    label_pat='|'.join(labels)
+    pat=re.compile(r'(?im)^\s*(?:'+label_pat+r')\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9./_\- ]{1,'+str(max_len)+r'})\s*$')
+    m=pat.search(raw)
+    if not m:
+        pat=re.compile(r'(?i)\b(?:'+label_pat+r')\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9./_\-]{1,30})')
+        m=pat.search(raw)
+    return re.sub(r'\s+',' ',m.group(1)).strip(' :-|') if m else ''
+
+
+def _local_iata_from_text(text):
+    for m in re.finditer(r'(?<![A-Z])([A-Z]{3})(?![A-Z])',str(text or '').upper()):
+        code=m.group(1)
+        if code not in _LOCAL_IATA_EXCLUDE:
+            return code
+    return ''
+
+
+def _local_flight_from_text(text):
+    raw=str(text or '').upper()
+    # Flight numbers are normally 2-character IATA carrier codes + 1-4 digits.
+    # Restrict the local detector deliberately; unusual formats can use the one AI
+    # fallback rather than turning Booking IDs, `Check-in 15KG`, or `Oct 2026` into flights.
+    reject={'IN','ON','ID','NO','KG','RS','MR','MS','DR','AM','PM','JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'}
+    known3={k for k in _FLIGHT_AIRLINE_BY_CODE if len(k)==3}
+    for m in re.finditer(r'(?<![A-Z0-9])([A-Z0-9]{2,3})\s*[- ]?\s*(\d{1,4})(?!\d)',raw):
+        code,num=m.group(1),m.group(2)
+        if code in reject:
+            continue
+        if len(code)==3 and code not in known3:
+            continue
+        if re.search(r'(?i)\b(?:booking|trip|invoice|amount|total|baggage|check[- ]?in|date)\b',raw):
+            # Still allow an explicitly-labelled Flight line.
+            if not re.search(r'(?i)\bflight\b',raw):
+                continue
+        return f'{code} {num}'
+    return ''
+
+
+def _local_time_from_zone(spans,page,x0,x1,y0,y1,anchor_y):
+    candidates=[]
+    for sp in spans:
+        if sp['page']!=page:
+            continue
+        cx,cy=_line_center(sp)
+        if not (x0<=cx<=x1 and y0<=cy<=y1):
+            continue
+        m=re.search(r'(?i)\b([01]?\d|2[0-3]):[0-5]\d\s*(?:AM|PM)?\b',str(sp.get('text') or ''))
+        if m:
+            candidates.append((abs(cy-anchor_y),re.sub(r'\s+',' ',m.group(0)).strip()))
+    candidates.sort(key=lambda x:x[0])
+    return candidates[0][1] if candidates else ''
+
+
+def _local_date_from_zone(spans,page,x0,x1,y0,y1,anchor_y):
+    candidates=[]
+    pats=(
+        r'(?i)\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2}\b',
+        r'(?i)\b\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2}\b',
+        r'\b\d{1,2}[/-]\d{1,2}[/-]20\d{2}\b',
+    )
+    for sp in spans:
+        if sp['page']!=page:
+            continue
+        cx,cy=_line_center(sp)
+        if not (x0<=cx<=x1 and y0<=cy<=y1):
+            continue
+        for pat in pats:
+            m=re.search(pat,str(sp.get('text') or ''))
+            if m:
+                candidates.append((abs(cy-anchor_y),re.sub(r'\s+',' ',m.group(0)).strip()))
+                break
+    candidates.sort(key=lambda x:x[0])
+    return candidates[0][1] if candidates else ''
+
+
+def _local_city_from_anchor(text,code):
+    value=re.sub(r'(?i)(?<![A-Z])'+re.escape(code)+r'(?![A-Z])',' ',str(text or ''))
+    value=re.sub(r'[()\[\],|:;]+',' ',value)
+    value=re.sub(r'\b\d{1,2}:\d{2}\b',' ',value)
+    value=re.sub(r'\s+',' ',value).strip(' -')
+    if value and len(value)<=45 and re.search(r'[A-Za-z]',value) and not re.search(r'(?i)\b(?:airport|international|terminal|aerodrome|airfield)\b',value):
+        return value
+    return ''
+
+
+def _local_segments_from_pdf_geometry(original_paths):
+    spans=[]
+    for path in original_paths or []:
+        try:
+            p=Path(path)
+            if p.exists() and p.suffix.lower()=='.pdf':
+                spans.extend(_pdf_layout_lines(p))
+        except Exception:
+            pass
+    if not spans:
+        return []
+
+    iatas=[]; flights=[]
+    for sp in spans:
+        code=_local_iata_from_text(sp.get('text'))
+        if code:
+            cp=dict(sp); cp['iata']=code; iatas.append(cp)
+        fn=_local_flight_from_text(sp.get('text'))
+        if fn:
+            cp=dict(sp); cp['flight_number']=fn; flights.append(cp)
+
+    segments=[]; used=set()
+    for fl in flights:
+        fx,fy=_line_center(fl); candidates=[]
+        same=[x for x in iatas if x['page']==fl['page']]
+        for dep in same:
+            dx,dy=_line_center(dep)
+            if dx<fx-35 or abs(dy-fy)>145:
+                continue
+            for arr in same:
+                if arr is dep or arr['iata']==dep['iata']:
+                    continue
+                ax,ay=_line_center(arr)
+                if ax<=dx or abs(ay-dy)>75:
+                    continue
+                sep=ax-dx
+                if sep<105:
+                    continue
+                dep_time=_local_time_from_zone(spans,dep['page'],dx-sep*.32,dx+sep*.40,dy-30,dy+105,dy)
+                arr_time=_local_time_from_zone(spans,arr['page'],ax-sep*.40,ax+sep*.32,ay-30,ay+105,ay)
+                score=100-abs(ay-dy)-min(35,abs(((dy+ay)/2)-fy)/4)+(22 if fx<dx else 0)+(12 if dep_time else 0)+(12 if arr_time else 0)
+                candidates.append((score,dep,arr,dep_time,arr_time))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda x:x[0],reverse=True)
+        _,dep,arr,dep_time,arr_time=candidates[0]
+        key=(fl['page'],fl['flight_number'],round(_line_center(dep)[1],0),dep['iata'],arr['iata'])
+        if key in used:
+            continue
+        used.add(key)
+
+        dx,dy=_line_center(dep); ax,ay=_line_center(arr); sep=max(105.0,ax-dx)
+        page_width=max(float(dep.get('page_width') or 0),float(arr.get('page_width') or 0),ax+sep*.35)
+        top=min(dy,ay)-12; bottom=max(dy,ay)+125
+        dep_left=dx-sep*.30; dep_right=dx+sep*.38
+        arr_left=ax-sep*.38; arr_right=min(page_width,ax+sep*.34)
+        dep_city=_local_city_from_anchor(dep.get('text'),dep['iata'])
+        arr_city=_local_city_from_anchor(arr.get('text'),arr['iata'])
+        dep_airport=_airport_block_from_zone(spans,dep['page'],dep_left,dep_right,top,bottom,dep_city,dep['iata'],dy)
+        arr_airport=_airport_block_from_zone(spans,arr['page'],arr_left,arr_right,top,bottom,arr_city,arr['iata'],ay)
+        dep_terminal=_extract_terminal_from_endpoint_text(dep_airport)
+        arr_terminal=_extract_terminal_from_endpoint_text(arr_airport)
+        dep_date=_local_date_from_zone(spans,dep['page'],dep_left,dep_right,top,bottom,dy)
+        arr_date=_local_date_from_zone(spans,arr['page'],arr_left,arr_right,top,bottom,ay)
+        center_lines=_group_spans_in_zone(spans,dep['page'],dep_right,arr_left,top,bottom)
+        center_text=' '.join(x.get('text','') for x in center_lines)
+        dm=re.search(r'(?i)\b(\d{1,2}\s*(?:h|hr|hrs|hour|hours)\s*(?:\d{1,2}\s*(?:m|min|mins|minutes))?)\b',center_text)
+        sm=re.search(r'(?i)\b(?:non\s*[- ]?stop|direct|[1-9]\s+stops?)\b',center_text)
+        fn=fl['flight_number']; carrier=fn.split()[0]
+        seg={
+            'flight':_FLIGHT_AIRLINE_BY_CODE.get(carrier,carrier),'flight_number':fn,
+            'aircraft':'','cabin':'','fare_type':'','dep_time':dep_time,'dep_city':dep_city,
+            'dep_code':dep['iata'],'dep_date':dep_date,
+            'dep_airport':_separate_endpoint_code_prefix(dep_airport,dep['iata']),'dep_terminal':dep_terminal,
+            'arr_time':arr_time,'arr_city':arr_city,'arr_code':arr['iata'],'arr_date':arr_date,
+            'arr_airport':_separate_endpoint_code_prefix(arr_airport,arr['iata']),'arr_terminal':arr_terminal,
+            'duration':re.sub(r'\s+',' ',dm.group(1)).strip() if dm else '',
+            'stops':re.sub(r'\s+',' ',sm.group(0)).strip() if sm else '','layover':''
+        }
+        if seg['dep_airport']:
+            seg['dep_airport_source_exact']=seg['dep_airport']
+        if seg['arr_airport']:
+            seg['arr_airport_source_exact']=seg['arr_airport']
+        segments.append(seg)
+
+    clean=[]; seen=set()
+    for seg in segments:
+        k=(seg.get('flight_number'),seg.get('dep_code'),seg.get('arr_code'),seg.get('dep_time'),seg.get('arr_time'))
+        if k not in seen:
+            seen.add(k); clean.append(seg)
+    return clean
+
+
+def _local_segments_from_text(raw):
+    out=[]; seen=set(); raw=str(raw or '')
+    reject={'IN','ON','ID','NO','KG','RS','MR','MS','DR','AM','PM','JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'}
+    known3={k for k in _FLIGHT_AIRLINE_BY_CODE if len(k)==3}
+    for fm in re.finditer(r'(?<![A-Z0-9])([A-Z0-9]{2,3})\s*[- ]?\s*(\d{1,4})(?!\d)',raw.upper()):
+        if fm.group(1) in reject or (len(fm.group(1))==3 and fm.group(1) not in known3):
+            continue
+        fn=f'{fm.group(1)} {fm.group(2)}'
+        window=raw[max(0,fm.start()-150):min(len(raw),fm.end()+1200)]
+        codes=[]
+        for cm in re.finditer(r'(?<![A-Z])([A-Z]{3})(?![A-Z])',window.upper()):
+            c=cm.group(1)
+            if c not in _LOCAL_IATA_EXCLUDE and c not in codes:
+                codes.append(c)
+        if len(codes)<2:
+            continue
+        times=[re.sub(r'\s+',' ',x).strip() for x in re.findall(r'(?i)\b(?:[01]?\d|2[0-3]):[0-5]\d\s*(?:AM|PM)?\b',window)]
+        k=(fn,codes[0],codes[1],times[0] if times else '')
+        if k in seen:
+            continue
+        seen.add(k); carrier=fm.group(1)
+        out.append({
+            'flight':_FLIGHT_AIRLINE_BY_CODE.get(carrier,carrier),'flight_number':fn,
+            'aircraft':'','cabin':'','fare_type':'','dep_time':times[0] if times else '',
+            'dep_city':'','dep_code':codes[0],'dep_date':'','dep_airport':'','dep_terminal':'',
+            'arr_time':times[1] if len(times)>1 else '','arr_city':'','arr_code':codes[1],
+            'arr_date':'','arr_airport':'','arr_terminal':'','duration':'','stops':'','layover':''
+        })
+    return out
+
+
+def _local_baggage_summary(raw):
+    lines=[re.sub(r'\s+',' ',x).strip() for x in str(raw or '').splitlines()]
+    hits=[]
+    for i,line in enumerate(lines):
+        if re.search(r'(?i)\b(?:baggage|check[- ]?in|checked\s+bag|cabin\s+bag|hand\s+bag|carry[- ]?on)\b',line) and re.search(r'(?i)\b\d+(?:\.\d+)?\s*(?:kg|kgs|piece|pieces|pc|pcs)\b',line):
+            hits.append(line)
+            if i+1<len(lines) and re.search(r'(?i)\b(?:cabin|hand|carry[- ]?on)\b',lines[i+1]) and re.search(r'\d',lines[i+1]):
+                hits.append(lines[i+1])
+            break
+    return ' '.join(dict.fromkeys(x for x in hits if x))
+
+
+def _local_passengers_from_text(raw,baggage_summary=''):
+    lines=[re.sub(r'\s+',' ',x).strip() for x in str(raw or '').splitlines() if str(x).strip()]
+    passengers=[]; seen=set()
+    title_pat=re.compile(r"(?i)\b(Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof)\.?\s+([A-Za-z][A-Za-z .'/-]{2,70})")
+    row_pat=re.compile(r"(?i)^\s*\d{1,2}[.)]?\s+([A-Za-z][A-Za-z .'/-]{2,60}?)\s+(Adult|Child|Infant|ADT|CHD|INF)\b")
+    for line in lines:
+        title=''; name=''; ptype=''
+        m=title_pat.search(line)
+        if m:
+            title=m.group(1)+('.' if not m.group(1).endswith('.') else '')
+            name=m.group(2)
+            name=re.split(r'(?i)\s+(?:Adult|Child|Infant|ADT|CHD|INF|DOB|Ticket|PNR|Baggage|\d{10,})\b',name)[0].strip(' ,-')
+        else:
+            m=row_pat.search(line)
+            if m:
+                name=m.group(1).strip(' ,-'); ptype=m.group(2)
+        if not name or len(name)<3 or re.search(r'(?i)\b(?:flight|airport|booking|customer|support|fare|payment)\b',name):
+            continue
+        low=(ptype+' '+title+' '+line).lower()
+        if re.search(r'\b(?:infant|inf)\b',low):
+            canon='Infant'
+        elif re.search(r'\b(?:child|chd)\b',low) or title.lower().startswith(('master','mstr')):
+            canon='Child'
+        else:
+            canon='Adult'
+        key=re.sub(r'\W+','',name).lower()
+        if key in seen:
+            continue
+        seen.add(key); dob=''; ticket=''
+        dm=re.search(r'(?i)\b(?:DOB\s*[:\-]?\s*)?([0-3]?\d[/-](?:0?\d|[A-Za-z]{3})[/-]\d{2,4})\b',line)
+        if dm and ('dob' in line.lower() or canon in ('Child','Infant')):
+            dob=dm.group(1)
+        tm=re.search(r'(?i)\b(?:ticket(?:\s*(?:no|number))?|e-ticket)\s*[:#\-]?\s*([0-9][0-9\-]{8,18})\b',line)
+        if tm:
+            ticket=tm.group(1)
+        bag=line if re.search(r'(?i)\b(?:kg|kgs|cabin|check[- ]?in|baggage)\b',line) else baggage_summary
+        passengers.append({'name':name,'title':title,'ticket_number':ticket,'type':canon,'dob':dob,'baggage':bag,'special_ancillary':''})
+    return passengers
+
+
+def _local_first_air_extract(raw_text,original_paths):
+    data=_local_blank_air_data(); raw=str(raw_text or '')
+    data['booking_date']=_explicit_booking_date_from_text(raw)
+    data['mobile']=_explicit_customer_mobile_from_text(raw)
+    data['gds_pnr']=_local_label_value(raw,[r'GDS\s*PNR'])
+    data['airline_pnr']=_local_label_value(raw,[r'Airline\s*PNR',r'Carrier\s*PNR'])
+    if not data['airline_pnr']:
+        for m in re.finditer(r'(?i)\bPNR\s*[:#\-]?\s*([A-Z0-9]{5,9})\b',raw):
+            if 'gds' not in raw[max(0,m.start()-12):m.start()].lower():
+                data['airline_pnr']=m.group(1); break
+    data['booking_id']=_local_label_value(raw,[r'Booking\s*(?:ID|Id|Reference|Ref)',r'Trip\s*ID',r'Reservation\s*(?:ID|Ref)'])
+    data['status']=_local_label_value(raw,[r'Status'],24)
+    data['baggage_summary']=_local_baggage_summary(raw)
+    data['passengers']=_local_passengers_from_text(raw,data['baggage_summary'])
+    data['segments']=_local_segments_from_pdf_geometry(original_paths) or _local_segments_from_text(raw)
+    data=_recover_source_only_fields(data,raw)
+    data=_normalize_flight_segments(data)
+    data=_sanitize_ticket_numbers(data)
+    data=_sanitize_inferred_stops(data)
+    data=_apply_baggage_summary(data)
+    data=_normalize_passenger_types(data)
+    data=_apply_special_ancillary_summary(data)
     try:
-        for item in file_parts:
-            original_paths.append(Path(item['path']))
-            prepared, temp_path=_prepare_flight_source(item,work_dir)
-            if temp_path: optimized.append(Path(temp_path))
-            p=Path(prepared['path'])
-            contents.append(types.Part.from_bytes(data=p.read_bytes(),mime_type=prepared['mime_type']))
-            paths.append(p)
+        data=_recover_airport_names_from_pdf_geometry(data,original_paths)
+    except Exception:
+        pass
+    return _final_endpoint_safety_gate(data)
 
-        # A short multimodal request: Gemini is explicitly told not to spend tokens on irrelevant pages.
-        r=call_with_high_demand_retry(lambda: client.models.generate_content(
-            model=model, contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type='application/json', response_schema=SCHEMA, temperature=0,
-            )
-        ))
-        if not r.text: raise RuntimeError('Gemini returned an empty flight ticket response.')
-        data=_normalize_flight_segments(json.loads(r.text))
 
-        # V174 independent source-truth pass: supplier source only, no earlier extraction.
-        try:
-            truth_contents=[SOURCE_TRUTH_PROMPT]
-            if source_text:
-                truth_contents.append('\nSOURCE TEXT:\n'+str(source_text)[:18000])
-            for p in paths:
-                if p.exists():
-                    mime='application/pdf' if p.suffix.lower()=='.pdf' else 'image/jpeg'
-                    truth_contents.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
-            tr=call_with_high_demand_retry(lambda: client.models.generate_content(
-                model=model,
-                contents=truth_contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type='application/json',
-                    response_schema=SCHEMA,
-                    temperature=0,
-                )
-            ))
-            if tr.text:
-                data=_normalize_flight_segments(json.loads(tr.text))
-        except Exception:
-            pass
+def _local_air_core_complete(data):
+    segs=(data or {}).get('segments') or []
+    pax=(data or {}).get('passengers') or []
+    if not segs or not pax:
+        return False
+    return all(all(str(seg.get(k) or '').strip() for k in ('flight_number','dep_code','arr_code','dep_time','arr_time')) for seg in segs)
 
-        # Source-only second reading: if useful airport/terminal/duration fields are blank,
-        # re-read the ORIGINAL source once. This never blocks printing and never invents data.
-        useful_fields=('dep_airport','arr_airport','dep_terminal','arr_terminal','duration','dep_code','arr_code')
-        # Re-read not only when segment fields are missing, but also whenever a
-        # sensitive top-level field or terminal was extracted. The second pass
-        # independently verifies booking_date, customer mobile and terminal ownership.
-        needs_detail_reread=(
-            any(not str(seg.get(k) or '').strip() for seg in (data.get('segments') or []) for k in useful_fields)
-            or any(
-                not _endpoint_has_substantive_airport_name(
-                    seg.get('dep_airport'),seg.get('dep_city'),seg.get('dep_code')
-                )
-                or not _endpoint_has_substantive_airport_name(
-                    seg.get('arr_airport'),seg.get('arr_city'),seg.get('arr_code')
-                )
-                for seg in (data.get('segments') or [])
-            )
-            or any(str(seg.get('dep_terminal') or '').strip() or str(seg.get('arr_terminal') or '').strip() for seg in (data.get('segments') or []))
-            or bool(str(data.get('booking_date') or '').strip())
-            or bool(str(data.get('mobile') or '').strip())
-        )
-        if needs_detail_reread:
-            try:
-                repair_contents=[REPAIR_PROMPT, '\nCURRENT EXTRACTION (UNTRUSTED CANDIDATE — verify every value against source):\n'+json.dumps(data, ensure_ascii=False)]
-                if source_text:
-                    repair_contents.append('\nSOURCE TEXT:\n'+str(source_text)[:18000])
-                for p in paths:
-                    if p.exists():
-                        mime='application/pdf' if p.suffix.lower()=='.pdf' else 'image/jpeg'
-                        repair_contents.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
-                rr=call_with_high_demand_retry(lambda: client.models.generate_content(
-                    model=model, contents=repair_contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type='application/json', response_schema=SCHEMA, temperature=0,
-                    )
-                ))
-                if rr.text:
-                    repaired=_normalize_flight_segments(json.loads(rr.text))
-                    # Preserve first-pass values when the repair pass returns blanks.
-                    old_segments=data.get('segments') or []
-                    new_segments=repaired.get('segments') or []
-                    for i, nseg in enumerate(new_segments):
-                        if i < len(old_segments):
-                            oseg=old_segments[i]
-                            for key, value in oseg.items():
-                                # Terminal blanks from the validation pass are deliberate:
-                                # never restore an old terminal that the source re-read cleared.
-                                if key in ('dep_terminal','arr_terminal'):
-                                    continue
-                                if not str(nseg.get(key) or '').strip() and str(value or '').strip():
-                                    nseg[key]=value
-                    for key, value in data.items():
-                        if key == 'segments':
-                            continue
-                        # A blank booking_date/mobile from the validation pass is
-                        # deliberate. Never restore the first-pass hallucination.
-                        if key in ('booking_date', 'mobile'):
-                            continue
-                        if not repaired.get(key) and value:
-                            repaired[key]=value
-                    data=repaired
-            except Exception:
-                # The second reading is best-effort only; source gaps never block printing.
-                pass
 
-        # Deterministic source-only recovery: selectable supplier text wins over AI omissions.
-        # This is especially useful for Terminal / Aircraft / Cabin / Stops labels in agency PDFs.
-        data=_recover_source_only_fields(data, raw_source_text)
-        data=_sanitize_ticket_numbers(data)
-        data=_sanitize_inferred_stops(data)
-        data=_apply_baggage_summary(data)
-        data=_normalize_passenger_types(data)
-        data=_apply_special_ancillary_summary(data)
+def _merge_ai_into_local(local,ai):
+    local=local or _local_blank_air_data(); ai=ai or {}
+    for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary','special_ancillary_summary'):
+        if not str(local.get(key) or '').strip() and str(ai.get(key) or '').strip():
+            local[key]=ai.get(key)
+    if not local.get('passengers') and ai.get('passengers'):
+        local['passengers']=ai.get('passengers') or []
+    elif local.get('passengers') and ai.get('passengers'):
+        for i,p in enumerate(local['passengers']):
+            if i<len(ai['passengers']):
+                for k in ('title','ticket_number','type','dob','baggage','special_ancillary'):
+                    if not str(p.get(k) or '').strip() and str(ai['passengers'][i].get(k) or '').strip():
+                        p[k]=ai['passengers'][i].get(k)
+    if not local.get('segments') and ai.get('segments'):
+        local['segments']=ai.get('segments') or []
+    elif local.get('segments') and ai.get('segments'):
+        for i,seg in enumerate(local['segments']):
+            if i<len(ai['segments']):
+                for k in ('flight','flight_number','aircraft','cabin','fare_type','dep_time','dep_city','dep_code','dep_date','dep_airport','dep_terminal','arr_time','arr_city','arr_code','arr_date','arr_airport','arr_terminal','duration','stops','layover'):
+                    if not str(seg.get(k) or '').strip() and str(ai['segments'][i].get(k) or '').strip():
+                        seg[k]=ai['segments'][i].get(k)
+    if not local.get('payment_items') and ai.get('payment_items'):
+        local['payment_items']=ai.get('payment_items') or []
+    for k in ('base_fare','taxes','gross_total'):
+        try: lv=float(local.get(k) or 0)
+        except Exception: lv=0
+        try: av=float(ai.get(k) or 0)
+        except Exception: av=0
+        if lv<=0 and av>0:
+            local[k]=av
+    return local
 
-        # First generic endpoint safety gate.
-        data=_enforce_terminal_endpoint_truth(data)
 
-        # V175 FINAL ROW-BY-ROW ENDPOINT VERIFICATION.
-        # Read every Departure and Arrival cell independently from the ORIGINAL
-        # supplier source. This is the final authority for airport text + terminal.
-        try:
-            verified_endpoints = _verify_endpoint_rows(
-                client,
-                model,
-                original_paths,
-                source_text=source_text,
-            )
-            data = _apply_verified_endpoint_rows(data, verified_endpoints)
-        except Exception:
-            # Never block Air Print if a supplemental verification call fails.
-            pass
+AIR_LIGHT_PROMPT="Extract only booking facts needed for an airline itinerary. SOURCE PRESENT = COPY, SOURCE ABSENT = BLANK. Do not infer airports, terminals, dates, baggage or fares. Return every flight sector separately; never merge connections. Preserve passenger names/types, PNR/ticket numbers, baggage, flight number, departure/arrival date/time/IATA/airport/terminal, duration/stops only when printed, and supplier payment rows/total. Ignore terms/marketing. Return JSON only."
 
-        # V184 selectable-PDF geometry recovery:
-        # if the row verifier still returns a shortened endpoint such as
-        # `DEL Terminal 1`, recover the richer printed airport name from that exact
-        # departure/arrival column. This uses supplier PDF coordinates only.
-        try:
-            data = _recover_airport_names_from_pdf_geometry(data, original_paths)
-        except Exception:
-            pass
+def extract_flight_ticket(file_parts, source_text, api_key, model):
+    """V194 local-first extraction: zero AI for readable tickets, max one fallback."""
+    raw_source_text=_plain_source_text(file_parts,source_text)
+    original_paths=[Path(item.get('path') or '') for item in (file_parts or []) if item.get('path')]
+    data=_local_first_air_extract(raw_source_text,original_paths)
+    used_ai=False
 
-        # V190 FOCUSED PER-SECTOR VISUAL FALLBACK:
-        # Only unresolved/suspicious endpoints are reread, one flight sector at a time.
-        # This is especially important for scanned/image tickets where PDF text geometry
-        # is unavailable. Deterministic selectable-PDF locks always win.
-        for seg in data.get('segments') or []:
-            if _endpoint_needs_focused_verify(seg,'dep') or _endpoint_needs_focused_verify(seg,'arr'):
+    if not _local_air_core_complete(data):
+        client=genai.Client(api_key=api_key)
+        contents=[AIR_LIGHT_PROMPT]
+        compact=re.sub(r'\n{3,}','\n\n',str(raw_source_text or '')).strip()
+        if compact:
+            contents.append('\nSUPPLIER TEXT:\n'+compact[:6500])
+        # Only scanned/image sources need a visual attachment. Selectable PDFs stay text-only.
+        if len(compact)<500:
+            for item in (file_parts or [])[:1]:
                 try:
-                    focused=_focused_endpoint_verify(client,model,original_paths,seg,source_text=source_text)
-                    _apply_focused_endpoint(seg,focused)
+                    p=Path(item.get('path') or '')
+                    if p.exists():
+                        contents.append(types.Part.from_bytes(data=p.read_bytes(),mime_type=item.get('mime_type') or ('application/pdf' if p.suffix.lower()=='.pdf' else 'image/jpeg')))
                 except Exception:
                     pass
-
-        # Final source-critical gate: reject contamination/truncation rather than print it.
-        data=_final_endpoint_safety_gate(data)
-
-        # Fare recovery: if the main extraction misses a clearly printed supplier
-        # total, run a focused multimodal fare pass before declaring the fare absent.
-        if (float(data.get('gross_total') or 0) <= 0 or not (data.get('payment_items') or [])) and paths:
-            try:
-                fare_contents=[FARE_RECOVERY_PROMPT]
-                for p in paths:
-                    if p.exists():
-                        mime='application/pdf' if p.suffix.lower()=='.pdf' else 'image/jpeg'
-                        fare_contents.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
-                fr=call_with_high_demand_retry(lambda: client.models.generate_content(
-                    model=model,
-                    contents=fare_contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type='application/json',
-                        response_schema=FARE_SCHEMA,
-                        temperature=0,
-                    )
-                ))
-                if fr.text:
-                    fd=json.loads(fr.text)
-                    gross=float(fd.get('gross_total') or 0)
-                    base=float(fd.get('base_fare') or 0)
-                    tax=float(fd.get('taxes') or 0)
-                    items=[]
-                    for row in (fd.get('payment_items') or []):
-                        try:
-                            amount=float(row.get('amount') or 0)
-                        except Exception:
-                            amount=0
-                        label=str(row.get('label') or '').strip()
-                        if label and amount >= 0:
-                            items.append({'label':label,'amount':amount})
-                    if gross > 0:
-                        data['gross_total']=gross
-                    if items:
-                        data['payment_items']=items
-                    if base > 0:
-                        data['base_fare']=base
-                    if tax > 0:
-                        data['taxes']=tax
-                    elif gross > 0 and base > 0 and not items:
-                        data['taxes']=max(gross-base,0)
-            except Exception:
-                pass
-
-        # Normalize payment details for downstream printing.
-        clean_items=[]
-        for row in (data.get('payment_items') or []):
-            try: amount=float(row.get('amount') or 0)
-            except Exception: amount=0
-            label=str(row.get('label') or '').strip()
-            if label and amount >= 0:
-                clean_items.append({'label':label,'amount':amount})
-        data['payment_items']=clean_items
-        try: gross=float(data.get('gross_total') or 0)
-        except Exception: gross=0
-        if gross <= 0 and clean_items:
-            gross=sum(float(x.get('amount') or 0) for x in clean_items)
-        if gross <= 0:
-            gross=float(data.get('base_fare') or 0)+float(data.get('taxes') or 0)
-        data['gross_total']=gross
-        data['_extraction_pages_optimized']=True
-        return data
-    finally:
-        for p in paths+optimized:
-            try:p.unlink(missing_ok=True)
-            except:pass
         try:
-            if work_dir.exists() and not any(work_dir.iterdir()): work_dir.rmdir()
-        except Exception: pass
-        for p in original_paths:
-            # Original uploads are owned by the bot and can be removed after extraction.
-            try:p.unlink(missing_ok=True)
-            except:pass
+            r=call_with_high_demand_retry(lambda: client.models.generate_content(
+                model=model,contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type='application/json',response_schema=SCHEMA,
+                    temperature=0,max_output_tokens=2200,
+                )
+            ))
+            if r.text:
+                data=_merge_ai_into_local(data,_normalize_flight_segments(json.loads(r.text)))
+                used_ai=True
+        except Exception:
+            pass
+
+    # All remaining verification is deterministic/local. No second source-truth,
+    # repair, endpoint-verifier or fare-recovery AI calls.
+    data=_recover_source_only_fields(data,raw_source_text)
+    data=_normalize_flight_segments(data)
+    data=_sanitize_ticket_numbers(data)
+    data=_sanitize_inferred_stops(data)
+    data=_apply_baggage_summary(data)
+    data=_normalize_passenger_types(data)
+    data=_apply_special_ancillary_summary(data)
+    data=_enforce_terminal_endpoint_truth(data)
+    try:
+        data=_recover_airport_names_from_pdf_geometry(data,original_paths)
+    except Exception:
+        pass
+    data=_final_endpoint_safety_gate(data)
+
+    clean=[]
+    for row in (data.get('payment_items') or []):
+        try: amount=float(row.get('amount') or 0)
+        except Exception: amount=0
+        label=str(row.get('label') or '').strip()
+        if label and amount>=0:
+            clean.append({'label':label,'amount':amount})
+    data['payment_items']=clean
+    try: gross=float(data.get('gross_total') or 0)
+    except Exception: gross=0
+    if gross<=0 and clean:
+        gross=sum(float(x.get('amount') or 0) for x in clean)
+    if gross<=0:
+        try: gross=float(data.get('base_fare') or 0)+float(data.get('taxes') or 0)
+        except Exception: gross=0
+    data['gross_total']=gross
+    data['_local_first']=True
+    data['_ai_fallback_used']=used_ai
+    return data
