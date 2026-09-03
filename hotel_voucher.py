@@ -1,5 +1,6 @@
 import json
 import base64
+import re
 from pathlib import Path
 from html import escape
 from google import genai
@@ -70,19 +71,40 @@ Fields:
 Return ONLY JSON matching the supplied schema.
 """
 
+def _fast_hotel_pdf_text(path):
+    """Keep hotel confirmation/cost pages while skipping long policy sections."""
+    try:
+        import fitz
+        doc=fitz.open(str(path)); pages=[]
+        for i,page in enumerate(doc):
+            text=page.get_text('text') or ''; low=text.lower(); score=0
+            score += 5 if re.search(r'\b(?:reservation|confirmation|booking)\s+(?:id|number|reference|no)\b',low) else 0
+            score += 5 if re.search(r'\b(?:guest\s+(?:name|details)|lead\s+guest|check[- ]?in|check[- ]?out)\b',low) else 0
+            score += 4 if re.search(r'\b(?:hotel\s+(?:name|address)|room\s+(?:type|category|details)|meal\s+plan|occupancy)\b',low) else 0
+            score += 3 if re.search(r'\b(?:fare|rate|tax|grand\s+total|amount\s+(?:paid|payable))\b',low) else 0
+            if re.search(r'\b(?:terms\s*(?:&|and)\s*conditions|privacy\s+policy|cancellation\s+policy)\b',low) and score<5: score-=8
+            pages.append((score,i,text))
+        if len(pages)<=5: chosen=pages
+        else: chosen=[x for x in pages if x[0]>=3][:8]
+        if not chosen: chosen=pages[:3]+pages[-2:]
+        doc.close()
+        return '\n\n'.join(x[2] for x in chosen)[:24000]
+    except Exception:
+        return extract_pdf_text(path,24000)
+
 
 def extract_hotel_voucher(file_parts, source_text, api_key, model):
     client = genai.Client(api_key=api_key)
     contents = [HOTEL_VOUCHER_PROMPT]
     if source_text:
-        contents.append("\nSOURCE TEXT:\n" + source_text)
+        contents.append("\nSOURCE TEXT:\n" + str(source_text)[:18000])
     opened = []
     try:
         for item in file_parts:
             path = Path(item["path"])
             opened.append(path)
             if path.suffix.lower()=='.pdf':
-                local=extract_pdf_text(path,60000)
+                local=_fast_hotel_pdf_text(path)
                 if len(local.strip())>=350:
                     contents.append("\nLOCAL SELECTABLE HOTEL PDF TEXT:\n"+local)
                     continue
@@ -94,6 +116,7 @@ def extract_hotel_voucher(file_parts, source_text, api_key, model):
                 response_mime_type="application/json",
                 response_schema=HOTEL_VOUCHER_SCHEMA,
                 temperature=0,
+                max_output_tokens=2800,
             ),
         ))
         if not response.text:
