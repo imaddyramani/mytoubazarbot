@@ -499,6 +499,58 @@ def _ensure_generated_inclusion_exclusion_lists(data):
         data['exclusions']=exc
     return data
 
+
+def _money_value(value):
+    try:
+        return str(int(float(str(value).replace(',','').strip())))
+    except Exception:
+        return ''
+
+
+def _extract_supplier_package_costs(source_text):
+    """Strict local recovery for common selectable-PDF Tour costing tables."""
+    text=str(source_text or '')
+    fields={}
+    labels={
+        'per_adult':r'(?:per\s+adult|adult(?:\s+cost|\s+rate|\s+price)?|adt)',
+        'per_child_cwb':r'(?:child\s+with\s+bed|child\s+w/?\s*bed|cwb)',
+        'per_child_cnb':r'(?:child\s+(?:without|no)\s+bed|child\s+w/?o\s*bed|cnb)',
+        'per_extra_bed':r'(?:extra\s+bed|extra\s+mattress|eb)',
+        'per_child':r'(?:per\s+child|child(?:\s+cost|\s+rate|\s+price)?)',
+        'total_cost':r'(?:grand\s+total|package\s+(?:total|cost|price)|total\s+(?:package\s+)?cost|net\s+payable)',
+    }
+    amount_pat=r'(?:INR|Rs\.?|₹)?\s*([0-9]{1,3}(?:,[0-9]{2,3})+|[0-9]{3,8})(?:\.\d{1,2})?'
+    for key,label in labels.items():
+        pattern=r'(?im)^\s*(?:'+label+r')\s*(?:[:=|\-]|INR|Rs\.?|₹)\s*'+amount_pat+r'\s*(?:/-)?\s*$'
+        m=re.search(pattern,text)
+        if m:
+            value=_money_value(m.group(1))
+            if value: fields[key]=value
+
+    lines=[re.sub(r'\s+',' ',x).strip() for x in text.splitlines() if x.strip()]
+    for i,line in enumerate(lines[:-1]):
+        ordered=[]
+        for key,label in labels.items():
+            hit=re.search(label,line,re.I)
+            if hit: ordered.append((hit.start(),key))
+        if len(ordered)>=2:
+            nums=re.findall(amount_pat,lines[i+1],re.I)
+            ordered.sort()
+            if len(nums)>=len(ordered):
+                for (_,key),num in zip(ordered,nums):
+                    fields.setdefault(key,_money_value(num))
+
+    if not fields:
+        return []
+    total=fields.get('total_cost','')
+    return [{
+        'option':'Package','per_adult':fields.get('per_adult',''),
+        'per_child':fields.get('per_child',''),'per_child_cwb':fields.get('per_child_cwb',''),
+        'per_child_cnb':fields.get('per_child_cnb',''),'per_extra_bed':fields.get('per_extra_bed',''),
+        'total_cost':total,'currency':'INR','notes':'Recovered from supplier costing table',
+        'supplier_total':total,'markup_total':'','final_total':''
+    }]
+
 def extract_transit_from_parts(file_parts, source_text, api_key, model):
     client = genai.Client(api_key=api_key)
     contents = [TRANSIT_PROMPT]
@@ -568,7 +620,17 @@ def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
                 norm=re.sub(r'\W+',' ',item).strip().lower()
                 if norm and norm not in existing:
                     result[key].append(item); existing.add(norm)
-        return result
+        local_costs=_extract_supplier_package_costs(source_text)
+        if local_costs:
+            if not (result.get('package_costs') or []):
+                result['package_costs']=local_costs
+            else:
+                local=local_costs[0]
+                for row in result['package_costs']:
+                    for key in ('per_adult','per_child','per_child_cwb','per_child_cnb','per_extra_bed','total_cost','supplier_total'):
+                        if not str(row.get(key) or '').strip() and str(local.get(key) or '').strip():
+                            row[key]=local[key]
+        return _ensure_generated_inclusion_exclusion_lists(result)
     finally:
         # Keep generated PDFs, but remove temporary supplier uploads after processing.
         for path in opened:

@@ -4424,6 +4424,8 @@ def _ensure_supplier_costs(data):
     cwb=int(data.get('child_cwb_count') or 0)
     cnb=int(data.get('child_cnb_count') or 0)
     eb=int(data.get('extra_bed_count') or 0)
+    if cwb or cnb or any(_num_cost(c.get('per_child_cwb'))>0 or _num_cost(c.get('per_child_cnb'))>0 for c in costs):
+        child=0
     for c in costs:
         if _num_cost(c.get('supplier_total')) > 0:
             continue
@@ -4448,9 +4450,10 @@ def custom_cost_keyboard():
 def _custom_cost_fields(data):
     """Return the cost fields that have a real passenger count."""
     fields = []
+    split_child=bool(int(data.get('child_cwb_count') or 0) or int(data.get('child_cnb_count') or 0))
     counts = [
         ('adult', 'per_adult', 'Adult', int(data.get('adult_count') or 0)),
-        ('child', 'per_child', 'Child', int(data.get('child_count') or 0)),
+        ('child', 'per_child', 'Child', 0 if split_child else int(data.get('child_count') or 0)),
         ('cwb', 'per_child_cwb', 'Child CWB', int(data.get('child_cwb_count') or 0)),
         ('cnb', 'per_child_cnb', 'Child CNB', int(data.get('child_cnb_count') or 0)),
         ('eb', 'per_extra_bed', 'Extra Bed (EB)', int(data.get('extra_bed_count') or 0)),
@@ -4471,6 +4474,8 @@ def _custom_cost_summary(data):
         'per_child_cnb': int(data.get('child_cnb_count') or 0),
         'per_extra_bed': int(data.get('extra_bed_count') or 0),
     }
+    if counts['per_child_cwb'] or counts['per_child_cnb']:
+        counts['per_child']=0
     labels = {
         'per_adult': 'Adult', 'per_child': 'Child', 'per_child_cwb': 'Child CWB',
         'per_child_cnb': 'Child CNB', 'per_extra_bed': 'Extra Bed (EB)'
@@ -4502,6 +4507,7 @@ def _apply_custom_cost_field(data, field, amount):
         c[field] = f'{amount:,.0f}'
         adults=int(data.get('adult_count') or 0); child=int(data.get('child_count') or 0)
         cwb=int(data.get('child_cwb_count') or 0); cnb=int(data.get('child_cnb_count') or 0); eb=int(data.get('extra_bed_count') or 0)
+        if cwb or cnb: child=0
         total = (_num_cost(c.get('per_adult'))*adults + _num_cost(c.get('per_child'))*child +
                  _num_cost(c.get('per_child_cwb'))*cwb + _num_cost(c.get('per_child_cnb'))*cnb +
                  _num_cost(c.get('per_extra_bed'))*eb)
@@ -4520,6 +4526,7 @@ def _finalize_custom_cost(data):
         raise ValueError('No package cost is available.')
     adults=int(data.get('adult_count') or 0); child=int(data.get('child_count') or 0)
     cwb=int(data.get('child_cwb_count') or 0); cnb=int(data.get('child_cnb_count') or 0); eb=int(data.get('extra_bed_count') or 0)
+    if cwb or cnb: child=0
     for c in costs:
         total = (_num_cost(c.get('per_adult'))*adults + _num_cost(c.get('per_child'))*child +
                  _num_cost(c.get('per_child_cwb'))*cwb + _num_cost(c.get('per_child_cnb'))*cnb +
@@ -5182,10 +5189,13 @@ _PACKAGE_COST_FIELDS = [
 def _required_package_cost_fields(data):
     """Return only customer-rate categories that actually exist in this package."""
     d=_normalize_guest_counts(copy.deepcopy(data or {}))
+    split_child=bool(int(d.get('child_cwb_count') or 0) or int(d.get('child_cnb_count') or 0))
     required=[]
     for field,label,count_key in _PACKAGE_COST_FIELDS:
         try: count=int(d.get(count_key) or 0)
         except Exception: count=0
+        if field=='per_child' and split_child:
+            continue
         if count>0:
             required.append((field,label))
     # Most tours have adults. If passenger counts were not extractable, asking Adult is
@@ -6213,7 +6223,11 @@ def build_whatsapp_itinerary(data, detail_level=None):
     if costs and data.get("show_cost", True):
         lines += ["", "💰 PACKAGE COST"]
         c=costs[0]
-        for label,key in [("Adult","per_adult"),("Child","per_child"),("CNB","per_child_cnb"),("CWB","per_child_cwb"),("Extra Bed","per_extra_bed")]:
+        split_child=bool(str(c.get('per_child_cwb') or '').strip() or str(c.get('per_child_cnb') or '').strip() or data.get('child_cwb_count') or data.get('child_cnb_count'))
+        cost_fields=[("Adult","per_adult")]
+        if not split_child: cost_fields.append(("Child","per_child"))
+        cost_fields.extend([("CNB","per_child_cnb"),("CWB","per_child_cwb"),("Extra Bed","per_extra_bed")])
+        for label,key in cost_fields:
             if str(c.get(key) or "").strip(): lines.append(f"• {label}: INR {c.get(key)}")
     mode=str(data.get('document_mode') or 'itinerary').lower()
     b2b=bool(data.get('b2b') or data.get('brand_neutral'))
@@ -6308,7 +6322,14 @@ def build_confirmation(d):
             cost_text = "\n".join(f"• {c.get('option','Package')}: Final ₹{c.get('final_total') or c.get('total_cost','—')}" for c in costs)
             cost_text += f"\n• Markup added: ₹{d.get('markup_total')}"
         else:
-            cost_text = "\n".join(f"• {c.get('option','Package')}: Adult {c.get('per_adult','—')} | Child {c.get('per_child','—')} | CWB {c.get('per_child_cwb','—')} | CNB {c.get('per_child_cnb','—')} | EB {c.get('per_extra_bed','—')}" for c in costs)
+            rows=[]
+            for c in costs:
+                split_child=bool(str(c.get('per_child_cwb') or '').strip() or str(c.get('per_child_cnb') or '').strip() or d.get('child_cwb_count') or d.get('child_cnb_count'))
+                fields=[f"Adult {c.get('per_adult','—')}"]
+                if not split_child: fields.append(f"Child {c.get('per_child','—')}")
+                fields.extend([f"CWB {c.get('per_child_cwb','—')}",f"CNB {c.get('per_child_cnb','—')}",f"EB {c.get('per_extra_bed','—')}"])
+                rows.append(f"• {c.get('option','Package')}: "+' | '.join(fields))
+            cost_text='\n'.join(rows)
     else:
         needed=[label for _,label in _required_package_cost_fields(d)]
         cost_text = "Customer costing not added yet — " + _package_cost_prompt(d)

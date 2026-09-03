@@ -132,7 +132,9 @@ BASIC MODE:
 - optional_activities must be [].
 
 DETAILED MODE:
-- 150-220 words per day. This is a full-length, client-ready tour-planner day plan, not a short summary.
+- 200-300 words per day. This must read like a full agency-prepared, client-ready itinerary, not a summary.
+- Give every day a clear professional flow: arrival/start, morning, sightseeing sequence, afternoon, evening, hotel return/check-in and overnight stay wherever supported.
+- Explain each confirmed attraction and experience meaningfully, including what the guest will see or do, without inventing booked services.
 - Structure each day naturally as a professional travel planner would: morning/start of the day, sightseeing and experiences in logical sequence, afternoon, and evening/return or leisure where applicable.
 - Name EVERY included sightseeing/attraction/place explicitly.
 - For every included sightseeing, give a useful client-facing description: what the place is, what the guest will see/do there, and the main experience or highlight. Avoid generic filler.
@@ -140,7 +142,7 @@ DETAILED MODE:
 - Mention meals, hotel/stay and included vehicle/transport in the appropriate part of the day when those facts are confirmed.
 - Do NOT invent exact timings, distances, travel durations, ticket inclusions, closures, or booked activities. If timing is not supplied, use natural wording such as "after breakfast", "later", "in the afternoon", or "in the evening".
 - Keep the writing polished, warm and customer-facing, like a professional tour operator's final itinerary.
-- Add 2-4 relevant optional activities only when genuinely useful. Label them clearly as OPTIONAL / AT OWN COST and never present them as included.
+- Add 2-4 destination-appropriate optional activities for EVERY day where leisure or sightseeing makes them possible. Travel-only days should still receive 1-2 sensible optional suggestions when practical. Label them clearly as OPTIONAL / AT OWN COST and never present them as included.
 
 Return ONLY the complete JSON matching the supplied itinerary schema.
 
@@ -169,6 +171,13 @@ CURRENT ITINERARY:
         day.setdefault("optional_activities", [])
         if str(detail_level).lower() == "basic":
             day["optional_activities"] = []
+        elif not day.get("optional_activities"):
+            # Last-resort client-safe suggestions. These are deliberately generic,
+            # relevant across destinations and explicitly remain at own cost.
+            day["optional_activities"] = [
+                "Explore the nearby local market and shop for regional products at own cost",
+                "Try a local café or regional dining experience during available leisure time at own cost",
+            ]
     return data
 
 

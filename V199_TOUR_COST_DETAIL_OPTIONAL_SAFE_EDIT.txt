@@ -1,0 +1,7 @@
+MyTourBazar Bot V199
+
+- Common supplier Tour costing tables are recovered locally from selectable PDF text.
+- Adult, Child, CWB, CNB, Extra Bed and package total labels are supported.
+- Detailed Tour mode targets 200-300 agency-style words per day.
+- Detailed mode requests 2-4 relevant optional activities per usable day.
+- Day-specific edits are merged into the original itinerary; untouched days cannot be deleted.

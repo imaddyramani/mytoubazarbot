@@ -1589,35 +1589,67 @@ def _recover_source_only_fields(data, raw_text):
     data['booking_date'] = _explicit_booking_date_from_text(raw_text)
     data['mobile'] = _explicit_customer_mobile_from_text(raw_text)
 
-    # Local payment-detail fallback for selectable supplier PDFs. Gemini remains the
-    # primary cross-supplier reader, but obvious labelled amount rows should never be
-    # lost merely because the model omitted them.
-    if not (data.get('payment_items') or []):
-        payment_block=raw_text
-        anchor=re.search(r'(?i)\b(?:payment\s+details|fare\s+details|fare\s+summary|payment\s+summary)\b', raw_text)
-        if anchor:
-            payment_block=raw_text[anchor.start():anchor.start()+3000]
-        rows=[]; gross=0.0
-        for line in payment_block.splitlines():
-            clean=re.sub(r'\s+',' ',line).strip()
-            if not clean or len(clean)>180:
-                continue
-            m=re.search(r'(?i)^(.*?)(?:[:\-]?\s*)(?:INR|Rs\.?|₹)\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*$',clean)
-            if not m:
-                continue
-            label=m.group(1).strip(' :-')
-            try: amount=float(m.group(2).replace(',',''))
-            except Exception: continue
-            if not label:
-                continue
-            if re.search(r'(?i)\b(?:gross\s+total|grand\s+total|total\s+amount|amount\s+payable|net\s+payable|total\s+fare|amount\s+in\s+rs)\b',label):
-                gross=max(gross,amount); continue
-            if re.search(r'(?i)\b(?:fare|tax(?:es)?|fee|charge|surcharge|yq|yr|gst|k3|seat|meal|baggage|ancillary|insurance|convenience|service)\b',label):
-                rows.append({'label':label,'amount':amount})
-        if rows:
-            data['payment_items']=rows
-        if gross>0 and float(data.get('gross_total') or 0)<=0:
-            data['gross_total']=gross
+    # Always reconcile selectable-PDF fare evidence, even when AI returned a
+    # partial row. Supplier tables often omit INR/Rs or flatten headers/values.
+    payment_block=raw_text
+    anchor=re.search(r'(?i)\b(?:payment\s+details|fare\s+details|fare\s+summary|payment\s+summary|price\s+summary|fare\s+breakup)\b',raw_text)
+    if anchor:
+        payment_block=raw_text[anchor.start():anchor.start()+6000]
+    cost_label=re.compile(r'(?i)\b(?:base\s*fare|air\s*fare|fare\s*charges?|tax(?:es)?|fee|charge|surcharge|yq|yr|gst|k3|seat|meal|baggage|ancillary|insurance|convenience|service)\b')
+    total_label=re.compile(r'(?i)\b(?:gross\s+total|grand\s+total|total\s+amount|amount\s+payable|net\s+payable|total\s+fare|booking\s+total|final\s+amount|amount\s+in\s+rs)\b')
+    local_rows=[]; gross=0.0
+    lines=[re.sub(r'\s+',' ',x).strip() for x in payment_block.splitlines() if x.strip()]
+    for line in lines:
+        if len(line)>200:
+            continue
+        m=re.search(r'(?i)^(.*?)(?:[:=|\-]\s*|\s+)(?:INR|Rs\.?|₹)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:/-)?$',line)
+        if not m:
+            continue
+        label=m.group(1).strip(' :-|')
+        if not (cost_label.search(label) or total_label.search(label)):
+            continue
+        try: amount=float(m.group(2).replace(',',''))
+        except Exception: continue
+        if amount<=0:
+            continue
+        if total_label.search(label):
+            gross=max(gross,amount)
+        else:
+            local_rows.append({'label':label,'amount':amount})
+
+    # Flattened table: `Base Fare  Taxes  Total` followed by `4500  900  5400`.
+    for i,line in enumerate(lines[:-1]):
+        labels_found=[]
+        for m in re.finditer(r'(?i)(base\s*fare|air\s*fare|tax(?:es)?|fees?|total\s*fare|grand\s*total|total\s*amount)',line):
+            labels_found.append((m.start(),m.group(1)))
+        if len(labels_found)<2:
+            continue
+        nums=re.findall(r'(?<![A-Za-z0-9])(?:INR|Rs\.?|₹)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)(?![A-Za-z0-9])',lines[i+1],re.I)
+        if len(nums)<len(labels_found):
+            continue
+        for (_,label),num in zip(labels_found,nums):
+            amount=float(num.replace(',',''))
+            if total_label.search(label): gross=max(gross,amount)
+            else: local_rows.append({'label':label,'amount':amount})
+
+    merged=[]; seen=set()
+    for row in list(data.get('payment_items') or [])+local_rows:
+        label=str((row or {}).get('label') or '').strip()
+        try: amount=float((row or {}).get('amount') or 0)
+        except Exception: amount=0
+        key=re.sub(r'\W+',' ',label).strip().lower()
+        if label and amount>0 and key not in seen and not total_label.search(label):
+            seen.add(key); merged.append({'label':label,'amount':amount})
+    if merged:
+        data['payment_items']=merged
+        for row in merged:
+            label=row['label'].lower()
+            if 'base fare' in label or 'air fare' in label:
+                data['base_fare']=row['amount']
+            elif re.search(r'\btax(?:es)?\b',label):
+                data['taxes']=row['amount']
+    if gross>0:
+        data['gross_total']=gross
     return data
 
 def _normalize_flight_segments(data):

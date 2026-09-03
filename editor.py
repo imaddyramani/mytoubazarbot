@@ -37,6 +37,32 @@ def _restore_named_train_carriers(updated_data, instruction):
             name_index += 1
     return updated_data
 
+
+def _preserve_untargeted_tour_days(current_data, updated_data, instruction):
+    """Apply a day-specific AI edit as a patch without losing other tour days."""
+    old_days=list((current_data or {}).get('days') or [])
+    if not old_days or not isinstance(updated_data,dict):
+        return updated_data
+    targets={int(x) for x in re.findall(r'(?i)\bday\s*(\d{1,2})\b',str(instruction or ''))}
+    targets={x for x in targets if 1 <= x <= len(old_days)}
+    if not targets:
+        return updated_data
+    ai_days=list(updated_data.get('days') or [])
+    merged=[dict(x or {}) for x in old_days]
+    ordered=sorted(targets)
+    for target in ordered:
+        chosen=None
+        for row in ai_days:
+            m=re.search(r'\d+',str((row or {}).get('day') or ''))
+            if m and int(m.group())==target:
+                chosen=row; break
+        if chosen is None and len(ai_days)==len(targets):
+            chosen=ai_days[ordered.index(target)]
+        if isinstance(chosen,dict):
+            base=dict(merged[target-1]); base.update(chosen); merged[target-1]=base
+    updated_data['days']=merged
+    return updated_data
+
 def apply_edit(doc_type, current_data, instruction, api_key, model, current_fare=None):
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured in .env")
@@ -130,5 +156,6 @@ USER CHANGE REQUEST:
         raise RuntimeError("Gemini returned an invalid edit response.")
     updated_data = result.get("updated_data")
     if doc_type == "package":
+        updated_data = _preserve_untargeted_tour_days(current_data, updated_data, instruction)
         updated_data = _restore_named_train_carriers(updated_data, instruction)
     return updated_data, result.get("updated_fare")

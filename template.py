@@ -392,11 +392,17 @@ def generate_pdf(data, output_path, logo_path=None, page_size="A4", text_scale_o
     cwb_n=int(data.get('child_cwb_count') or 0)
     cnb_n=int(data.get('child_cnb_count') or 0)
     eb_n=int(data.get('extra_bed_count') or 0)
+    has_split_child_cost=bool(
+        cwb_n or cnb_n or any(
+            _num(c.get('per_child_cwb'))>0 or _num(c.get('per_child_cnb'))>0
+            for c in (data.get('package_costs') or [])
+        )
+    )
     cost_rows=[]
     for c in (data.get('package_costs') or []):
         pa=_num(c.get('per_adult')); pc=_num(c.get('per_child')); pcw=_num(c.get('per_child_cwb')); pcn=_num(c.get('per_child_cnb')); peb=_num(c.get('per_extra_bed'))
-        chargeable=adult_n+child_n+cwb_n+cnb_n
-        supplier_calc=(pa*adult_n)+(pc*child_n)+(pcw*cwb_n)+(pcn*cnb_n)+(peb*eb_n)
+        generic_child_n=0 if has_split_child_cost else child_n
+        supplier_calc=(pa*adult_n)+(pc*generic_child_n)+(pcw*cwb_n)+(pcn*cnb_n)+(peb*eb_n)
         supplier_raw=_num(c.get('supplier_total')) or _num(c.get('total_cost'))
         supplier_total=supplier_calc if supplier_calc>0 else supplier_raw
         markup_total=_num(c.get('markup_total'))
@@ -416,14 +422,16 @@ def generate_pdf(data, output_path, logo_path=None, page_size="A4", text_scale_o
                 return f"{esc(value)} × {count}"
             return esc(value)
         adult_cell=_rate_cell(c.get('per_adult'), adult_n)
-        child_cell=_rate_cell(c.get('per_child'), child_n)
+        child_cell=_rate_cell(c.get('per_child'), generic_child_n)
         cwb_cell=_rate_cell(c.get('per_child_cwb'), cwb_n)
         cnb_cell=_rate_cell(c.get('per_child_cnb'), cnb_n)
         eb_cell=_rate_cell(c.get('per_extra_bed'), eb_n)
-        cost_rows.append(f"<tr><td><b>{esc(c.get('option') or 'Package')}</b></td><td>{adult_cell}</td><td>{child_cell}</td><td>{cwb_cell}</td><td>{cnb_cell}</td><td>{eb_cell}</td><td class='cost-total'><b>{esc(c.get('currency') or 'INR')} {final_total:,.0f}</b></td></tr>")
+        child_td='' if has_split_child_cost else f'<td>{child_cell}</td>'
+        cost_rows.append(f"<tr><td><b>{esc(c.get('option') or 'Package')}</b></td><td>{adult_cell}</td>{child_td}<td>{cwb_cell}</td><td>{cnb_cell}</td><td>{eb_cell}</td><td class='cost-total'><b>{esc(c.get('currency') or 'INR')} {final_total:,.0f}</b></td></tr>")
     cost_section=''
     if data.get('show_cost', True) and cost_rows:
-        cost_section=f"""<div class='cost-box'><div class='cost-heading'>PACKAGE COST</div><table class='cost-table'><thead><tr><th>PACKAGE / OPTION</th><th>PER ADULT</th><th>PER CHILD</th><th>CHILD (CWB)</th><th>CHILD (CNB)</th><th>EXTRA BED (EB)</th><th>TOTAL COST</th></tr></thead><tbody>{''.join(cost_rows)}</tbody></table><div class='cost-footnote'>CWB = Child With Bed &nbsp; | &nbsp; CNB = Child No Bed &nbsp; | &nbsp; EB = Extra Bed</div></div>"""
+        child_th='' if has_split_child_cost else '<th>PER CHILD</th>'
+        cost_section=f"""<div class='cost-box'><div class='cost-heading'>PACKAGE COST</div><table class='cost-table'><thead><tr><th>PACKAGE / OPTION</th><th>PER ADULT</th>{child_th}<th>CHILD (CWB)</th><th>CHILD (CNB)</th><th>EXTRA BED (EB)</th><th class='cost-total-head'>TOTAL AMOUNT</th></tr></thead><tbody>{''.join(cost_rows)}</tbody></table><div class='cost-footnote'>CWB = Child With Bed &nbsp; | &nbsp; CNB = Child No Bed &nbsp; | &nbsp; EB = Extra Bed</div></div>"""
 
     special_notes=[]
     policy_text=str(data.get('special_notes') or '').strip()
@@ -487,7 +495,7 @@ body{{font-family:Arial,'Helvetica Neue',sans-serif;color:#30363b;font-size:9pt;
 table{{width:100%;border-collapse:collapse;margin-bottom:15px;page-break-inside:auto}}
 .schedule th{{background:#173d5d;color:#fff;padding:6px 7px;text-align:left;font-size:7.7pt;font-weight:700;letter-spacing:.2px;border:1px solid #d5dadd}}
 .schedule td{{border:1px solid #d7dbde;padding:6px 7px;font-size:7.9pt;vertical-align:middle}}
-.schedule tr:nth-child(even){{background:#fafafa}}.option-row td{{background:#eef3f6;color:#173d5d;font-weight:700;text-transform:uppercase;letter-spacing:.4px}}.gold-stars{{color:#d9a300;letter-spacing:1px;font-size:10pt;font-weight:700;white-space:nowrap}}.half-star{{display:inline-block;width:.56em;overflow:hidden;white-space:nowrap;vertical-align:baseline;color:#d9a300;letter-spacing:0}}.cost-footnote{{font-size:6.8pt;color:#7a7f83;padding:4px 7px 6px;font-style:italic}}.cost-box{{border:1.5px solid #f39a21;border-radius:6px;overflow:hidden;margin:14px 0 16px;page-break-inside:avoid}}.cost-heading{{background:#f39a21;color:#fff;font-size:10pt;font-weight:700;padding:7px 10px;letter-spacing:.4px}}.cost-table{{margin:0;width:100%;border-collapse:collapse}}.cost-table th{{background:#eef3f6;color:#153b5c;padding:7px 6px;font-size:7.4pt;border:1px solid #d7dbde;text-align:left}}.cost-table td{{padding:7px 6px;font-size:8pt;border:1px solid #d7dbde}}.cost-total{{text-align:right;color:#153b5c}}.special-notes{{background:#fff8e8;border:1px solid #f0c56a;border-radius:5px;padding:8px 12px;margin-bottom:14px}}.special-notes li{{font-size:8pt;margin-bottom:4px}}
+.schedule tr:nth-child(even){{background:#fafafa}}.option-row td{{background:#eef3f6;color:#173d5d;font-weight:700;text-transform:uppercase;letter-spacing:.4px}}.gold-stars{{color:#d9a300;letter-spacing:1px;font-size:10pt;font-weight:700;white-space:nowrap}}.half-star{{display:inline-block;width:.56em;overflow:hidden;white-space:nowrap;vertical-align:baseline;color:#d9a300;letter-spacing:0}}.cost-footnote{{font-size:6.8pt;color:#7a7f83;padding:4px 7px 6px;font-style:italic}}.cost-box{{border:1.5px solid #f39a21;border-radius:6px;overflow:hidden;margin:14px 0 16px;page-break-inside:avoid}}.cost-heading{{background:#f39a21;color:#fff;font-size:10pt;font-weight:700;padding:7px 10px;letter-spacing:.4px}}.cost-table{{margin:0;width:100%;border-collapse:collapse}}.cost-table th{{background:#eef3f6;color:#153b5c;padding:7px 6px;font-size:7.4pt;border:1px solid #d7dbde;text-align:left}}.cost-table td{{padding:7px 6px;font-size:8pt;border:1px solid #d7dbde}}.cost-table th.cost-total-head,.cost-table td.cost-total{{text-align:center;color:#153b5c;vertical-align:middle}}.special-notes{{background:#fff8e8;border:1px solid #f0c56a;border-radius:5px;padding:8px 12px;margin-bottom:14px}}.special-notes li{{font-size:8pt;margin-bottom:4px}}
 .logistics{{table-layout:fixed;width:100%;max-width:100%;border:1px solid #d7dbde;border-radius:6px;overflow:hidden;box-sizing:border-box;page-break-inside:avoid}}
 .logistics td{{box-sizing:border-box;min-width:0;overflow-wrap:anywhere;word-break:break-word}}
 .logistics td.labelcell{{background:#f7f7f6;color:#444;font-weight:700;width:18%;max-width:18%;white-space:normal;padding:5px 5px;font-size:7.1pt}}
