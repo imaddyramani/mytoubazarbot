@@ -4,6 +4,7 @@ from google import genai
 from google.genai import types
 
 from ai_retry import call_with_high_demand_retry
+from performance_utils import collect_local_document_text
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 SCHEMA={"type":"object","properties":{
@@ -454,7 +455,10 @@ def _plain_source_text(file_parts, source_text=''):
                 doc.close()
         except Exception:
             pass
-    return '\n'.join(chunks)
+    combined='\n'.join(chunks)
+    if any(Path(item.get('path') or '').suffix.lower()!='.pdf' for item in file_parts or []) or len(combined.strip())<120:
+        return collect_local_document_text(file_parts,source_text,max_chars=50000)
+    return combined[:50000]
 
 def _segment_source_window(raw_text, seg):
     """Find a local text window around this flight number; fall back to all text."""
@@ -2219,51 +2223,11 @@ BAGGAGE IS MANDATORY WHEN PRINTED:
 Return every flight sector separately; never merge connections. Preserve PNR/ticket numbers, flight number, departure/arrival date/time/IATA/airport/terminal, duration/stops only when printed, and supplier payment rows/total. Ignore terms/marketing. Return JSON only."""
 
 def extract_flight_ticket(file_parts, source_text, api_key, model):
-    """V194 local-first extraction: zero AI for readable tickets, max one fallback."""
+    """Extract an Air Print entirely through deterministic parsing and local OCR."""
     raw_source_text=_plain_source_text(file_parts,source_text)
     original_paths=[Path(item.get('path') or '') for item in (file_parts or []) if item.get('path')]
     data=_local_first_air_extract(raw_source_text,original_paths)
     used_ai=False
-
-    if _local_air_needs_ai(data):
-        client=genai.Client(api_key=api_key)
-        contents=[AIR_LIGHT_PROMPT]
-        compact=re.sub(r'\n{3,}','\n\n',str(raw_source_text or '')).strip()
-        if compact:
-            contents.append('\nSUPPLIER TEXT:\n'+compact[:18000])
-        # Only scanned/image sources need a visual attachment. Selectable PDFs stay text-only.
-        # Always include the original first source for verification.  Selectable
-        # text can collapse columns and is not sufficient for passenger/sector rows.
-        if file_parts:
-            prep_dir=Path(__file__).resolve().parent/'data'/'tmp_air_fast'
-            prepared_temps=[]
-            for item in (file_parts or [])[:3]:
-                try:
-                    prepared,tmp=_prepare_flight_source(item,prep_dir)
-                    if tmp: prepared_temps.append(Path(tmp))
-                    p=Path(prepared.get('path') or '')
-                    if p.exists():
-                        contents.append(types.Part.from_bytes(data=p.read_bytes(),mime_type=prepared.get('mime_type') or ('application/pdf' if p.suffix.lower()=='.pdf' else 'image/jpeg')))
-                except Exception:
-                    pass
-        try:
-            r=call_with_high_demand_retry(lambda: client.models.generate_content(
-                model=model,contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type='application/json',response_schema=SCHEMA,
-                    temperature=0,max_output_tokens=3600,
-                )
-            ))
-            if r.text:
-                data=_merge_ai_into_local(data,_normalize_flight_segments(json.loads(r.text)))
-                used_ai=True
-        except Exception:
-            pass
-        finally:
-            for p in locals().get('prepared_temps',[]):
-                try: p.unlink(missing_ok=True)
-                except Exception: pass
-
     # All remaining verification is deterministic/local. No second source-truth,
     # repair, endpoint-verifier or fare-recovery AI calls.
     data=_recover_source_only_fields(data,raw_source_text)
