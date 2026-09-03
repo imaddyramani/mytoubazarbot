@@ -159,6 +159,11 @@ CURRENT ITINERARY:
     if not response.text:
         raise RuntimeError("Gemini returned an empty itinerary enhancement response.")
     data = json.loads(response.text)
+    # Basic/Detailed is a day-description rewrite, not a fresh extraction.
+    # These source/draft lists are authoritative and must survive unchanged into
+    # WhatsApp and PDF output even if the model returns empty arrays.
+    data["inclusions"] = list((current_data or {}).get("inclusions") or [])
+    data["exclusions"] = list((current_data or {}).get("exclusions") or [])
     data["detail_level"] = str(detail_level).lower()
     for day in data.get("days", []):
         day.setdefault("optional_activities", [])

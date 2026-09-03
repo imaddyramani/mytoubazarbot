@@ -1997,6 +1997,12 @@ def _local_air_needs_ai(data):
     # require at least one booking-level fact before trusting local-only extraction.
     if not any(str((data or {}).get(k) or '').strip() for k in ('airline_pnr','gds_pnr','booking_id','baggage_summary')):
         return True
+    # Baggage drives the designed trolley/cabin display. If local extraction did
+    # not find it, AI must inspect the original ticket before we accept blanks.
+    if not str((data or {}).get('baggage_summary') or '').strip() and not any(
+        str(p.get('baggage') or '').strip() for p in passengers
+    ):
+        return True
     return False
 
 
@@ -2045,7 +2051,21 @@ def _merge_ai_into_local(local,ai):
     return local
 
 
-AIR_LIGHT_PROMPT="Extract only booking facts needed for an airline itinerary. SOURCE PRESENT = COPY, SOURCE ABSENT = BLANK. Do not infer airports, terminals, dates, baggage or fares. Return every flight sector separately; never merge connections. Preserve passenger names/types, PNR/ticket numbers, baggage, flight number, departure/arrival date/time/IATA/airport/terminal, duration/stops only when printed, and supplier payment rows/total. Ignore terms/marketing. Return JSON only."
+AIR_LIGHT_PROMPT="""Extract only booking facts needed for an airline itinerary. SOURCE PRESENT = COPY, SOURCE ABSENT = BLANK. Do not infer airports, terminals, dates, baggage or fares.
+
+PASSENGERS ARE A STRICT TRANSCRIPTION TASK:
+- Read the complete passenger table/list and return EVERY passenger row.
+- Copy each FULL traveller name exactly, including every first, middle and surname component.
+- Never shorten a name, drop its last word, merge two passengers, or turn nearby words such as For/Adult/Passenger into a name.
+- Preserve separate infant and child rows and their actual complete names.
+- Put title only in title and the remaining complete name only in name.
+
+BAGGAGE IS MANDATORY WHEN PRINTED:
+- Search passenger rows, fare-family details and baggage/allowance sections.
+- Preserve both check-in and cabin/hand baggage, with kg/piece counts and passenger type when supplied.
+- Put the complete common allowance in baggage_summary and passenger-specific allowance in passengers[].baggage.
+
+Return every flight sector separately; never merge connections. Preserve PNR/ticket numbers, flight number, departure/arrival date/time/IATA/airport/terminal, duration/stops only when printed, and supplier payment rows/total. Ignore terms/marketing. Return JSON only."""
 
 def extract_flight_ticket(file_parts, source_text, api_key, model):
     """V194 local-first extraction: zero AI for readable tickets, max one fallback."""
