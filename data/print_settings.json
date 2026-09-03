@@ -30,5 +30,9 @@
     "main_files": false,
     "main_settings": true
   },
-  "tour_last_page": "tc_default"
+  "tour_last_page": "tc_default",
+  "logo_scales": {
+    "flight": 1.25
+  },
+  "_air_logo_125_migrated": true
 }

@@ -1136,7 +1136,7 @@ def _parse_markup_input(value, supplier_total=0, pax_count=1):
     amount = float(numbers[0])
 
     pax_count = max(1, int(pax_count or 1))
-    per_person = bool(re.search(r"(?i)\b(?:per\s*(?:person|pax|passenger)|each|pp)\b", low))
+    per_person = bool(re.search(r"(?i)(?:\bper\s*(?:person|pax|passenger)\b|\beach\b|(?<![A-Za-z])pp\b)", low))
     minus = bool(re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b", low))
     plus = bool(re.search(r"(?i)^\s*\+|\b(?:add|plus|increase|markup|mark\s*up)\b", low))
     explicit_selling = bool(re.search(
@@ -1154,10 +1154,7 @@ def _parse_markup_input(value, supplier_total=0, pax_count=1):
 
     if per_person:
         if base <= 0:
-            raise ValueError(
-                "Per-pax selling fare needs the original supplier fare. "
-                "If there is no supplier fare, enter the final booking total directly."
-            )
+            return float(amount * pax_count)
 
         supplier_pp = base / pax_count
 
@@ -1267,8 +1264,18 @@ def _fare_cost_confirmation(value, supplier_total, final_fare, pax_count):
     amount=float(nums[0]) if nums else 0
     pax_count=max(1,int(pax_count or 1))
     supplier_total=float(supplier_total or 0)
-    per_person=bool(re.search(r"(?i)\b(?:per\s*(?:person|pax|passenger)|each|pp)\b",low))
+    per_person=bool(re.search(r"(?i)(?:\bper\s*(?:person|pax|passenger)\b|\beach\b|(?<![A-Za-z])pp\b)",low))
     markup=bool(re.search(r"(?i)^\s*[+-]|\b(?:add|plus|increase|markup|mark\s*up|reduce|less|minus|deduct|discount)\b",low))
+
+    if per_person and not supplier_total:
+        return (
+            f"✅ *Cost understood:*\n"
+            f"Selling Fare PP: *INR {_fare_num(amount)}*\n"
+            f"Eligible Pax: *{pax_count}*\n"
+            f"Final Customer Total: *INR {_fare_num(final_fare)}*\n\n"
+            f"The Air Print will distribute this total into Base Fare and Taxes & Fees.\n"
+            f"Infant: *Excluded by default*"
+        )
 
     if per_person and supplier_total:
         mode,entered,supplier_pp=_fare_pp_mode(raw,supplier_total,pax_count)

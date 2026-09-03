@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from google import genai
 from google.genai import types
@@ -212,7 +213,9 @@ of exploring the local area; do not falsely name specific attractions as include
 ========================
 3. AI-GENERATED INCLUSIONS
 ========================
-Do NOT simply copy the supplier's inclusion list.
+First preserve EVERY explicit supplier inclusion as a separate item. Do not omit, merge away,
+or replace the supplier's own inclusion list. After preserving it, you may rewrite each item
+professionally and add concise derived inclusion statements only when supported by the package.
 
 Create a clean, customer-facing inclusion list from the actual package structure and services
 found in the material. For example, if the material clearly establishes accommodation + breakfast
@@ -240,6 +243,9 @@ such as:
 
 Do not invent unusual taxes or charges. Do not state something is excluded if the supplier clearly
 included it.
+
+CRITICAL: Preserve EVERY exclusion explicitly printed by the supplier. Supplier exclusions take
+priority over generated standard exclusions and must never disappear from the draft or PDF.
 
 ========================
 5. FLIGHTS / TRANSIT — VERY IMPORTANT
@@ -421,6 +427,78 @@ def _dedupe_transit(rows):
         seen.add(key); out.append(row)
     return out
 
+
+def _extract_supplier_inclusion_exclusion_lists(source_text):
+    """Recover explicit supplier bullet lists from locally extracted PDF text."""
+    result={'inclusions':[],'exclusions':[]}
+    current=None
+    stop_headings=re.compile(
+        r'(?i)^(?:hotel|accommodation|itinerary|day\s*\d+|package\s+cost|costing|price|'
+        r'terms(?:\s*&\s*conditions)?|cancellation|payment|notes?|important)\s*:?[\s-]*$'
+    )
+    for raw_line in str(source_text or '').splitlines():
+        line=re.sub(r'\s+',' ',raw_line).strip()
+        heading=re.sub(r'[^A-Za-z ]',' ',line).strip().lower()
+        if re.fullmatch(r'(?:package )?inclusions?',heading):
+            current='inclusions'; continue
+        if re.fullmatch(r'(?:package )?exclusions?|not included',heading):
+            current='exclusions'; continue
+        if current and stop_headings.fullmatch(line):
+            current=None; continue
+        if not current or not line:
+            continue
+        item=re.sub(r'^(?:[•●▪◦✓✔✘❌*\-–—]+|\d+[.)])\s*','',line).strip()
+        if item==line and len(item)>180:
+            continue
+        if len(item)<3 or len(item)>260:
+            continue
+        if re.fullmatch(r'(?i)(?:yes|no|included|excluded|n/?a)',item):
+            continue
+        if item not in result[current]:
+            result[current].append(item)
+    return result
+
+
+def _ensure_generated_inclusion_exclusion_lists(data):
+    """Guarantee professional lists when the supplier provides none."""
+    data=data or {}
+    if not (data.get('inclusions') or []):
+        inc=[]
+        hotels=data.get('hotels') or data.get('accommodation') or []
+        for h in hotels:
+            place=str(h.get('destination') or '').strip()
+            hotel=str(h.get('hotel_name') or '').strip()
+            meal=str(h.get('meal_plan') or '').strip()
+            label='Accommodation'
+            if hotel and place: label=f'Accommodation at {hotel}, {place}'
+            elif hotel: label=f'Accommodation at {hotel}'
+            elif place: label=f'Accommodation in {place}'
+            if meal: label += f' with {meal} meal plan'
+            if label not in inc: inc.append(label)
+        vehicle=str(data.get('vehicle') or '').strip()
+        if vehicle:
+            inc.append(f'Transfers and sightseeing by {vehicle} as per the itinerary')
+        if data.get('days'):
+            inc.append('Sightseeing and excursions specifically mentioned in the day-wise itinerary')
+        if data.get('pickup') or data.get('drop'):
+            inc.append('Pickup and drop arrangements as mentioned in the itinerary')
+        if data.get('transit'):
+            inc.append('Confirmed journey sectors specifically listed in the itinerary')
+        data['inclusions']=inc or ['Services specifically mentioned in the day-wise itinerary']
+
+    if not (data.get('exclusions') or []):
+        exc=[
+            'Personal expenses such as tips, laundry, telephone calls and room service',
+            'Meals and refreshments not specifically mentioned in the itinerary',
+            'Entry tickets, activity charges and guide fees unless specifically included',
+            'Optional activities and services not expressly mentioned under inclusions',
+            'Any expense arising due to weather, road conditions, delays or circumstances beyond our control',
+        ]
+        if not (data.get('transit') or []):
+            exc.insert(0,'Airfare, train fare or bus fare unless specifically included')
+        data['exclusions']=exc
+    return data
+
 def extract_transit_from_parts(file_parts, source_text, api_key, model):
     client = genai.Client(api_key=api_key)
     contents = [TRANSIT_PROMPT]
@@ -440,7 +518,7 @@ def extract_transit_from_parts(file_parts, source_text, api_key, model):
             raise RuntimeError("Gemini returned an empty transit response.")
         result=json.loads(response.text)
         result["transit"]=_dedupe_transit(result.get("transit") or [])
-        return result
+        return _ensure_generated_inclusion_exclusion_lists(result)
     finally:
         for path in opened:
             try: Path(path).unlink(missing_ok=True)
@@ -479,7 +557,18 @@ def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
         if not response.text:
             raise RuntimeError("Gemini returned an empty response.")
 
-        return json.loads(response.text)
+        result=json.loads(response.text)
+        # Deterministic safety net for supplier documents with explicit heading lists.
+        # This preserves source items if the model returns either array empty.
+        supplier_lists=_extract_supplier_inclusion_exclusion_lists(source_text)
+        for key in ('inclusions','exclusions'):
+            result.setdefault(key,[])
+            existing={re.sub(r'\W+',' ',str(x)).strip().lower() for x in result[key]}
+            for item in supplier_lists[key]:
+                norm=re.sub(r'\W+',' ',item).strip().lower()
+                if norm and norm not in existing:
+                    result[key].append(item); existing.add(norm)
+        return result
     finally:
         # Keep generated PDFs, but remove temporary supplier uploads after processing.
         for path in opened:

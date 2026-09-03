@@ -662,6 +662,55 @@ def _normalize_passenger_types(data):
     return data
 
 
+def _sanitize_passenger_names(data):
+    """Remove obvious labels/sentence fragments that were misread as people."""
+    clean=[]; seen=set()
+    invalid_exact={
+        'for','to','from','adult','child','infant','passenger','passengers','traveller',
+        'traveler','name','passenger name','passenger information','booking','flight'
+    }
+    for pax in (data or {}).get('passengers') or []:
+        row=dict(pax or {})
+        name=re.sub(r'\s+',' ',str(row.get('name') or '')).strip(' ,;:/-|')
+        name=re.sub(r'(?i)^(?:mr|mrs|ms|miss|master|mstr|dr|prof)\.?\s+','',name).strip()
+        low=name.lower()
+        if (low in invalid_exact or len(name)<3 or not re.search(r'[A-Za-z]{2}',name)
+                or re.search(r'(?i)\b(?:ticket|pnr|baggage|booking|flight\s+details)\b',name)):
+            continue
+        key=re.sub(r'\W+','',low)
+        if key in seen:
+            continue
+        seen.add(key); row['name']=name; clean.append(row)
+    data['passengers']=clean
+    return data
+
+
+def _dedupe_conflicting_segments(data):
+    """Collapse conflicting rows that describe the exact same scheduled journey."""
+    rows=(data or {}).get('segments') or []
+    out=[]; positions={}
+    for row in rows:
+        row=dict(row or {})
+        key=tuple(re.sub(r'\s+','',str(row.get(k) or '')).upper() for k in
+                  ('dep_date','dep_code','arr_code','dep_time','arr_time'))
+        if all(key) and key in positions:
+            old=out[positions[key]]
+            old_no=_norm_flight_key(old.get('flight_number'))
+            new_no=_norm_flight_key(row.get('flight_number'))
+            old_code=re.match(r'^[A-Z0-9]{2,3}',old_no or '')
+            new_code=re.match(r'^[A-Z0-9]{2,3}',new_no or '')
+            old_known=bool(old_code and old_code.group(0) in _FLIGHT_AIRLINE_BY_CODE)
+            new_known=bool(new_code and new_code.group(0) in _FLIGHT_AIRLINE_BY_CODE)
+            if new_known and not old_known:
+                out[positions[key]]=row
+            continue
+        if all(key):
+            positions[key]=len(out)
+        out.append(row)
+    data['segments']=out
+    return data
+
+
 def _apply_baggage_summary(data):
     summary=re.sub(r'\s+',' ',str(data.get('baggage_summary') or '')).strip()
     if not summary:
@@ -1900,6 +1949,8 @@ def _local_first_air_extract(raw_text,original_paths):
     data=_sanitize_inferred_stops(data)
     data=_apply_baggage_summary(data)
     data=_normalize_passenger_types(data)
+    data=_sanitize_passenger_names(data)
+    data=_dedupe_conflicting_segments(data)
     data=_apply_special_ancillary_summary(data)
     try:
         data=_recover_airport_names_from_pdf_geometry(data,original_paths)
@@ -2042,6 +2093,8 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     data=_sanitize_inferred_stops(data)
     data=_apply_baggage_summary(data)
     data=_normalize_passenger_types(data)
+    data=_sanitize_passenger_names(data)
+    data=_dedupe_conflicting_segments(data)
     data=_apply_special_ancillary_summary(data)
     data=_enforce_terminal_endpoint_truth(data)
     try:

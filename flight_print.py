@@ -559,8 +559,12 @@ def _payment_breakdown(data, updated_total):
         return adjusted,target
 
     if target>0:
-        # Only when the supplier gave no usable component rows at all.
-        return [{"label":"Total Fare","amount":round(target)}],target
+        base_amount=round(target*0.80)
+        tax_amount=round(target)-base_amount
+        return [
+            {"label":"Base Fare","amount":base_amount},
+            {"label":"Taxes & Fees","amount":tax_amount},
+        ],target
     return [],target
 
 def generate_flight_ticket(data, updated_total, output_path, logo_path=None, page_size="A4", text_scale_override=None, logo_scale_override=None):
@@ -591,6 +595,7 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     baggage_summary=_text(data.get("baggage_summary"))
     ancillary_summary=_text(data.get("special_ancillary_summary"))
     has_real_ticket=any(_text(p.get("ticket_number")) for p in passengers)
+    show_ticket_col=True
     ticket_heading="Ticket Number" if has_real_ticket else "Airline PNR"
     has_ancillary=bool(ancillary_summary or any(_text(p.get("special_ancillary")) for p in passengers))
     pax_table_class="pax has-ancillary" if has_ancillary else "pax"
@@ -605,7 +610,7 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
         row=(
             f'<tr><td class="pax-index">{i+1}</td>'
             f'<td class="pax-name"><strong>{_esc(_display_person_name(p))}</strong></td>'
-            f'<td class="pax-pnr">{_esc(ticket_value)}</td>'
+            + (f'<td class="pax-pnr">{_esc(ticket_value)}</td>' if show_ticket_col else '') +
             f'<td class="pax-type">{_esc(p.get("type") or "Adult")}</td>'
             f'<td class="pax-dob">{_esc(p.get("dob"))}</td>'
             f'<td class="baggage-cell">{baggage_html}</td>'
@@ -614,7 +619,7 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
             row += f'<td class="ancillary-cell">{_esc(ancillary_value)}</td>'
         row += '</tr>'
         pax_rows_list.append(row)
-    pax_colspan=7 if has_ancillary else 6
+    pax_colspan=6 + (1 if has_ancillary else 0)
     pax_rows=''.join(pax_rows_list) or f'<tr><td colspan="{pax_colspan}">No passenger details found.</td></tr>'
 
     rows=[]
@@ -730,7 +735,7 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
 </style></head><body>
 <div class="top"><div class="brand">{logo_html}</div><div class="heading"><h1>E-TICKET ITINERARY</h1><div>Flight Booking Confirmation</div>{booked_on_html}</div></div>
 <div class="meta"><table><tr><td class="lab">Trip ID:</td><td class="val">{_esc(data.get('booking_id') or data.get('trip_id'))}</td><td class="lab">Travel Date:</td><td class="val">{_esc(data.get('travel_date') or (segs[0].get('dep_date') if segs else ''))}</td></tr><tr><td class="lab">Airline PNR:</td><td class="val pnr-val">{_esc(data.get('airline_pnr'))}</td><td class="lab">GDS PNR:</td><td class="val">{_esc(data.get('gds_pnr'))}</td></tr><tr><td class="lab">Status:</td><td class="val">{_esc(data.get('status') or 'CONFIRMED')}</td><td class="lab">Customer Mobile:</td><td class="val">{_esc(customer_mobile)}</td></tr></table></div>
-<div class="section">PASSENGER INFORMATION</div><table class="{pax_table_class}"><thead><tr><th>#</th><th>Passenger Name</th><th>{_esc(ticket_heading)}</th><th>Type</th><th>DOB</th><th>Baggage</th>{('<th>Special Ancillary</th>' if has_ancillary else '')}</tr></thead><tbody>{pax_rows}</tbody></table>
+<div class="section">PASSENGER INFORMATION</div><table class="{pax_table_class}"><thead><tr><th>#</th><th>Passenger Name</th>{(f'<th>{_esc(ticket_heading)}</th>' if show_ticket_col else '')}<th>Type</th><th>DOB</th><th>Baggage</th>{('<th>Special Ancillary</th>' if has_ancillary else '')}</tr></thead><tbody>{pax_rows}</tbody></table>
 <div class="section">FLIGHT DETAILS &amp; SCHEDULE{(' (CONNECTING ITINERARY)' if len(segs)>1 else '')}</div><table class="flights"><thead><tr><th>Flight &amp; Aircraft</th><th>Departure</th><th class="duration-head"><span>Duration</span><span class="duration-head-stop">Stops</span></th><th>Arrival</th></tr></thead><tbody>{flight_rows}</tbody></table>
 {fare_html}<div class="terms keep"><h3>General Instructions</h3><ul>{terms_html}</ul></div>
 </body></html>'''
