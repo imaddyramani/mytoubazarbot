@@ -47,7 +47,8 @@ def _safe_send_kwargs(kwargs):
 
 def install_dynamic_progress_fix():
     from telegram import Bot, Message
-    from telegram.error import BadRequest
+    from telegram.error import BadRequest, NetworkError, TimedOut
+    import asyncio
 
     # ------------------------------------------------------------------
     # 1. Patch Message.edit_text
@@ -57,6 +58,21 @@ def install_dynamic_progress_fix():
     # for all subsequent progress updates.
     # ------------------------------------------------------------------
     original_message_edit_text = Message.edit_text
+    original_send_document = Bot.send_document
+
+    async def reliable_send_document(self, *args, **kwargs):
+        """Retry only transient Telegram transport failures for completed files."""
+        last_error = None
+        for attempt in range(3):
+            try:
+                return await original_send_document(self, *args, **kwargs)
+            except (NetworkError, TimedOut) as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(1 + attempt * 2)
+        raise last_error
+
+    Bot.send_document = reliable_send_document
 
     async def dynamic_message_edit_text(self, text, *args, **kwargs):
         chat_id = self.chat_id
@@ -204,6 +220,7 @@ def install_dynamic_progress_fix():
     try:
         from telegram.ext import ExtBot
         ExtBot.edit_message_text = dynamic_bot_edit
+        ExtBot.send_document = reliable_send_document
     except Exception:
         pass
 
