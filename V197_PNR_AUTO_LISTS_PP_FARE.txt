@@ -1,0 +1,7 @@
+MyTourBazar Bot V197
+
+- Airline PNR repeats in passenger rows when individual ticket numbers are absent.
+- Supplier inclusions/exclusions are preserved; when absent, professional lists are generated from the itinerary.
+- With no supplier fare, `343pp` means INR 343 multiplied by chargeable passengers.
+- Infant is excluded from PP multiplication unless explicitly included.
+- A no-supplier-fare selling total is displayed as 80% Base Fare and 20% Taxes & Fees, with the exact total preserved.

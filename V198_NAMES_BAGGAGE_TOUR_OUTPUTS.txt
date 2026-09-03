@@ -1,0 +1,7 @@
+MyTourBazar Bot V198
+
+- Air AI verification now requires complete full passenger-name transcription.
+- Missing baggage forces original-ticket AI inspection.
+- Check-in and cabin baggage feed the existing designed icon display.
+- Basic/Detailed conversion can no longer remove draft inclusions or exclusions.
+- The exact draft lists are retained in Basic WhatsApp, Detailed WhatsApp, Basic PDF and Detailed PDF.

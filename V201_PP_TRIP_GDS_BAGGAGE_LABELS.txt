@@ -1,0 +1,6 @@
+MyTourBazar Bot V201
+
+- Per-person Air fares multiply by source passenger count even when some names fail extraction.
+- Missing Trip ID receives a stable five-digit numeric ID.
+- Missing GDS PNR copies the Airline PNR.
+- Baggage icons now include visible Check-in and Cabin labels.

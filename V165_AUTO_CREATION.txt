@@ -1,0 +1,37 @@
+MyTourBazar Bot V165 - Auto Creation
+
+NEW MAIN MENU
+- Auto Creation
+
+AUTO CREATION INPUT
+- One supplier Tour/package + multiple flight/train/bus/hotel PDFs/screenshots
+- Normal text notes
+- Voice notes
+- All items sent within the short batch window are combined as one Tour job
+
+SMART MERGE
+- Matches passenger, dates, route continuity, destination, pickup/drop and package dates
+- Deduplicates repeated transport sectors
+- Does not intentionally merge clearly mismatched tickets
+- Builds one proper day-wise Tour draft
+- Can build a sensible destination day-plan from an explicit owner brief when no supplier day plan exists, without inventing confirmed hotel names/bookings/prices/ticket facts
+
+OUTPUT
+- WhatsApp Basic / Detailed
+- PDF Basic / Detailed
+- Quotation / Voucher
+- Auto Creation defaults to existing 'without_footer' last page and footer mode NONE
+
+POST-GENERATION CONTROLS
+- Page Size
+- Footer
+- Font - / +
+- Logo - / +
+- Auto Size
+- B2B
+- Done / Make Again
+- Modify & Regenerate (text or voice)
+
+WORKFLOW RULE
+- A normal new PDF/image drop after a completed print starts NEW work.
+- Replying to an old generated PDF with text, or using Modify & Regenerate, targets that saved itinerary.

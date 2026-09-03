@@ -1,0 +1,9 @@
+MyTourBazar Bot V167
+
+- Normal new upload remains a new job.
+- Reply to a Tour draft: natural text/voice edits that draft directly.
+- Reply to a generated PDF: natural text/voice edits and regenerates that exact saved document.
+- Exact Telegram output message IDs are stored internally with saved references for reliable old-PDF reply targeting.
+- Removed Font +/- and Logo +/- from generated Tour and Modify & Regenerate menus. Auto Size, Page Size, Footer, B2B, document mode and other reliable controls remain.
+- 3 Star Premium => 3 full gold stars + half star. 4 Star Premium => 4 full gold stars + half star. No prefix required.
+- Latest available airline-logo pack merged into assets/airline_logos; missing airlines still use takeoff fallback.

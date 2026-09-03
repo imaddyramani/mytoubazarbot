@@ -1,0 +1,12 @@
+V168 - Single Status Message Recovery
+
+Fixes Telegram 400 BadRequest warnings such as:
+  Message can't be edited
+
+Behavior:
+- Normal workflow still uses one editable bot-owned status/progress message.
+- If Telegram invalidates that status ID, the bot attempts to retire it once.
+- A single clean replacement status message is created.
+- All later progress updates transparently follow the replacement, even when callers still hold the old Message object.
+- 'Message is not modified' remains silently ignored.
+- Non-inline reply keyboards are never attached to replacement status messages.
