@@ -734,12 +734,15 @@ def _local_source_passenger_counts(raw_text, passengers=None):
 def _apply_air_output_defaults(data,raw_source_text=''):
     """Apply MyTourBazar print defaults after source-truth extraction."""
     data=data or _local_blank_air_data()
+    data=_sanitize_air_identifiers(data)
     source_total,source_chargeable=_local_source_passenger_counts(raw_source_text,data.get('passengers'))
     data['_source_passenger_count']=source_total
     data['_source_chargeable_passenger_count']=source_chargeable
     if not str(data.get('gds_pnr') or '').strip() and str(data.get('airline_pnr') or '').strip():
         data['gds_pnr']=data['airline_pnr']
-    if not str(data.get('booking_id') or '').strip():
+    # MyTourBazar Trip ID is always a five-digit print reference. A supplier PNR
+    # accidentally extracted into booking_id is promoted above, never printed here.
+    if not re.fullmatch(r'\d{5}',str(data.get('booking_id') or '').strip()):
         first_seg=(data.get('segments') or [{}])[0]
         first_pax=(data.get('passengers') or [{}])[0]
         seed='|'.join([
@@ -747,6 +750,40 @@ def _apply_air_output_defaults(data,raw_source_text=''):
             str(first_seg.get('dep_date') or ''),str(first_pax.get('name') or ''),
         ])
         data['booking_id']=str(10000+(zlib.crc32(seed.encode('utf-8'))%90000))
+    return data
+
+
+_PNR_LABEL_WORDS={
+    'number','no','pnr','airline','carrier','gds','booking','reference','ref',
+    'reservation','record','locator','confirmation','code','notavailable','notfound'
+}
+
+
+def _clean_pnr_candidate(value):
+    """Return a compact real-looking PNR, never a nearby label word."""
+    raw=re.sub(r'[^A-Za-z0-9]','',str(value or '')).upper()
+    if not raw or raw.lower() in _PLACEHOLDER_VALUES or raw.lower() in _PNR_LABEL_WORDS:
+        return ''
+    # Airline/GDS record locators are normally 5-9 compact alphanumeric chars.
+    # Requiring a letter prevents ticket numbers, dates and Trip IDs becoming PNRs.
+    if not re.fullmatch(r'[A-Z0-9]{5,9}',raw) or not re.search(r'[A-Z]',raw):
+        return ''
+    return raw
+
+
+def _sanitize_air_identifiers(data):
+    """Repair PNR/Trip-ID field shifts caused by flattened supplier PDF labels."""
+    data=data or {}
+    airline=_clean_pnr_candidate(data.get('airline_pnr'))
+    gds=_clean_pnr_candidate(data.get('gds_pnr'))
+    booking_raw=str(data.get('booking_id') or '').strip()
+    misplaced=_clean_pnr_candidate(booking_raw)
+    if not airline and misplaced:
+        airline=misplaced
+    data['airline_pnr']=airline
+    data['gds_pnr']=gds
+    if not re.fullmatch(r'\d{5}',booking_raw):
+        data['booking_id']=''
     return data
 
 
@@ -2029,13 +2066,14 @@ def _local_first_air_extract(raw_text,original_paths):
     data=_local_blank_air_data(); raw=str(raw_text or '')
     data['booking_date']=_explicit_booking_date_from_text(raw)
     data['mobile']=_explicit_customer_mobile_from_text(raw)
-    data['gds_pnr']=_local_label_value(raw,[r'GDS\s*PNR'])
-    data['airline_pnr']=_local_label_value(raw,[r'Airline\s*PNR',r'Carrier\s*PNR'])
+    data['gds_pnr']=_local_label_value(raw,[r'GDS\s*PNR(?:\s*(?:No\.?|Number))?'])
+    data['airline_pnr']=_local_label_value(raw,[r'Airline\s*PNR(?:\s*(?:No\.?|Number))?',r'Carrier\s*PNR(?:\s*(?:No\.?|Number))?'])
     if not data['airline_pnr']:
         for m in re.finditer(r'(?i)\bPNR\s*[:#\-]?\s*([A-Z0-9]{5,9})\b',raw):
             if 'gds' not in raw[max(0,m.start()-12):m.start()].lower():
                 data['airline_pnr']=m.group(1); break
     data['booking_id']=_local_label_value(raw,[r'Booking\s*(?:ID|Id|Reference|Ref)',r'Trip\s*ID',r'Reservation\s*(?:ID|Ref)'])
+    data=_sanitize_air_identifiers(data)
     data['status']=_local_label_value(raw,[r'Status'],24)
     data['baggage_summary']=_local_baggage_summary(raw)
     data['passengers']=_local_passengers_from_text(raw,data['baggage_summary'])
