@@ -750,7 +750,23 @@ def _apply_air_output_defaults(data,raw_source_text=''):
             str(first_seg.get('dep_date') or ''),str(first_pax.get('name') or ''),
         ])
         data['booking_id']=str(10000+(zlib.crc32(seed.encode('utf-8'))%90000))
+    data['status']=_normalize_air_status(data.get('status'),bool(data.get('airline_pnr')))
     return data
+
+
+def _normalize_air_status(value,has_pnr=False):
+    """Map supplier wording to the three MyTourBazar operational statuses."""
+    raw=re.sub(r'\s+',' ',str(value or '')).strip()
+    low=raw.lower()
+    if re.search(r'\b(?:cancelled|canceled|void|refunded)\b',low):
+        return 'CANCELLED'
+    if re.search(r'\b(?:hold|on hold|held|time limit|payment due)\b',low):
+        return 'HOLD'
+    if re.search(r'\b(?:pending|waitlisted?|unconfirmed|on request|requested|awaiting)\b',low):
+        return 'PENDING'
+    if re.search(r'\b(?:successful|success|confirmed|complete|completed|booked|ticketed|issued|vouchered)\b',low):
+        return 'VOUCHERED'
+    return 'VOUCHERED' if has_pnr else ('PENDING' if not raw else raw.upper())
 
 
 _PNR_LABEL_WORDS={
@@ -2214,7 +2230,7 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         contents=[AIR_LIGHT_PROMPT]
         compact=re.sub(r'\n{3,}','\n\n',str(raw_source_text or '')).strip()
         if compact:
-            contents.append('\nSUPPLIER TEXT:\n'+compact[:30000])
+            contents.append('\nSUPPLIER TEXT:\n'+compact[:18000])
         # Only scanned/image sources need a visual attachment. Selectable PDFs stay text-only.
         # Always include the original first source for verification.  Selectable
         # text can collapse columns and is not sufficient for passenger/sector rows.
@@ -2235,7 +2251,7 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
                 model=model,contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type='application/json',response_schema=SCHEMA,
-                    temperature=0,max_output_tokens=5000,
+                    temperature=0,max_output_tokens=3600,
                 )
             ))
             if r.text:
