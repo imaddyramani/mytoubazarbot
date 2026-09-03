@@ -22,6 +22,10 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, filters
 )
 
+# Groq provider compatibility layer. This must run before project AI modules import google.genai.
+from groq_genai_compat import install_google_genai_shim
+install_google_genai_shim()
+
 from extractor import extract_itinerary_from_parts, extract_transit_from_parts
 from template import generate_pdf
 from hotel_voucher import extract_hotel_voucher, generate_hotel_voucher
@@ -131,8 +135,12 @@ def mtb_airline_logo_html(airline_text, alt=None):
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b").strip() or "qwen/qwen3.6-27b"
+
+# Keep one generic pair for every existing extractor/editor function.
+AI_API_KEY = GROQ_API_KEY
+AI_MODEL = GROQ_MODEL
 
 ADMIN_USER_IDS = {
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
@@ -1378,7 +1386,7 @@ def _supplier_total(data):
         return 0.0
 
 def _parse_reply_controls(instruction, current_fare, data, current_footer=False, current_logo=True, current_page_size="auto"):
-    """Parse non-content commands before Gemini. Remaining text is sent to Gemini."""
+    """Parse non-content commands before Groq AI. Remaining text is sent to Groq AI."""
     original = str(instruction or "").strip()
     text = original
     lower = text.lower()
@@ -1462,7 +1470,7 @@ def _parse_reply_controls(instruction, current_fare, data, current_footer=False,
         text = re.sub(r"(?i)\b(?:page\s*size|paper\s*size|page|paper)\s*(?:to|=|:)??\s*(a5|a4|a3|letter|legal|auto|automatic)\b", "", text)
         text = re.sub(r"(?i)^\s*(a5|a4|a3|letter|legal|auto|automatic)\s*$", "", text)
 
-    # Global print font controls. These are handled before Gemini so a request such as
+    # Global print font controls. These are handled before Groq AI so a request such as
     # "make the font Liberation Serif Bold" changes the actual print renderer, not the
     # itinerary data.
     font_match = None
@@ -1899,7 +1907,7 @@ async def reply_reference_edit(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Smart Make Changes button: once a reference is selected, the next natural-language
     # message is treated as the edit instruction even if the owner does not use Telegram's
-    # Reply action. This is intentionally open-ended; Gemini handles arbitrary changes.
+    # Reply action. This is intentionally open-ended; Groq AI handles arbitrary changes.
     active_reference = context.user_data.get("editing_reference")
     if active_reference:
         # V160: once Modify & Regenerate/Voice-Text Edit is tapped, the next text
@@ -2007,7 +2015,7 @@ async def _begin_edit(update, context, reference):
         f"• `Detailed WhatsApp` → get only the detailed WhatsApp version.\n"
         f"• `Detailed draft` → return to an editable detailed draft first.\n\n"
         f"For Tour costing, tell me the final customer rate naturally - there is no separate markup system. "
-        f"Gemini will understand the intent, preserve the rest, and regenerate the PDF.",
+        f"Groq AI will understand the intent, preserve the rest, and regenerate the PDF.",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
 
@@ -2015,7 +2023,7 @@ async def _begin_edit(update, context, reference):
 def _package_edit_is_cost_only(instruction, parsed_rates=None):
     """True when a Modify & Regenerate reply contains only customer costing.
 
-    Keep cost-only edits local so Gemini cannot rebuild the tour and drop the
+    Keep cost-only edits local so Groq AI cannot rebuild the tour and drop the
     owner's Adult/CWB/CNB/EB selling rates before PDF rendering.
     """
     raw=str(instruction or '').strip()
@@ -2038,7 +2046,7 @@ def _package_edit_is_cost_only(instruction, parsed_rates=None):
 def _hotel_edit_is_cost_only(instruction, hotel_cost=None):
     """True when a Hotel Voice/Text edit contains only customer room costing.
 
-    Explicit room/EB/total amounts do not need Gemini; they can be applied directly
+    Explicit room/EB/total amounts do not need Groq AI; they can be applied directly
     to the structured Hotel cost box and regenerated reliably.
     """
     raw=str(instruction or '').strip()
@@ -2089,13 +2097,13 @@ async def perform_saved_edit(update, context, instruction):
             shutil.copy2(source_pdf, temp_pdf)
             part = [{"path": str(temp_pdf), "mime_type": "application/pdf"}]
             if doc_type == "package":
-                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_itinerary_from_parts, part, "", GEMINI_API_KEY, GEMINI_MODEL), status=status)
+                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_itinerary_from_parts, part, "", AI_API_KEY, AI_MODEL), status=status)
             elif doc_type == "flight":
-                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_flight_ticket, part, "", GEMINI_API_KEY, GEMINI_MODEL), status=status)
+                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_flight_ticket, part, "", AI_API_KEY, AI_MODEL), status=status)
             elif doc_type == "bus":
-                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_bus_ticket, part, "", GEMINI_API_KEY, GEMINI_MODEL), status=status)
+                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_bus_ticket, part, "", AI_API_KEY, AI_MODEL), status=status)
             elif doc_type == "hotel":
-                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_hotel_voucher, part, "", GEMINI_API_KEY, GEMINI_MODEL), status=status)
+                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_hotel_voucher, part, "", AI_API_KEY, AI_MODEL), status=status)
             else:
                 raise RuntimeError(f"Unsupported legacy document type: {doc_type}")
             if old_fare is None and doc_type in ("flight", "bus", "hotel"):
@@ -2138,7 +2146,7 @@ async def perform_saved_edit(update, context, instruction):
         package_pdf = bool(doc_type == "package" and re.search(r"\b(?:pdf|print)\b", instruction, re.I))
 
         # Cost-only Hotel edits are deterministic/local. A direct room/EB/total
-        # change does not need Gemini and immediately updates the structured Hotel cost box.
+        # change does not need Groq AI and immediately updates the structured Hotel cost box.
         if doc_type == 'hotel' and hotel_cost_only and hotel_cost_update:
             new_data = copy.deepcopy(old_data or {})
             new_data['customer_hotel_cost'] = hotel_cost_update
@@ -2156,7 +2164,7 @@ async def perform_saved_edit(update, context, instruction):
         elif requested_detail:
             new_data = await _run_ai_with_retry_status(
                 update.message,
-                lambda: asyncio.to_thread(enhance_package_itinerary, old_data, GEMINI_API_KEY, GEMINI_MODEL, requested_detail),
+                lambda: asyncio.to_thread(enhance_package_itinerary, old_data, AI_API_KEY, AI_MODEL, requested_detail),
                 status=status,
             )
             new_data["client_name"] = old_data.get("client_name", "")
@@ -2165,7 +2173,7 @@ async def perform_saved_edit(update, context, instruction):
         elif remaining:
             new_data, ai_fare = await _run_ai_with_retry_status(
                 update.message,
-                lambda: asyncio.to_thread(apply_edit, doc_type, old_data, remaining, GEMINI_API_KEY, GEMINI_MODEL, old_fare),
+                lambda: asyncio.to_thread(apply_edit, doc_type, old_data, remaining, AI_API_KEY, AI_MODEL, old_fare),
                 status=status,
             )
             if ai_fare is not None:
@@ -2181,11 +2189,11 @@ async def perform_saved_edit(update, context, instruction):
             # Keep supplier fare data untouched; the Hotel renderer reads customer_hotel_cost.
         if doc_type == 'package' and package_rates:
             # Explicit numeric rates are owner-authored customer selling rates. Re-apply
-            # them after Gemini so a mixed edit can never erase Adult/CWB/CNB/EB values.
+            # them after Groq AI so a mixed edit can never erase Adult/CWB/CNB/EB values.
             new_data = _tour_v2_apply_costs(new_data, package_rates)
             new_data['show_cost'] = True
         elif doc_type == 'package':
-            # If the local parser did not understand the wording, trust Gemini's semantic
+            # If the local parser did not understand the wording, trust Groq AI's semantic
             # edit and reconcile only the rate fields that actually changed. This handles
             # normal/Hinglish voice phrasing without introducing a markup workflow.
             new_data, ai_package_rates = _tour_reconcile_ai_customer_costs(old_data,new_data,instruction)
@@ -2346,7 +2354,7 @@ async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await tg_file.download_to_drive(path)
             transcript=await _run_ai_with_retry_status(
                 msg,
-                lambda: asyncio.to_thread(transcribe_voice_note, path, GEMINI_API_KEY, GEMINI_MODEL, msg.voice.mime_type or 'audio/ogg'),
+                lambda: asyncio.to_thread(transcribe_voice_note, path, AI_API_KEY, AI_MODEL, msg.voice.mime_type or 'audio/ogg'),
                 status=status,
             )
             await safe_status_edit(status,msg,'✅ *Voice note understood.* Applying it to this draft...',parse_mode='Markdown')
@@ -2375,7 +2383,7 @@ async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await tg_file.download_to_drive(path)
             transcript=await _run_ai_with_retry_status(
                 msg,
-                lambda: asyncio.to_thread(transcribe_voice_note, path, GEMINI_API_KEY, GEMINI_MODEL, msg.voice.mime_type or 'audio/ogg'),
+                lambda: asyncio.to_thread(transcribe_voice_note, path, AI_API_KEY, AI_MODEL, msg.voice.mime_type or 'audio/ogg'),
                 status=status,
             )
             await safe_status_edit(status,msg,'✅ *Voice note understood.*\n\nApplying the changes now...',parse_mode='Markdown')
@@ -2407,7 +2415,7 @@ async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await tg_file.download_to_drive(path)
             transcript=await _run_ai_with_retry_status(
                 msg,
-                lambda: asyncio.to_thread(transcribe_voice_note, path, GEMINI_API_KEY, GEMINI_MODEL, msg.voice.mime_type or 'audio/ogg'),
+                lambda: asyncio.to_thread(transcribe_voice_note, path, AI_API_KEY, AI_MODEL, msg.voice.mime_type or 'audio/ogg'),
                 status=status,
             )
             context.user_data['smart_text']=(context.user_data.get('smart_text','')+'\n'+transcript).strip()
@@ -2824,7 +2832,7 @@ async def _process_pending_tour_transit(message, context):
     status=await message.reply_text("✈️ *Reading all transit files...*\n\nCombining PDFs, screenshots and text and detecting all sectors.",
                                     parse_mode="Markdown")
     try:
-        result=await _run_with_progress(status, message, lambda: asyncio.to_thread(extract_transit_from_parts, parts, text, GEMINI_API_KEY, GEMINI_MODEL), ['✈️ Reading transit sectors and terminals...','🔎 Checking connecting flight details...'], 25, 92)
+        result=await _run_with_progress(status, message, lambda: asyncio.to_thread(extract_transit_from_parts, parts, text, AI_API_KEY, AI_MODEL), ['✈️ Reading transit sectors and terminals...','🔎 Checking connecting flight details...'], 25, 92)
         rows=result.get("transit") or []
         data=context.user_data.get("itinerary") or {}
         if rows:
@@ -3018,7 +3026,7 @@ async def process_bus_ticket(update, context):
         )
     try:
         parts=[{'path':p,'mime_type':'application/pdf' if p.lower().endswith('.pdf') else 'image/jpeg'} for p in files]
-        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_bus_ticket,parts,txt,GEMINI_API_KEY,GEMINI_MODEL), ['🚌 Reading bus booking pages...','🔍 Extracting passenger, PNR, route and fare...'], 25, 92)
+        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_bus_ticket,parts,txt,AI_API_KEY,AI_MODEL), ['🚌 Reading bus booking pages...','🔍 Extracting passenger, PNR, route and fare...'], 25, 92)
         context.user_data['pending_bus_data']=data
         supplier_total=_supplier_total(data)
         context.user_data['pending_bus_fare']=None
@@ -3148,7 +3156,7 @@ async def process_flight_ticket(update, context):
         )
     try:
         parts=[{'path':p,'mime_type':'application/pdf' if p.lower().endswith('.pdf') else 'image/jpeg'} for p in files]
-        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_flight_ticket,parts,txt,GEMINI_API_KEY,GEMINI_MODEL), ['✈️ Reading flight booking pages...','🔍 Extracting passenger, PNR, sectors and fare...'], 25, 92)
+        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_flight_ticket,parts,txt,AI_API_KEY,AI_MODEL), ['✈️ Reading flight booking pages...','🔍 Extracting passenger, PNR, sectors and fare...'], 25, 92)
         context.user_data['pending_flight_data']=data
         supplier_total=_supplier_total(data)
         context.user_data['pending_flight_fare']=None
@@ -3353,8 +3361,8 @@ async def process_hotel_voucher(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END if 'hotel' != 'tour' else None
     context.user_data['_source_processing'] = 'hotel'
     _cancel_source_auto_process(context)
-    if not GEMINI_API_KEY:
-        await update.message.reply_text("❌ GEMINI_API_KEY is not configured in .env.", reply_markup=main_keyboard())
+    if not AI_API_KEY:
+        await update.message.reply_text("❌ GROQ_API_KEY is not configured in Northflank.", reply_markup=main_keyboard())
         return
     files=context.user_data.get("voucher_files", [])
     source_text=context.user_data.get("voucher_text", "")
@@ -3383,7 +3391,7 @@ async def process_hotel_voucher(update: Update, context: ContextTypes.DEFAULT_TY
         for f in files:
             mime="application/pdf" if f.lower().endswith(".pdf") else "image/jpeg"
             parts.append({"path":f,"mime_type":mime})
-        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_hotel_voucher, parts, source_text, GEMINI_API_KEY, GEMINI_MODEL), ['🏨 Reading hotel confirmation pages...','🔍 Extracting guest, reservation, rooms and stay details...'], 25, 92)
+        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_hotel_voucher, parts, source_text, AI_API_KEY, AI_MODEL), ['🏨 Reading hotel confirmation pages...','🔍 Extracting guest, reservation, rooms and stay details...'], 25, 92)
         # The extraction is complete and structured data is now self-contained. Clear the
         # source list before fare/costing actions so a delayed callback can never try to
         # reopen a deleted incoming voucher file.
@@ -3631,8 +3639,8 @@ def _looks_like_supplier_material(text):
 
 
 async def smart_process(update, context):
-    if not GEMINI_API_KEY:
-        await update.message.reply_text("❌ GEMINI_API_KEY is not configured in .env.", reply_markup=main_keyboard())
+    if not AI_API_KEY:
+        await update.message.reply_text("❌ GROQ_API_KEY is not configured in Northflank.", reply_markup=main_keyboard())
         return ConversationHandler.END
     text = context.user_data.get("smart_text", "").strip()
     parts = _smart_parts(context)
@@ -3656,9 +3664,9 @@ async def smart_process(update, context):
         if forced_kind in ("flight", "bus", "hotel", "package"):
             result = {"kind": forced_kind, "confidence": 1.0, "reason": f"{forced_kind.title()} mode was selected manually.", "reference": "", "instruction": text}
         elif parts or supplier_text:
-            result = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_classify, parts, text, GEMINI_API_KEY, GEMINI_MODEL), ["🤖 AI is identifying the supplier document type...", "🔎 Reading the supplied material..."], 20, 48)
+            result = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_classify, parts, text, AI_API_KEY, AI_MODEL), ["🤖 AI is identifying the supplier document type...", "🔎 Reading the supplied material..."], 20, 48)
         else:
-            # V168: deterministic no-prefix routing before Gemini planning.
+            # V168: deterministic no-prefix routing before Groq AI planning.
             # This prevents natural Tour briefs such as "Goa 4N/5D..." from being
             # incorrectly redirected to Tour Guide, while MTB edits still win.
             direct_ref, direct_instruction = _smart_mtb_edit_request(text)
@@ -3675,7 +3683,7 @@ async def smart_process(update, context):
                     "reference": "", "instruction": text,
                 }
             else:
-                plan = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(agent_plan, text, text, GEMINI_API_KEY, GEMINI_MODEL), ["🧠 AI is understanding what you want...", "🧭 Selecting the correct MyTourBazar workflow..."], 10, 30)
+                plan = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(agent_plan, text, text, AI_API_KEY, AI_MODEL), ["🧠 AI is understanding what you want...", "🧭 Selecting the correct MyTourBazar workflow..."], 10, 30)
                 action = str(plan.get("action", "ask_user"))
                 if action == "edit_document" and plan.get("reference"):
                     result = {"kind":"edit", "confidence":0.99, "reason":plan.get("reason","Existing document change requested."), "reference":plan.get("reference",""), "instruction":plan.get("instruction") or text}
@@ -3712,13 +3720,13 @@ async def smart_process(update, context):
             return ConversationHandler.END
 
         if kind == "chat":
-            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text, GEMINI_API_KEY, GEMINI_MODEL), ['💬 AI is preparing your reply...'], 60, 92)
+            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text, AI_API_KEY, AI_MODEL), ['💬 AI is preparing your reply...'], 60, 92)
             await safe_status_edit(status, update.message, answer or "I’m ready. Tell me what you want me to do.", parse_mode=None)
             await update.message.reply_text("Send another request or supplier document.", reply_markup=main_keyboard())
             return ConversationHandler.END
 
         if kind == "unknown" or conf < 0.45:
-            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text or "I sent a supplier document but its type could not be identified.", GEMINI_API_KEY, GEMINI_MODEL), ['💬 AI is reviewing what you sent...'], 60, 92)
+            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text or "I sent a supplier document but its type could not be identified.", AI_API_KEY, AI_MODEL), ['💬 AI is reviewing what you sent...'], 60, 92)
             await safe_status_edit(status, update.message, "🤔 *I need a little more information.*\n\n" + (answer or "Please tell me whether this is a tour, flight, bus or hotel document."))
             await update.message.reply_text("You can send another file/text or use a print button.", reply_markup=main_keyboard())
             return ConversationHandler.END
@@ -3757,8 +3765,8 @@ async def smart_process(update, context):
                     lambda: asyncio.to_thread(
                         generate_package_from_brief,
                         smart_text_value,
-                        GEMINI_API_KEY,
-                        GEMINI_MODEL,
+                        AI_API_KEY,
+                        AI_MODEL,
                         requested_detail,
                     ),
                     [
@@ -3837,7 +3845,7 @@ async def smart_process(update, context):
 
         if kind == "flight":
             files = [str(x) for x in context.user_data.get("smart_files", [])]
-            data = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_flight_ticket, _smart_parts(context), text, GEMINI_API_KEY, GEMINI_MODEL), ["✈️ Reading passenger, PNR and flight sectors...", "🔍 Extracting airport, terminal and duration details..."], 60, 92)
+            data = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_flight_ticket, _smart_parts(context), text, AI_API_KEY, AI_MODEL), ["✈️ Reading passenger, PNR and flight sectors...", "🔍 Extracting airport, terminal and duration details..."], 60, 92)
             context.user_data.clear()
             context.user_data["_source_status_message"] = status
             context.user_data["pending_flight_data"] = data
@@ -3850,7 +3858,7 @@ async def smart_process(update, context):
             return ConversationHandler.END
 
         if kind == "bus":
-            data = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_bus_ticket, _smart_parts(context), text, GEMINI_API_KEY, GEMINI_MODEL), ["🚌 Reading passenger, PNR and route details...", "🔍 Extracting fare and journey details..."], 60, 92)
+            data = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_bus_ticket, _smart_parts(context), text, AI_API_KEY, AI_MODEL), ["🚌 Reading passenger, PNR and route details...", "🔍 Extracting fare and journey details..."], 60, 92)
             context.user_data.clear()
             context.user_data["_source_status_message"] = status
             context.user_data["pending_bus_data"] = data
@@ -3946,8 +3954,8 @@ async def smart_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.voice:
         return SMART_INPUT
-    if not GEMINI_API_KEY:
-        await msg.reply_text("❌ GEMINI_API_KEY is not configured.", reply_markup=main_keyboard())
+    if not AI_API_KEY:
+        await msg.reply_text("❌ GROQ_API_KEY is not configured in Northflank.", reply_markup=main_keyboard())
         return ConversationHandler.END
 
     tg_file = await context.bot.get_file(msg.voice.file_id)
@@ -3963,8 +3971,8 @@ async def smart_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lambda: asyncio.to_thread(
                 transcribe_voice_note,
                 path,
-                GEMINI_API_KEY,
-                GEMINI_MODEL,
+                AI_API_KEY,
+                AI_MODEL,
                 msg.voice.mime_type or "audio/ogg",
             ),
             status=status,
@@ -4214,7 +4222,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✍️ *Enter the flight / train details in text.*\n\n"
             "You can paste onward and return details together or send them one by one. "
-            "You do not need to format them perfectly — Gemini will read and organize the details automatically.\n\n"
+            "You do not need to format them perfectly — Groq AI will read and organize the details automatically.\n\n"
             "Example:\n`01 Oct: IndiGo 6E-594 Raipur → Mumbai 09:30 AM – 11:25 AM\n"
             "01 Oct: IndiGo 6E-273 Mumbai → Rajkot 01:10 PM – 03:50 PM\n"
             "05 Oct: IndiGo 6E-233 Rajkot → Mumbai 09:15 AM – 11:05 AM\n"
@@ -4377,7 +4385,7 @@ async def receive_guest_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"👤 Guest name saved: *{guest_name}*\n\n"
         "Now send *everything you have* — supplier PDF, supplier text, screenshots, hotel details, "
         "or flight screenshots.\n\n"
-        "You do NOT need to tell me what each file is. Gemini will identify it automatically.\n\n"
+        "You do NOT need to tell me what each file is. Groq AI will identify it automatically.\n\n"
         "When you have finished sending all material, tap *✅ Done*.",
         parse_mode="Markdown",
         reply_markup=source_keyboard(),
@@ -4540,7 +4548,7 @@ async def continue_tour_preprint_options(message, context, data):
 async def _run_with_progress(status, chat_message, work, labels, start_pct=30, end_pct=58):
     """Run AI/supplier work with one live status message.
 
-    Gemini 503/high-demand errors are retried inside the extractor before temporary
+    Groq AI 503/high-demand errors are retried inside the extractor before temporary
     source files are cleaned up. A contextvar notifier lets this loop temporarily
     replace the normal progress animation with a visible retry countdown.
     """
@@ -4589,11 +4597,11 @@ async def _run_with_progress(status, chat_message, work, labels, start_pct=30, e
         reset_retry_notifier(token)
 
 async def _run_ai_with_retry_status(chat_message, work, status=None):
-    """Run an AI task and only take over the UI if Gemini reports high demand.
+    """Run an AI task and only take over the UI if Groq AI reports high demand.
 
     This is used for edit/detail operations that already have their own status text.
     It preserves that normal text, but on a 503 it shows a live retry countdown and
-    keeps waiting until the underlying Gemini call succeeds.
+    keeps waiting until the underlying Groq AI call succeeds.
     """
     retry_state = {"attempt": 0, "until": 0.0}
 
@@ -4884,14 +4892,14 @@ def _tour_core_draft_signature(raw):
     """Return the non-cost/non-transit core of an editable Tour draft.
 
     This lets a resent full draft print locally when the owner only changed costing,
-    transit or PRINT TYPE/DETAIL. Hotel/day-plan edits still fall through to Gemini.
+    transit or PRINT TYPE/DETAIL. Hotel/day-plan edits still fall through to Groq AI.
     """
     s=str(raw or '')
     marker=re.search(r'(?i)AI-completed itinerary draft\s*:',s)
     if marker:
         s=s[marker.start():]
     # Journey and costing are parsed deterministically elsewhere, so exclude them
-    # from the core-comparison used to decide whether Gemini is necessary.
+    # from the core-comparison used to decide whether Groq AI is necessary.
     s=re.sub(r'(?is)\*?Journey\s*/\s*Transit\s*:\*?.*?(?=\n\s*\*?Package\s+Cost\s*:\*?|\Z)','',s)
     s=re.sub(r'(?is)\*?Package\s+Cost\s*:\*?.*?(?=\n\s*Edit this final draft|\Z)','',s)
     s=re.sub(r'(?is)\n\s*Edit this final draft.*$','',s)
@@ -4904,7 +4912,7 @@ def _tour_core_draft_signature(raw):
 
 def _tour_reply_is_simple_cost_transit_patch(raw):
     """True when the owner reply only changes costing/transit/print controls.
-    Such replies should never invoke Gemini or rebuild the draft.
+    Such replies should never invoke Groq AI or rebuild the draft.
     """
     s=str(raw or '')
     # Full draft markers imply there may be hotel/day edits that need the smart editor.
@@ -4917,7 +4925,7 @@ def _tour_reply_is_simple_cost_transit_patch(raw):
 async def _tour_v2_process_edited_final(message, context, edited_text):
     """Apply the owner's final Tour reply and print directly.
 
-    Simple costing/transit replies are processed entirely locally. Gemini is used
+    Simple costing/transit replies are processed entirely locally. Groq AI is used
     only when the owner actually edits hotels, day plans or other free-form draft data.
     """
     current=copy.deepcopy(context.user_data.get('itinerary') or {})
@@ -4956,7 +4964,7 @@ async def _tour_v2_process_edited_final(message, context, edited_text):
 
         # 2) Natural Transit reply. No prefix, colon, pipe or template is required.
         # If the owner says Onward/Return/Connection (or otherwise clearly talks about
-        # a journey), Gemini gets the raw reply and extracts every real sector.
+        # a journey), Groq AI gets the raw reply and extracts every real sector.
         local_transit=[]
         transit_changed=False
         clear_transit=bool(re.search(r'(?i)\b(?:no\s+transit|no\s+journey|skip\s+transit|done\s+by\s+self)\b',raw))
@@ -4967,7 +4975,7 @@ async def _tour_v2_process_edited_final(message, context, edited_text):
             transit_changed=True
         elif transit_signal:
             # A copied final draft already has a clean Journey / Transit block. Parse
-            # that block locally so resending the draft does not need another Gemini
+            # that block locally so resending the draft does not need another Groq AI
             # call. Free-form line-by-line shorthand still uses the smart AI parser.
             local_backup=_tour_patch_transit_from_text(raw,data.get('transit'))
             structured_transit_block=bool(re.search(r'(?i)Journey\s*/\s*Transit\s*:',raw))
@@ -4978,7 +4986,7 @@ async def _tour_v2_process_edited_final(message, context, edited_text):
                     await safe_status_edit(status,message,'🧠 *Understanding your journey reply...*\n\n██████░░░░░░░░░░ 38%\n\nReading the line-by-line travel sectors...',parse_mode='Markdown')
                     parsed=await _run_ai_with_retry_status(
                         message,
-                        lambda: asyncio.to_thread(extract_transit_from_parts,[],raw,GEMINI_API_KEY,GEMINI_MODEL),
+                        lambda: asyncio.to_thread(extract_transit_from_parts,[],raw,AI_API_KEY,AI_MODEL),
                         status=status)
                     local_transit=list((parsed or {}).get('transit') or [])
                 except Exception:
@@ -4993,7 +5001,7 @@ async def _tour_v2_process_edited_final(message, context, edited_text):
 
         # 3) Only call the general Tour editor for real hotel/day-plan/content edits.
         # If the owner resent the full draft but only changed costing/transit/controls,
-        # compare the non-cost/non-transit core and print locally without Gemini.
+        # compare the non-cost/non-transit core and print locally without Groq AI.
         core_unchanged = (_tour_core_draft_signature(raw) == _tour_core_draft_signature(build_confirmation(current)))
         simple_final_patch = _tour_reply_is_simple_cost_transit_patch(raw) or core_unchanged
         if not simple_final_patch:
@@ -5007,7 +5015,7 @@ async def _tour_v2_process_edited_final(message, context, edited_text):
             )
             updated,_=await _run_ai_with_retry_status(
                 message,
-                lambda: asyncio.to_thread(apply_edit,'package',data,instruction,GEMINI_API_KEY,GEMINI_MODEL,None),
+                lambda: asyncio.to_thread(apply_edit,'package',data,instruction,AI_API_KEY,AI_MODEL,None),
                 status=status)
             ai_data=_normalize_guest_counts(updated or data)
             # Re-apply deterministic owner-entered costing/transit after AI so AI can never erase them.
@@ -5050,7 +5058,7 @@ async def _tour_v2_process_edited_final(message, context, edited_text):
             saved_show=bool(data.get('show_cost'))
             saved_transit=copy.deepcopy(data.get('transit'))
             data=await _run_ai_with_retry_status(
-                message,lambda: asyncio.to_thread(enhance_package_itinerary,data,GEMINI_API_KEY,GEMINI_MODEL,'detailed'),status=status)
+                message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,'detailed'),status=status)
             data['client_name']=old_name or str(data.get('client_name') or '')
             if saved_costs:
                 data['package_costs']=saved_costs; data['show_cost']=saved_show
@@ -5105,7 +5113,7 @@ async def _tour_v2_apply_missing_reply(message, context, reply_text):
         "Apply these facts to the appropriate hotel rows. Do not change unrelated itinerary facts. "
         f"Missing fields were: {', '.join(missing)}. User reply: {reply_text}"
     )
-    updated,_=await _run_ai_with_retry_status(message, lambda: asyncio.to_thread(apply_edit,"package",data,instruction,GEMINI_API_KEY,GEMINI_MODEL,None), status=status)
+    updated,_=await _run_ai_with_retry_status(message, lambda: asyncio.to_thread(apply_edit,"package",data,instruction,AI_API_KEY,AI_MODEL,None), status=status)
     context.user_data["itinerary"]=_normalize_guest_counts(updated or data)
     context.user_data.pop("tour_v2_missing",None)
     await safe_status_edit(status,message,"✅ Missing details added to the draft.")
@@ -5126,7 +5134,7 @@ async def _tour_v2_extract_journey(message, context, stage, file_path=None, sour
         if not rows:
             used_ai=True
             await safe_status_edit(status,message,"🤖 Local parser could not confidently read this source. Using AI fallback once...")
-            result=await _run_with_progress(status,message,lambda: asyncio.to_thread(extract_transit_from_parts,parts,source_text,GEMINI_API_KEY,GEMINI_MODEL),["✈️ Extracting sectors, airports, terminals and timings...","🔎 Organizing journey details..."],25,92)
+            result=await _run_with_progress(status,message,lambda: asyncio.to_thread(extract_transit_from_parts,parts,source_text,AI_API_KEY,AI_MODEL),["✈️ Extracting sectors, airports, terminals and timings...","🔎 Organizing journey details..."],25,92)
             rows=result.get("transit") or []
         else:
             for q in paths:
@@ -5318,7 +5326,7 @@ async def _process_post_generated_transit_text(message, context, source_text):
             await safe_status_edit(status,message,"🤖 Understanding your short / mixed transit reply...")
             result=await _run_ai_with_retry_status(
                 message,
-                lambda: asyncio.to_thread(extract_transit_from_parts,[],source_text,GEMINI_API_KEY,GEMINI_MODEL),
+                lambda: asyncio.to_thread(extract_transit_from_parts,[],source_text,AI_API_KEY,AI_MODEL),
                 status=status)
             ai_rows=result.get("transit") or []
             if ai_rows:
@@ -5504,9 +5512,9 @@ def _tour_v2_apply_costs(data, rates):
 
 
 def _tour_reconcile_ai_customer_costs(old_data, new_data, instruction):
-    """Convert Gemini-understood Tour cost edits into clean customer selling rates.
+    """Convert Groq AI-understood Tour cost edits into clean customer selling rates.
 
-    The old supplier/markup workflow is intentionally not used. When Gemini understands a
+    The old supplier/markup workflow is intentionally not used. When Groq AI understands a
     natural request such as "make adult forty three thousand seven hundred" or a mixed
     hotel+cost edit, only the changed customer rate fields are copied into the cost box.
     """
@@ -5530,7 +5538,7 @@ def _tour_reconcile_ai_customer_costs(old_data, new_data, instruction):
         if nv > 0 and abs(nv-ov) >= 0.5:
             changed[field]=nv
 
-    # Gemini may explicitly enable the customer cost box even when a requested value
+    # Groq AI may explicitly enable the customer cost box even when a requested value
     # happens to equal the supplier value. In that case, preserve all positive rates it
     # returned as customer-authored rates.
     if not changed and bool(new_data.get('show_cost')) and not bool(old_data.get('show_cost')):
@@ -5560,7 +5568,7 @@ async def _tour_v2_finish_selected_output(message, context, cost_text):
     if str(data.get("detail_level") or "basic").lower()!=detail:
         status=await message.reply_text(f"✨ Preparing the {detail} itinerary...")
         old_name=str(data.get("client_name") or "")
-        data=await _run_ai_with_retry_status(message,lambda: asyncio.to_thread(enhance_package_itinerary,data,GEMINI_API_KEY,GEMINI_MODEL,detail),status=status)
+        data=await _run_ai_with_retry_status(message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail),status=status)
         data["client_name"]=old_name or str(data.get("client_name") or "")
         data["detail_level"]=detail
         await safe_status_edit(status,message,"✅ Itinerary detail level ready.")
@@ -5580,9 +5588,9 @@ async def process_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END if 'tour' != 'tour' else None
     context.user_data['_source_processing'] = 'tour'
     _cancel_source_auto_process(context)
-    if not GEMINI_API_KEY:
+    if not AI_API_KEY:
         await update.message.reply_text(
-            "❌ GEMINI_API_KEY is not configured in .env.",
+            "❌ GROQ_API_KEY is not configured in Northflank.",
             reply_markup=main_keyboard()
         )
         return
@@ -5637,7 +5645,7 @@ async def process_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         await progress(30, f"⚡ Local-first preprocessing • {perf_stats.get('local_pdfs',0)} text PDF(s), {perf_stats.get('visual_sources',0)} visual source(s)...")
-        data = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_itinerary_from_parts, parts, text, GEMINI_API_KEY, GEMINI_MODEL), ["🧠 Structuring locally prepared supplier facts...", "📑 Organizing hotels, sightseeing, meals and transport...", "✨ Building the itinerary draft..."], 30, 58)
+        data = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_itinerary_from_parts, parts, text, AI_API_KEY, AI_MODEL), ["🧠 Structuring locally prepared supplier facts...", "📑 Organizing hotels, sightseeing, meals and transport...", "✨ Building the itinerary draft..."], 30, 58)
 
         explicit_guest = str(context.user_data.get("guest_name") or "").strip()
         if explicit_guest:
@@ -5812,8 +5820,8 @@ async def _tour_variant_data(message, data, detail, status=None):
             lambda: asyncio.to_thread(
                 enhance_package_itinerary,
                 old,
-                GEMINI_API_KEY,
-                GEMINI_MODEL,
+                AI_API_KEY,
+                AI_MODEL,
                 desired,
             ),
             status=status,
@@ -6447,11 +6455,11 @@ async def perform_draft_edit(update, context, instruction):
     try:
         requested_detail = _itinerary_detail_command(instruction)
         if requested_detail:
-            new_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(enhance_package_itinerary, old_data, GEMINI_API_KEY, GEMINI_MODEL, requested_detail), status=status)
+            new_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(enhance_package_itinerary, old_data, AI_API_KEY, AI_MODEL, requested_detail), status=status)
             new_data['client_name'] = old_data.get('client_name', '')
             new_data['detail_level'] = requested_detail
         else:
-            new_data, _ = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(apply_edit, 'package', old_data, instruction, GEMINI_API_KEY, GEMINI_MODEL, None), status=status)
+            new_data, _ = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(apply_edit, 'package', old_data, instruction, AI_API_KEY, AI_MODEL, None), status=status)
         new_data = _ensure_supplier_costs(new_data)
         if old_data.get('b2b') or old_data.get('brand_neutral') or context.user_data.get('pending_b2b'):
             new_data = _apply_tour_document_mode_fields(
@@ -6519,7 +6527,7 @@ async def _prepare_tour_pdf_request(message, context, detail, mode):
     if str(data.get('detail_level') or '').lower() != detail:
         old_name = str(data.get('client_name') or '').strip()
         status = await message.reply_text(f'🤖 Preparing the {detail} day plan...')
-        data = await _run_ai_with_retry_status(message, lambda: asyncio.to_thread(enhance_package_itinerary, data, GEMINI_API_KEY, GEMINI_MODEL, detail), status=status)
+        data = await _run_ai_with_retry_status(message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail), status=status)
         data['client_name'] = old_name or str(data.get('client_name') or '').strip()
         data['detail_level'] = detail
         if context.user_data.get('pending_b2b'):
@@ -6853,7 +6861,7 @@ async def regenerate_saved_with_modifications(query, context, reference):
     data=_normalize_guest_counts(dict(old_data))
     detail=pending.get('detail')
     if kind=='package' and detail and str(data.get('detail_level','')).lower()!=detail:
-        data=await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary,data,GEMINI_API_KEY,GEMINI_MODEL,detail))
+        data=await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail))
         data['client_name']=old_data.get('client_name',''); data['detail_level']=detail
     page_size=pending.get('page_size') or record.get('page_size') or 'A4'
     footer_mode=pending.get('footer_mode') or record.get('footer_mode') or _default_footer_mode(kind)
@@ -7072,7 +7080,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             "Paste whatever details you have. No special format is required. You can send onward and return journeys together or in separate messages.\n\n"
             "Example:\n`01 Oct: IndiGo 6E-594 Raipur → Mumbai 09:30 AM – 11:25 AM\n"
             "01 Oct: IndiGo 6E-273 Mumbai → Rajkot 01:10 PM – 03:50 PM`\n\n"
-            "Gemini will extract the operator, flight/train number, route, date, departure and arrival automatically.\n\n"
+            "Groq AI will extract the operator, flight/train number, route, date, departure and arrival automatically.\n\n"
             "When finished, tap *✅ Done*.",
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardMarkup([["✍️ Flight Text"], ["✈️ Flight Screenshot"], ["✅ Done"]], resize_keyboard=True)
@@ -7120,8 +7128,8 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             return
         detail = query.data.split(":", 1)[1]
         try:
-            status = await query.message.reply_text("🤖 Updating the day plans with Gemini...")
-            new_data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, GEMINI_API_KEY, GEMINI_MODEL, detail), status=status)
+            status = await query.message.reply_text("🤖 Updating the day plans with Groq AI...")
+            new_data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail), status=status)
             new_data["client_name"] = data.get("client_name", "")
             new_data["detail_level"] = detail
             if data.get('b2b') or data.get('brand_neutral') or context.user_data.get('pending_b2b'):
@@ -7215,7 +7223,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
         if not record:
             await query.message.reply_text('❌ Saved document not found.', reply_markup=main_keyboard()); return
         if record.get('type') == 'package':
-            # V155: one natural-language/voice edit entry for Tour. Gemini can change
+            # V155: one natural-language/voice edit entry for Tour. Groq AI can change
             # hotels/day plans as well as mixed flight/train/bus transit. Costing labels
             # (Adult/CWB/CNB/EB) are preserved locally after the AI edit.
             context.user_data['editing_reference']=reference
@@ -7310,7 +7318,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             return
         try:
             if str(data.get('detail_level','')).lower() != detail:
-                data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, GEMINI_API_KEY, GEMINI_MODEL, detail))
+                data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail))
                 data['client_name'] = context.user_data.get('guest_name') or data.get('client_name','')
                 context.user_data['itinerary'] = data
             await safe_callback_edit(query, '⏳ Generating the final Tour PDF with T&C NON GOOGLE...')
@@ -7443,7 +7451,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             if str(data.get('detail_level') or 'basic').lower()!=detail:
                 status=await query.message.reply_text(f'✨ Preparing the {detail} itinerary...')
                 old_name=str(data.get('client_name') or '')
-                data=await _run_ai_with_retry_status(query.message,lambda: asyncio.to_thread(enhance_package_itinerary,data,GEMINI_API_KEY,GEMINI_MODEL,detail),status=status)
+                data=await _run_ai_with_retry_status(query.message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail),status=status)
                 data['client_name']=old_name or str(data.get('client_name') or '')
                 data['detail_level']=detail
                 await safe_status_edit(status,query.message,f'✅ {detail.title()} day plan ready.')
@@ -7474,7 +7482,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
                 if str(data.get("detail_level") or "basic").lower()!=detail:
                     status=await query.message.reply_text(f"✨ Preparing the {detail} itinerary...")
                     old_name=str(data.get("client_name") or "")
-                    data=await _run_ai_with_retry_status(query.message,lambda: asyncio.to_thread(enhance_package_itinerary,data,GEMINI_API_KEY,GEMINI_MODEL,detail),status=status)
+                    data=await _run_ai_with_retry_status(query.message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail),status=status)
                     data["client_name"]=old_name or str(data.get("client_name") or "")
                     data["detail_level"]=detail
                     await safe_status_edit(status,query.message,"✅ Itinerary detail level ready.")
@@ -7524,7 +7532,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
                 return
             if str(data.get("detail_level", "")).lower() != detail:
                 old_name = str(data.get('client_name') or '').strip()
-                data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, GEMINI_API_KEY, GEMINI_MODEL, detail))
+                data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail))
                 data["client_name"] = old_name or str(data.get("client_name") or "").strip()
                 data["detail_level"] = detail
                 if data.get('b2b') or data.get('brand_neutral') or context.user_data.get('pending_b2b'):
@@ -8246,7 +8254,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^❌ Cancel$"), cancel))
     app.add_error_handler(error_handler)
 
-    logger.info("MyTourBazar Gemini multimodal itinerary bot is running.")
+    logger.info("MyTourBazar Groq AI bot is running | model=%s | key_loaded=%s", AI_MODEL, bool(AI_API_KEY))
     app.run_polling()
 
 
