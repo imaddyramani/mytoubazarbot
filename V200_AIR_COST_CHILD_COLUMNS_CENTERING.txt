@@ -1,8 +1,0 @@
-MyTourBazar Bot V200
-
-- Air supplier fare recovery runs even when AI returned partial payment rows.
-- Fare labels with or without INR/Rs/currency symbols are supported.
-- Flattened Base Fare / Taxes / Total tables are recovered locally.
-- Generic Child cost is hidden and excluded when CWB or CNB is used.
-- Generic Child is also suppressed in Tour drafts, WhatsApp output, custom-cost prompts and calculations.
-- Tour cost TOTAL AMOUNT heading and value are centered.

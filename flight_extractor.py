@@ -354,30 +354,39 @@ def _prepare_flight_source(item, work_dir):
         try:
             import fitz
             doc=fitz.open(str(p))
-            keep=[]
-            keywords=(
-                'flight','itinerary','booking','pnr','passenger','ticket','departure','arrival',
-                'origin','destination','sector','fare','tax','airline','e-ticket','eticket','journey'
-            )
-            ignore=('terms and conditions','terms & conditions','conditions of carriage','privacy policy','disclaimer','offers','advertisement')
+            keep=[]; page_text=[]
             for i,page in enumerate(doc):
                 text=(page.get_text('text') or '').lower()
-                score=sum(1 for k in keywords if k in text)
-                if any(k in text for k in ignore):
-                    score-=3
-                if score>=1:
-                    keep.append(i)
-            # IMPORTANT: supplier fares and booking facts may appear on ANY page.
-            # Never truncate to the first few pages. Keep every page so fare recovery,
-            # passenger details, connected sectors and later-page invoices are visible.
-            # Terms/conditions are left in the source PDF and are ignored by the extraction prompt.
-            keep=sorted(set(keep))
-            if not keep:
+                page_text.append(text)
+                score=0
+                score += 6 if re.search(r'\b[A-Z0-9]{2,3}\s*[- ]?\s*\d{2,5}\b',(page.get_text('text') or '')) else 0
+                score += 5 if re.search(r'\b(?:airline\s+pnr|gds\s+pnr|booking\s+(?:id|reference))\b',text) else 0
+                score += 5 if re.search(r'\b(?:passenger|traveller)\s+(?:name|details|information)\b',text) else 0
+                score += 4 if re.search(r'\b(?:fare\s+(?:details|summary|breakup)|payment\s+(?:details|summary)|grand\s+total|total\s+fare|amount\s+payable)\b',text) else 0
+                score += 4 if re.search(r'\b(?:check[- ]?in|checked|cabin|hand)\s+(?:bag|baggage)|\bbaggage\s+allowance\b',text) else 0
+                score += 3 if 'departure' in text and 'arrival' in text else 0
+                score += 2 if re.search(r'\b(?:e-ticket|eticket|flight itinerary|booking confirmation)\b',text) else 0
+                terms=bool(re.search(r'\b(?:terms\s*(?:&|and)\s*conditions|conditions\s+of\s+carriage|privacy\s+policy|disclaimer|cancellation\s+policy)\b',text))
+                core=bool(re.search(r'\b(?:airline\s+pnr|gds\s+pnr|passenger\s+(?:name|details)|fare\s+(?:details|summary)|payment\s+summary)\b',text))
+                if terms and not core: score-=10
+                if score>=4: keep.append(i)
+
+            if len(doc)<=5:
                 keep=list(range(len(doc)))
+            elif keep:
+                # Preserve a text-empty scanned continuation only when it directly
+                # touches a selected booking page; discard unrelated blank scans.
+                selected=set(keep)
+                for i,text in enumerate(page_text):
+                    if not text.strip() and (i-1 in selected or i+1 in selected):
+                        selected.add(i)
+                keep=sorted(selected)
             else:
-                # Include all pages, even pages that look text-empty (scanned/image pages).
-                keep=list(range(len(doc)))
-            out=work_dir/(p.stem+'_all_pages.pdf')
+                # Unknown/scanned long supplier: cap visual work but retain both
+                # beginning and ending pages, where itinerary and fare usually sit.
+                n=len(doc); keep=sorted(set(range(min(4,n))) | set(range(max(0,n-3),n)))
+
+            out=work_dir/(p.stem+'_relevant_pages.pdf')
             newdoc=fitz.open()
             for i in keep:
                 newdoc.insert_pdf(doc,from_page=i,to_page=i)
@@ -431,7 +440,17 @@ def _plain_source_text(file_parts, source_text=''):
             if path.suffix.lower()=='.pdf' and path.exists():
                 import fitz
                 doc=fitz.open(str(path))
-                chunks.extend((page.get_text('text') or '') for page in doc)
+                texts=[page.get_text('text') or '' for page in doc]
+                if len(texts)>5:
+                    useful=[]
+                    for text in texts:
+                        low=text.lower()
+                        core=bool(re.search(r'(?i)\b(?:pnr|passenger|traveller|flight|departure|arrival|baggage|fare|tax|total\s+amount|amount\s+payable|booking\s+id)\b',text))
+                        terms=bool(re.search(r'(?i)\b(?:terms\s*(?:&|and)\s*conditions|privacy\s+policy|conditions\s+of\s+carriage|cancellation\s+policy)\b',text))
+                        if core and (not terms or re.search(r'(?i)\b(?:pnr|passenger\s+name|fare\s+summary|payment\s+summary)\b',text)):
+                            useful.append(text)
+                    texts=useful or texts[:4]+texts[-3:]
+                chunks.extend(texts)
                 doc.close()
         except Exception:
             pass
@@ -2162,11 +2181,15 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         # Always include the original first source for verification.  Selectable
         # text can collapse columns and is not sufficient for passenger/sector rows.
         if file_parts:
+            prep_dir=Path(__file__).resolve().parent/'data'/'tmp_air_fast'
+            prepared_temps=[]
             for item in (file_parts or [])[:3]:
                 try:
-                    p=Path(item.get('path') or '')
+                    prepared,tmp=_prepare_flight_source(item,prep_dir)
+                    if tmp: prepared_temps.append(Path(tmp))
+                    p=Path(prepared.get('path') or '')
                     if p.exists():
-                        contents.append(types.Part.from_bytes(data=p.read_bytes(),mime_type=item.get('mime_type') or ('application/pdf' if p.suffix.lower()=='.pdf' else 'image/jpeg')))
+                        contents.append(types.Part.from_bytes(data=p.read_bytes(),mime_type=prepared.get('mime_type') or ('application/pdf' if p.suffix.lower()=='.pdf' else 'image/jpeg')))
                 except Exception:
                     pass
         try:
@@ -2182,6 +2205,10 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
                 used_ai=True
         except Exception:
             pass
+        finally:
+            for p in locals().get('prepared_temps',[]):
+                try: p.unlink(missing_ok=True)
+                except Exception: pass
 
     # All remaining verification is deterministic/local. No second source-truth,
     # repair, endpoint-verifier or fare-recovery AI calls.

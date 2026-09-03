@@ -1,0 +1,52 @@
+Global airline logo pack / supported naming index
+
+Included logos in this pack:
+- air_india.png
+- air_india_express.png
+- emirates.png
+- etihad_airways.png
+- finnair.png
+- iberia.png
+- indigo.png
+- klm.png
+- lufthansa.png
+- malaysia_airlines.png
+- norwegian.png
+- norse.png
+- qatar_airways.png
+- sas.png
+- singapore_airlines.png
+- spicejet.png
+
+Code already supports these airline codes / suggested filenames:
+6E -> indigo.png
+AI -> air_india.png
+IX -> air_india_express.png
+QP -> akasa_air.png
+SG -> spicejet.png
+UK -> vistara.png
+G8 -> go_first.png
+I5 -> air_asia.png
+EK -> emirates.png
+QR -> qatar_airways.png
+EY -> etihad_airways.png
+GF -> gulf_air.png
+FZ -> flydubai.png
+WY -> oman_air.png
+KU -> kuwait_airways.png
+G9 -> air_arabia.png
+SQ -> singapore_airlines.png
+MH -> malaysia_airlines.png
+TG -> thai_airways.png
+UL -> sri_lankan_airlines.png
+CX -> cathay_pacific.png
+BA -> british_airways.png
+LH -> lufthansa.png
+KL -> klm.png
+AF -> air_france.png
+TK -> turkish_airlines.png
+SV -> saudia.png
+RJ -> royal_jordanian.png
+
+You can add any future missing airline logo using the same filename pattern in this folder.
+If a logo is missing, the bot will automatically use assets/flight_takeoff.png
