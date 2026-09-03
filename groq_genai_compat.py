@@ -402,9 +402,12 @@ def _generate_content(api_key: str, model: str, contents: Any, config: GenerateC
     }
 
     last_error: Exception | None = None
-    for attempt in range(5):
+    max_attempts=max(1,min(3,int(os.getenv("GROQ_MAX_ATTEMPTS","3"))))
+    request_timeout=max(30.0,min(90.0,float(os.getenv("GROQ_REQUEST_TIMEOUT_SECONDS","70"))))
+    for attempt in range(max_attempts):
         try:
-            with httpx.Client(timeout=180.0) as client:
+            timeout=httpx.Timeout(request_timeout,connect=15.0,write=30.0,pool=15.0)
+            with httpx.Client(timeout=timeout) as client:
                 r = client.post(f"{GROQ_BASE_URL}/chat/completions", headers=headers, json=payload)
 
             if r.status_code == 429 or r.status_code >= 500:
@@ -414,7 +417,8 @@ def _generate_content(api_key: str, model: str, contents: Any, config: GenerateC
                     delay = float(retry_after) if retry_after else float(2 ** attempt)
                 except Exception:
                     delay = float(2 ** attempt)
-                time.sleep(min(max(delay, 1), 65))
+                if attempt < max_attempts-1:
+                    time.sleep(min(max(delay, 1), 6))
                 continue
 
             if r.status_code == 413 and "tokens per minute" in r.text.lower():
@@ -441,8 +445,8 @@ def _generate_content(api_key: str, model: str, contents: Any, config: GenerateC
             return _Response(output, raw=raw)
         except Exception as exc:
             last_error = exc
-            if attempt < 4 and not (isinstance(exc, RuntimeError) and "Groq API 4" in str(exc) and "429" not in str(exc)):
-                time.sleep(min(2 ** attempt, 12))
+            if attempt < max_attempts-1 and not (isinstance(exc, RuntimeError) and "Groq API 4" in str(exc) and "429" not in str(exc)):
+                time.sleep(min(2 ** attempt, 5))
                 continue
             raise
 
