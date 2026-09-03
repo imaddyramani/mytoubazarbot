@@ -1,0 +1,8 @@
+MyTourBazar Bot V202
+
+- Long Air PDFs are scanned locally page-by-page before AI verification.
+- Only passenger, PNR, sector, baggage and fare pages are attached to AI.
+- Terms, policies, advertisements and unrelated pages are excluded.
+- Later fare pages and connected/return sectors remain eligible regardless of page number.
+- Short PDFs of five pages or fewer remain intact.
+- Unknown fully scanned long PDFs use a bounded first/last-page safety window.
