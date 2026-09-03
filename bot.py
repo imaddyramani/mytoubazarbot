@@ -6,6 +6,7 @@ from datetime import datetime
 import time
 import shutil
 import copy
+import gc
 import re
 import types
 from urllib.parse import quote
@@ -2491,17 +2492,24 @@ async def _render_ticket_with_automatic_fit(kind, data, fare, logo_path, footer_
         try:
             await asyncio.to_thread(_generate_ticket_base,kind,data,fare,base,logo_path,paper,
                                     text_scale_override=scale,logo_scale_override=logo_scale_override)
+            # WeasyPrint retains sizeable cyclic layout/font objects until a GC
+            # pass. Release them before pypdf loads the generated PDF and creates
+            # watermark/footer overlays, otherwise both memory peaks overlap.
+            await asyncio.to_thread(gc.collect)
             base_pages=_pdf_page_count(base)
             await asyncio.to_thread(add_watermark_to_pdf,base,wm,watermark_enabled,watermark_opacity,watermark_scale)
+            await asyncio.to_thread(gc.collect)
             if footer_mode=='bar': await asyncio.to_thread(add_contact_bar_to_pdf,wm,candidate)
             elif footer_mode=='design': await asyncio.to_thread(add_footer_to_pdf,wm,candidate)
             elif footer_mode=='footer2': await asyncio.to_thread(add_footer2_to_pdf,wm,candidate)
             else: shutil.copyfile(wm,candidate)
+            await asyncio.to_thread(gc.collect)
             final_pages=_pdf_page_count(candidate)
             shutil.move(str(candidate),str(final))
             return base_pages,final_pages
         finally:
             base.unlink(missing_ok=True); wm.unlink(missing_ok=True); candidate.unlink(missing_ok=True)
+            await asyncio.to_thread(gc.collect)
 
     base_pages,final_pages=await render_once(None,'fast1')
     selected_scale=None
