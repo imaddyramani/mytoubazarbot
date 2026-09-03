@@ -412,20 +412,22 @@ def _baggage_signature(value, person=None):
 
 
 def _baggage_html(value, person=None):
-    """Render only canonical type + normalized allowance.
+    """Render baggage icons + allowance only.
 
-    Example:
-      [trolley icon] Adult 15kg
-      [cabin icon]   Adult 7kg
+    Passenger type already appears in the separate Type column, so the baggage cell
+    should only show:
+      [trolley icon] 15kg
+      [cabin icon]   7kg
 
-    No `Passenger`, no `15kg 15kg`, no repeated baggage labels.
+    No `Passenger`, no `Adult`, no `Child`, no `Infant` inside the baggage cell,
+    and no duplicated allowance tokens.
     """
     entries=_normalized_baggage_entries(value,person)
     lines=[]
     for kind,pax_type,allowance in entries:
         lines.append(
             f'<span class="bag-line">{_baggage_icon(kind)}'
-            f'<span>{_esc(pax_type)} {_esc(allowance)}</span></span>'
+            f'<span>{_esc(allowance)}</span></span>'
         )
     return ''.join(lines)
 
@@ -594,19 +596,11 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     pax_table_class="pax has-ancillary" if has_ancillary else "pax"
 
     pax_rows_list=[]
-    seen_baggage_signatures=set()
     for i,p in enumerate(passengers):
         ticket_value=_text(p.get("ticket_number")) if has_real_ticket else _text(data.get("airline_pnr"))
         baggage_value=_text(p.get("baggage")) or baggage_summary
         ancillary_value=_text(p.get("special_ancillary")) or ancillary_summary
-
-        baggage_signature=_baggage_signature(baggage_value,p)
-        if baggage_signature and baggage_signature in seen_baggage_signatures:
-            baggage_html=""
-        else:
-            baggage_html=_baggage_html(baggage_value,p)
-            if baggage_signature:
-                seen_baggage_signatures.add(baggage_signature)
+        baggage_html=_baggage_html(baggage_value,p)
 
         row=(
             f'<tr><td class="pax-index">{i+1}</td>'
