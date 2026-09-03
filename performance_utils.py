@@ -3,6 +3,59 @@ from pathlib import Path
 from datetime import datetime
 import re
 
+
+def extract_image_text(path, max_chars=30000):
+    """Local OCR for screenshots; never calls an external AI service."""
+    try:
+        import pytesseract
+        from PIL import Image, ImageOps
+        image=Image.open(path)
+        image=ImageOps.exif_transpose(image).convert('L')
+        if max(image.size)>2400:
+            image.thumbnail((2400,2400))
+        return (pytesseract.image_to_string(image,config='--psm 6') or '')[:max_chars]
+    except Exception:
+        return ''
+
+
+def extract_pdf_text_with_local_ocr(path,max_chars=60000,max_ocr_pages=7):
+    """Use embedded text first; OCR a bounded first/last page set only if scanned."""
+    text=extract_pdf_text(path,max_chars)
+    if len(re.sub(r'\s+',' ',text).strip())>=120:
+        return text[:max_chars]
+    try:
+        import fitz, pytesseract
+        from PIL import Image
+        doc=fitz.open(str(path)); n=len(doc)
+        indices=list(range(min(4,n)))
+        if n>4:
+            indices += list(range(max(4,n-3),n))
+        chunks=[]
+        for i in list(dict.fromkeys(indices))[:max_ocr_pages]:
+            pix=doc[i].get_pixmap(matrix=fitz.Matrix(1.7,1.7),alpha=False)
+            image=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
+            chunks.append(pytesseract.image_to_string(image,config='--psm 6') or '')
+            if sum(len(x) for x in chunks)>=max_chars: break
+        doc.close()
+        return '\n'.join(chunks)[:max_chars]
+    except Exception:
+        return text[:max_chars]
+
+
+def collect_local_document_text(file_parts,source_text='',max_chars=60000):
+    """Collect PDF/image facts locally for Air, Bus and Hotel workflows."""
+    chunks=[str(source_text or '')]
+    for item in file_parts or []:
+        path=Path(item.get('path') or '')
+        if not path.exists(): continue
+        if path.suffix.lower()=='.pdf':
+            value=extract_pdf_text_with_local_ocr(path,max_chars=max_chars)
+        else:
+            value=extract_image_text(path,max_chars=max_chars)
+        if value: chunks.append(value)
+        if sum(len(x) for x in chunks)>=max_chars: break
+    return '\n\n'.join(chunks)[:max_chars]
+
 try:
     from pypdf import PdfReader
 except Exception:
