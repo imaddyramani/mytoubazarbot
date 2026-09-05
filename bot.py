@@ -2466,7 +2466,7 @@ def source_keyboard():
     )
 
 
-async def _render_ticket_with_automatic_fit(kind, data, fare, logo_path, footer_mode, clean=False, requested_size="auto", logo_scale_override=None):
+async def _render_ticket_with_automatic_fit(kind, data, fare, logo_path, footer_mode, clean=False, requested_size="auto", logo_scale_override=None, progress=None):
     """Fast Air/Bus/Hotel renderer.
 
     V127 removes the old A4/Legal/Letter x five-scale trial loop. Normal printing now
@@ -2490,6 +2490,7 @@ async def _render_ticket_with_automatic_fit(kind, data, fare, logo_path, footer_
         wm=GENERATED_DIR / f"_{suffix}_{kind}_{filename}_wm.pdf"
         candidate=GENERATED_DIR / f"_{suffix}_{kind}_{filename}_final.pdf"
         try:
+            if progress: await progress('Rendering PDF' if scale is None else 'Adjusting PDF layout')
             await asyncio.to_thread(_generate_ticket_base,kind,data,fare,base,logo_path,paper,
                                     text_scale_override=scale,logo_scale_override=logo_scale_override)
             # WeasyPrint retains sizeable cyclic layout/font objects until a GC
@@ -2497,8 +2498,10 @@ async def _render_ticket_with_automatic_fit(kind, data, fare, logo_path, footer_
             # watermark/footer overlays, otherwise both memory peaks overlap.
             await asyncio.to_thread(gc.collect)
             base_pages=_pdf_page_count(base)
+            if progress: await progress('Adding watermark')
             await asyncio.to_thread(add_watermark_to_pdf,base,wm,watermark_enabled,watermark_opacity,watermark_scale)
             await asyncio.to_thread(gc.collect)
+            if progress: await progress('Adding footer and links')
             if footer_mode=='bar': await asyncio.to_thread(add_contact_bar_to_pdf,wm,candidate)
             elif footer_mode=='design': await asyncio.to_thread(add_footer_to_pdf,wm,candidate)
             elif footer_mode=='footer2': await asyncio.to_thread(add_footer2_to_pdf,wm,candidate)
@@ -2521,7 +2524,7 @@ async def _render_ticket_with_automatic_fit(kind, data, fare, logo_path, footer_
     return final,paper,selected_scale
 
 
-async def _print_ticket_final(message, context, kind, footer_mode="none", clean=False, add_footer=False):
+async def _print_ticket_final(message, context, kind, footer_mode="none", clean=False, add_footer=False, progress=None):
     """Generate Air/Bus/Hotel with automatic footer-aware fitting.
 
     The automatic fit is part of normal generation, not a button-only feature.
@@ -2552,7 +2555,7 @@ async def _print_ticket_final(message, context, kind, footer_mode="none", clean=
 
     pdf_path, chosen_size, selected_scale = await _render_ticket_with_automatic_fit(
         kind, data, fare, logo_path, footer_mode, clean=clean,
-        requested_size=page_size, logo_scale_override=logo_scale_override
+        requested_size=page_size, logo_scale_override=logo_scale_override, progress=progress
     )
 
     # Reopen the final PDF only after footer placement so the reference record reflects
@@ -2577,6 +2580,7 @@ async def _print_ticket_final(message, context, kind, footer_mode="none", clean=
     else:
         caption_detail = (f"Hotel Total: INR {fare:,.0f}" if fare else "")
 
+    if progress: await progress('Saving completed PDF')
     reference = create_reference()
     save_record(reference, {
         "type": kind,
@@ -2590,6 +2594,7 @@ async def _print_ticket_final(message, context, kind, footer_mode="none", clean=
         "page_size": chosen_size,
         "text_scale": selected_scale,
     })
+    if progress: await progress('Sending PDF to Telegram')
     with open(pdf_path, "rb") as fh:
         sent_pdf = await message.reply_document(
             fh,
@@ -2608,8 +2613,9 @@ async def _print_ticket_final(message, context, kind, footer_mode="none", clean=
     await message.reply_text("✅ Ready for the next request.", reply_markup=ready_keyboard())
 
 def _cancel_auto_print(context):
+    context.user_data.pop("_auto_print_token", None)
     task = context.user_data.pop("_auto_print_task", None)
-    if task and not task.done():
+    if task and task is not asyncio.current_task() and not task.done():
         task.cancel()
 
 
@@ -2656,6 +2662,28 @@ async def _auto_print_after_countdown(message, context, kind, supplier_total, pr
     """
     token = object()
     context.user_data["_auto_print_token"] = token
+    stage = 'Fare countdown'
+
+    async def progress(label):
+        nonlocal stage
+        stage = label
+        logger.info('AUTO_PRINT_STAGE kind=%s stage=%s', kind, label)
+        # Status transport must not prevent rendering from starting.
+        try:
+            await asyncio.wait_for(_safe_message_text_edit(
+                prompt_message, f'⏳ {label}...', reply_markup=None), timeout=8)
+        except Exception:
+            logger.warning('Auto-print status update unavailable')
+
+    async def finish(text):
+        try:
+            edited = await asyncio.wait_for(
+                _safe_message_text_edit(prompt_message, text, reply_markup=None), timeout=8)
+        except Exception:
+            edited = False
+        if not edited:
+            await message.reply_text(text)
+
     try:
         for remaining in range(AUTO_PRINT_SECONDS, 0, -1):
             if context.user_data.get("_auto_print_token") is not token:
@@ -2671,32 +2699,25 @@ async def _auto_print_after_countdown(message, context, kind, supplier_total, pr
             await asyncio.sleep(1)
         if context.user_data.get("_auto_print_token") is not token:
             return
-        context.user_data.pop("_auto_print_task", None)
-        context.user_data.pop("_auto_print_token", None)
         fare_key = f"pending_{kind}_fare"
         context.user_data[fare_key] = supplier_total if supplier_total > 0 else None
         context.user_data["pending_fare_kind"] = None
         context.user_data["pending_footer_kind"] = kind
         footer_mode = _default_footer_mode(kind)
-        await _safe_message_text_edit(
-            prompt_message,
-            "⏳ 5 seconds elapsed. Completing the print automatically...",
-            reply_markup=None,
-        )
+        await progress('Starting PDF generation')
         await _print_ticket_final(
             message, context, kind,
             footer_mode=footer_mode,
             clean=(footer_mode == "none"),
+            progress=progress,
         )
+        await finish('✅ PDF generated and sent.')
     except asyncio.CancelledError:
+        await finish(f'Print cancelled during: {stage}.')
         return
     except Exception as exc:
         logger.exception("Automatic 5-second print failed")
-        await _safe_message_text_edit(
-            prompt_message,
-            f"❌ *Automatic print failed.*\n\nReason: `{str(exc)[:800]}`",
-            reply_markup=None,
-        )
+        await finish(f'❌ Automatic print failed during: {stage}.\n\n{str(exc)[:700]}')
     finally:
         if context.user_data.get("_auto_print_token") is token:
             context.user_data.pop("_auto_print_token", None)
