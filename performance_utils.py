@@ -1,115 +1,48 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
-import gc
-import os
 import re
-import io
-import shutil
-import subprocess
-import threading
-import time
-
-_OCR_LOCK = threading.Lock()
 
 
 class LocalExtractionError(ValueError):
     """Actionable source-reading failure, not an empty booking."""
 
 
-def _ocr_image(image, timeout=25):
-    executable = os.environ.get('TESSERACT_CMD') or shutil.which('tesseract')
-    if not executable:
-        raise LocalExtractionError('Tesseract OCR is not installed or not on PATH. Install Tesseract or set TESSERACT_CMD to its executable path.')
-    with io.BytesIO() as buffer:
-        image.save(buffer, format='PNG')
-        try:
-            result = subprocess.run(
-                [executable, 'stdin', 'stdout', '-l', os.environ.get('OCR_LANG', 'eng'),
-                 '--psm', '3', '-c', 'preserve_interword_spaces=1'],
-                input=buffer.getvalue(), capture_output=True, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired as exc:
-            raise LocalExtractionError('OCR timed out. Send this supplier page separately or send a clearer/selectable PDF.') from exc
-    if result.returncode:
-        raise LocalExtractionError('Tesseract could not read this page. Check the installed OCR language and send a clearer source.')
-    return result.stdout.decode('utf-8', errors='replace').strip()
-
-# Keep native OCR/image libraries from starting many worker threads in small
-# hosting containers.  Multiple threads increase peak memory without helping
-# much for the small, bounded page set used here.
-os.environ.setdefault('OMP_THREAD_LIMIT','1')
-os.environ.setdefault('OMP_NUM_THREADS','1')
-
-
 def extract_image_text(path, max_chars=30000):
-    """Local OCR for screenshots; never calls an external AI service."""
-    try:
-        from PIL import Image, ImageOps
-        with Image.open(path) as source:
-            image=ImageOps.exif_transpose(source).convert('L')
-            if max(image.size)>1800:
-                image.thumbnail((1800,1800))
-            try:
-                with _OCR_LOCK:
-                    text = _ocr_image(image)
-                if not text:
-                    raise LocalExtractionError('No readable text in supplier image. Send a clearer image or paste the booking text.')
-                if len(text)>max_chars:
-                    raise LocalExtractionError('Supplier text exceeds the extraction limit. Split the booking into smaller uploads.')
-                return text
-            finally:
-                image.close()
-    except LocalExtractionError:
-        raise
-    except Exception as exc:
-        raise LocalExtractionError('Cannot open supplier image. Send a valid PNG/JPEG or PDF.') from exc
+    raise LocalExtractionError(
+        'Image extraction is disabled. Send a selectable-text PDF or paste the supplier booking details.')
 
 
-def extract_pdf_text_with_local_ocr(path,max_chars=60000,max_ocr_pages=20):
-    """Read every page in order; OCR only pages with missing text or large scans.
-
-    Resource limits fail explicitly rather than silently dropping middle pages.
-    Native text and OCR are never concatenated for the same page (duplicate pax).
-    """
+def extract_supplier_pdf_text(path, max_chars=60000):
+    """Read embedded text locally; never rasterize pages or run OCR."""
     try:
         import fitz
-        from PIL import Image
         chunks=[]
-        with _OCR_LOCK, fitz.open(str(path)) as doc:
-            started=time.monotonic(); count=0
+        with fitz.open(str(path)) as doc:
             if doc.needs_pass:
                 raise LocalExtractionError('Supplier PDF is password protected. Send an unlocked copy.')
             for index,page in enumerate(doc):
                 text=page.get_text('text',sort=True) or ''
-                area=max(1,page.rect.width*page.rect.height)
-                large_scan=any(fitz.Rect(info['bbox']).get_area()/area>0.35 for info in page.get_image_info())
-                needs_ocr=large_scan or (len(re.sub(r'\s+','',text))<40 and bool(page.get_images()))
-                if needs_ocr:
-                    if count>=max_ocr_pages or time.monotonic()-started>=120:
-                        raise LocalExtractionError('Supplier PDF exceeded the OCR page/time limit. Split it into smaller PDFs; no partial booking was accepted.')
-                    count+=1
-                    zoom=min(2.0,2200/max(page.rect.width,page.rect.height))
-                    pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),colorspace=fitz.csGRAY,alpha=False)
-                    image=Image.frombytes('L',(pix.width,pix.height),pix.samples)
-                    del pix
-                    try:
-                        text=_ocr_image(image,timeout=max(1,min(25,120-(time.monotonic()-started))))
-                    finally:
-                        image.close()
-                        gc.collect()
-                    if not text:
-                        raise LocalExtractionError(f'No readable text on supplier page {index+1}. Send a clearer page.')
+                # Do not silently accept an unreadable page within a mixed PDF.
+                if not text.strip() and (page.get_images() or page.get_drawings()):
+                    raise LocalExtractionError(
+                        f'Supplier page {index+1} has no selectable text. Send a text PDF or paste its booking details.')
                 chunks.append(text)
                 if sum(map(len,chunks))+2*len(chunks)>max_chars:
-                    raise LocalExtractionError('Supplier text exceeds the extraction limit. Split the source; no partial booking was accepted.')
+                    raise LocalExtractionError('Supplier text is too long. Split it into smaller uploads.')
         result='\n\n'.join(chunks).strip()
         if not result:
-            raise LocalExtractionError('No readable supplier text. Send a clearer PDF or paste the booking details.')
+            raise LocalExtractionError('No selectable supplier text found. Paste the booking details or send a text PDF.')
         return result
     except LocalExtractionError:
         raise
     except Exception as exc:
         raise LocalExtractionError('Could not read supplier PDF. Check that it is valid and unlocked.') from exc
+
+
+def extract_pdf_text_with_local_ocr(path, max_chars=60000, max_ocr_pages=20):
+    """Compatibility entry point for older modules; text extraction only."""
+    return extract_supplier_pdf_text(path, max_chars)
 
 
 def collect_local_document_text(file_parts,source_text='',max_chars=60000):
