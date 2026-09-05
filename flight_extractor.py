@@ -431,34 +431,8 @@ def _clean_source_value(value):
     return '' if value.lower() in _PLACEHOLDER_VALUES else value
 
 def _plain_source_text(file_parts, source_text=''):
-    """Collect selectable supplier text without inventing any booking facts."""
-    chunks=[]
-    if source_text:
-        chunks.append(str(source_text))
-    for item in file_parts or []:
-        try:
-            path=Path(item.get('path') or '')
-            if path.suffix.lower()=='.pdf' and path.exists():
-                import fitz
-                doc=fitz.open(str(path))
-                texts=[page.get_text('text') or '' for page in doc]
-                if len(texts)>5:
-                    useful=[]
-                    for text in texts:
-                        low=text.lower()
-                        core=bool(re.search(r'(?i)\b(?:pnr|passenger|traveller|flight|departure|arrival|baggage|fare|tax|total\s+amount|amount\s+payable|booking\s+id)\b',text))
-                        terms=bool(re.search(r'(?i)\b(?:terms\s*(?:&|and)\s*conditions|privacy\s+policy|conditions\s+of\s+carriage|cancellation\s+policy)\b',text))
-                        if core and (not terms or re.search(r'(?i)\b(?:pnr|passenger\s+name|fare\s+summary|payment\s+summary)\b',text)):
-                            useful.append(text)
-                    texts=useful or texts[:4]+texts[-3:]
-                chunks.extend(texts)
-                doc.close()
-        except Exception:
-            pass
-    combined='\n'.join(chunks)
-    if any(Path(item.get('path') or '').suffix.lower()!='.pdf' for item in file_parts or []) or len(combined.strip())<120:
-        return collect_local_document_text(file_parts,source_text,max_chars=50000)
-    return combined[:50000]
+    """Use the shared page-aware reader, including scanned middle pages."""
+    return collect_local_document_text(file_parts,source_text,max_chars=50000)
 
 def _segment_source_window(raw_text, seg):
     """Find a local text window around this flight number; fall back to all text."""
