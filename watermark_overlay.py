@@ -4,7 +4,8 @@ from PIL import Image
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import shutil
-from pypdf import PdfReader, PdfWriter
+import logging
+import fitz
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_LOGO = BASE_DIR / "data" / "logo_default.png"
@@ -35,39 +36,39 @@ def _transparent_logo(opacity: float, scale: float):
                 px[x,y] = (r,g,b,0)
             else:
                 px[x,y] = (r,g,b,int(a * opacity))
-    if scale != 1.0:
-        nw=max(1,int(im.width*scale)); nh=max(1,int(im.height*scale))
-        im=im.resize((nw,nh),Image.Resampling.LANCZOS)
+    # Scale is applied to placement on the PDF, not to bitmap pixels.
     return im
 
 
 def add_watermark_to_pdf(input_path, output_path, enabled=True, opacity=0.04, scale=1.0):
-    reader=PdfReader(str(input_path))
-    if not reader.pages:
-        raise ValueError("Cannot watermark an empty PDF")
     if not enabled:
-        writer=PdfWriter()
-        for p in reader.pages: writer.add_page(p)
-        with open(output_path,'wb') as f: writer.write(f)
+        shutil.copyfile(input_path, output_path)
         return
     img=_transparent_logo(float(opacity), float(scale))
     if img is None:
         shutil.copyfile(input_path, output_path); return
-    writer=PdfWriter()
-    for page in reader.pages:
-        w=float(page.mediabox.width); h=float(page.mediabox.height)
-        # Use a comfortable central watermark size. Scale 100% means the base mark is 35% of page width.
-        target_w=min(w*0.35*float(scale), w*0.60)
+    logger=logging.getLogger('mytourbazar.pdf')
+    logger.info('PDF_STAGE watermark_start')
+    try:
+        with io.BytesIO() as buffer:
+            img.save(buffer,format='PNG')
+            raw=buffer.getvalue()
         ratio=img.height/img.width
-        target_h=target_w*ratio
-        if target_h>h*0.55:
-            target_h=h*0.55; target_w=target_h/ratio
-        x=(w-target_w)/2; y=(h-target_h)/2
-        buf=io.BytesIO(); c=canvas.Canvas(buf,pagesize=(w,h))
-        c.drawImage(ImageReader(img),x,y,width=target_w,height=target_h,preserveAspectRatio=True,mask='auto')
-        c.showPage(); c.save(); buf.seek(0)
-        overlay=PdfReader(buf).pages[0]
-        # Watermark first, then original page over it, so data is always on top.
-        overlay.merge_page(page)
-        writer.add_page(overlay)
-    with open(output_path,'wb') as f: writer.write(f)
+    finally:
+        img.close()
+    with fitz.open(str(input_path)) as doc:
+        if not len(doc):
+            raise ValueError('Cannot watermark an empty PDF')
+        xref=0
+        for page in doc:
+            w,h=page.rect.width,page.rect.height
+            target_w=min(w*0.35*float(scale),w*0.60)
+            target_h=target_w*ratio
+            if target_h>h*0.55:
+                target_h=h*0.55; target_w=target_h/ratio
+            x,y=(w-target_w)/2,(h-target_h)/2
+            # Reuse a single image object; retain original pages and links.
+            xref=page.insert_image(fitz.Rect(x,y,x+target_w,y+target_h),
+                                   stream=raw if not xref else None,xref=xref,overlay=False)
+        doc.save(str(output_path),deflate=True)
+    logger.info('PDF_STAGE watermark_complete')

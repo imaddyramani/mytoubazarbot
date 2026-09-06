@@ -2,7 +2,7 @@ from pathlib import Path
 import re
 from html import escape
 import base64
-from weasyprint import HTML
+from pdf_render import write_pdf
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 
@@ -559,5 +559,5 @@ li{{margin-bottom:4px;font-size:8pt}}.policies{{font-size:7.8pt;white-space:pre-
 
 </body></html>"""
     html = html.replace("size:A4", f"size:{page_size}")
-    HTML(string=html).write_pdf(str(output_path))
+    write_pdf(html, output_path)
     return output_path

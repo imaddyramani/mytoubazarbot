@@ -1,9 +1,56 @@
 """One Groq repair only when deterministic booking extraction is incomplete."""
 import copy
 import json
+import logging
 import math
 import re
 import httpx
+
+LOGGER = logging.getLogger('mytourbazar.groq')
+
+
+def _response_error(response):
+    """Return Groq's useful error message without logging request contents."""
+    try:
+        body=response.json()
+        message=(body.get('error') or {}).get('message') or body.get('message')
+    except Exception:
+        message=''
+    return re.sub(r'\s+',' ',str(message or '')).strip()[:300]
+
+
+def _clean_json(text):
+    text=str(text or '').strip()
+    if text.startswith('```'):
+        text=re.sub(r'^```(?:json)?\s*','',text,flags=re.I)
+        text=re.sub(r'\s*```$','',text)
+    return text.strip()
+
+
+def _groq_json(payload, api_key):
+    """Make one normal call and at most one 400-compatibility call."""
+    headers={'Authorization':'Bearer '+api_key,'Content-Type':'application/json'}
+    timeout=httpx.Timeout(35,connect=7,write=20,pool=7)
+    with httpx.Client(timeout=timeout) as client:
+        response=client.post('https://api.groq.com/openai/v1/chat/completions',headers=headers,json=payload)
+        if response.status_code==400:
+            detail=_response_error(response)
+            LOGGER.warning('Groq rejected structured request: HTTP 400: %s',detail or 'unspecified request error')
+            # Some Groq models reject JSON Object Mode or reasoning controls even
+            # though they can still return JSON when explicitly prompted.
+            compatible=copy.deepcopy(payload)
+            compatible.pop('response_format',None)
+            compatible.pop('reasoning_effort',None)
+            compatible['max_completion_tokens']=min(int(compatible.get('max_completion_tokens') or 2048),2048)
+            response=client.post('https://api.groq.com/openai/v1/chat/completions',headers=headers,json=compatible)
+    if response.status_code!=200:
+        detail=_response_error(response)
+        suffix=': '+detail if detail else ''
+        raise ValueError(f'Groq request rejected (HTTP {response.status_code}){suffix}')
+    choice=response.json()['choices'][0]
+    if choice.get('finish_reason')!='stop':
+        raise ValueError('Groq response was incomplete; use a smaller supplier source.')
+    return json.loads(_clean_json(choice['message']['content']))
 
 
 def request_json(source, schema, api_key, model, instructions):
@@ -11,18 +58,15 @@ def request_json(source, schema, api_key, model, instructions):
     if len(source)>28000:
         raise ValueError('Source exceeds the single AI request budget. Supply a focused booking source.')
     payload={'model':model,'temperature':0,'response_format':{'type':'json_object'},
-             'max_completion_tokens':4096,'messages':[
+             'max_completion_tokens':3072,'messages':[
                  {'role':'system','content':instructions+' Return JSON matching schema: '+json.dumps(schema,separators=(',',':'))},
                  {'role':'user','content':source}]}
+    if str(model).startswith('qwen/'):
+        payload['reasoning_effort']='none'
     try:
-        with httpx.Client(timeout=httpx.Timeout(25,connect=5)) as client:
-            response=client.post('https://api.groq.com/openai/v1/chat/completions',
-                headers={'Authorization':'Bearer '+api_key},json=payload)
-        if response.status_code!=200:
-            raise ValueError(f'Groq unavailable (HTTP {response.status_code}). No retry loop was started.')
-        choice=response.json()['choices'][0]
-        if choice.get('finish_reason')!='stop': raise ValueError('AI response incomplete; please use a smaller source.')
-        return _validate(json.loads(choice['message']['content']),schema)
+        return _validate(_groq_json(payload,api_key),schema)
+    except ValueError:
+        raise
     except (httpx.HTTPError,KeyError,IndexError,TypeError,json.JSONDecodeError) as exc:
         raise ValueError('Groq request failed. Retry later or supply the booking details as text.') from exc
 
@@ -75,17 +119,14 @@ def repair_if_needed(kind, local, source, schema, api_key, model):
             'Copy every passenger and sector exactly. Do not infer missing facts. Use empty strings/lists or zero for absent values. '
             'Keep existing supported facts. Schema: '+json.dumps(schema,separators=(',',':')))
     payload={'model':model,'temperature':0,'response_format':{'type':'json_object'},
-             'max_completion_tokens':4096,'messages':[{'role':'system','content':prompt},
+             'max_completion_tokens':3072,'messages':[{'role':'system','content':prompt},
              {'role':'user','content':'Supplier source:\n'+source}]}
+    if str(model).startswith('qwen/'):
+        payload['reasoning_effort']='none'
     try:
-        with httpx.Client(timeout=httpx.Timeout(25,connect=5)) as client:
-            response=client.post('https://api.groq.com/openai/v1/chat/completions',
-                headers={'Authorization':'Bearer '+api_key},json=payload)
-        if response.status_code!=200:
-            raise ValueError(f'Groq repair unavailable (HTTP {response.status_code}); no retries were queued.')
-        choice=response.json()['choices'][0]
-        if choice.get('finish_reason')!='stop': raise ValueError('Repair response was incomplete.')
-        repaired=_validate(json.loads(choice['message']['content']),schema)
+        repaired=_validate(_groq_json(payload,api_key),schema)
+    except ValueError:
+        raise
     except (httpx.HTTPError,KeyError,IndexError,TypeError,json.JSONDecodeError) as exc:
         raise ValueError('Groq repair failed. Retry later or supply the missing booking fields as text.') from exc
     # At minimum names and endpoint codes must be transcriptions of this source.
