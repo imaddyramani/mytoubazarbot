@@ -58,13 +58,26 @@ def _local_bus_passengers(text,boarding=''):
     out=[]; seen=set()
     for line in str(text).splitlines():
         clean=re.sub(r'\s+',' ',line).strip()
-        m=re.search(r'(?i)(?:^|\b)(Mr|Mrs|Ms|Miss|Master|Mstr|Dr)\.?\s+([A-Za-z][A-Za-z .\'/\-]{2,60}?)(?=\s+(?:Seat|Adult|Child|Infant|ADT|CHD|INF|\d{1,2}[A-Z]?)\b|$)',clean)
-        if not m: continue
-        title=m.group(1)+'.'; name=m.group(2).strip(' ,-')
+        title=''; name=''
+        m=re.search(r'(?i)\b([A-Z][A-Z\'-]{1,35})\s*/\s*([A-Z][A-Z .\'-]{1,55}?)\s+(MR|MRS|MS|MISS|MASTER|MSTR)\b',clean)
+        if m:
+            name=(m.group(2).strip()+' '+m.group(1).strip()).title(); title=m.group(3).title()+'.'
+        else:
+            # Common redBus/AbhiBus rows: SURNAME/FIRSTNAME MR, or a numbered
+            # passenger row where type and seat follow the complete name.
+            m=re.search(r'(?i)(?:^|\b)(Mr|Mrs|Ms|Miss|Master|Mstr|Dr)\.?\s+([A-Za-z][A-Za-z .\'/\-]{2,60}?)(?=\s+(?:Seat|Adult|Child|Infant|ADT|CHD|INF|\d{1,2}[A-Z]?)\b|$)',clean)
+            if m:
+                title=m.group(1)+'.'; name=m.group(2).strip(' ,-')
+            else:
+                m=re.search(r'(?i)^\s*\d{1,3}[.)]?\s+([A-Za-z][A-Za-z .\'/\-]{2,70}?)\s+(Adult|Child|Infant|ADT|CHD|INF)\b',clean)
+                if m: name=m.group(1).strip(' ,-')
+        if not name: continue
         key=re.sub(r'\W+','',name).lower()
         if not key or key in seen: continue
         seen.add(key)
         seat=''; sm=re.search(r'(?i)\bSeat(?:\s*(?:No|Number))?\s*[:#\-]?\s*([A-Z0-9\-]{1,8})',clean)
+        if not sm:
+            sm=re.search(r'(?i)\b(?:Adult|Child|Infant|ADT|CHD|INF)\b\s+([A-Z]?(?:\d{1,3}[A-Z]?|[A-Z]\d{1,3}))\b',clean)
         if sm: seat=sm.group(1)
         ptype='Child' if re.search(r'(?i)\b(?:Child|CHD)\b',clean) or title.lower().startswith(('master','mstr')) else 'Infant' if re.search(r'(?i)\b(?:Infant|INF)\b',clean) else 'Adult'
         out.append({'name':name,'title':title,'seat':seat,'type':ptype,'dob':'','boarding':boarding})

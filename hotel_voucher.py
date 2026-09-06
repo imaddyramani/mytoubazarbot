@@ -102,6 +102,28 @@ def _hotel_local_amount(text,labels):
     m=re.search(r'(?:INR|Rs\.?|₹)?\s*([0-9][0-9,]*(?:\.\d+)?)',value,re.I)
     return float(m.group(1).replace(',','')) if m else 0.0
 
+_DATE_TOKEN=(r'(?:[0-3]?\d[\s./-]+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
+             r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|\d{1,2})[\s,./-]+\d{2,4}|'
+             r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|'
+             r'Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+[0-3]?\d,?\s+\d{4})')
+
+def _hotel_label_date(text,label):
+    m=re.search(r'(?is)\b(?:'+label+r')\b.{0,80}?('+_DATE_TOKEN+r')',str(text or ''))
+    return re.sub(r'\s+',' ',m.group(1)).strip() if m else ''
+
+def _hotel_terms(text):
+    lines=[re.sub(r'\s+',' ',x).strip(' •-*\t') for x in str(text or '').splitlines()]
+    out=[]; active=False
+    for line in lines:
+        if re.search(r'(?i)^(?:hotel\s+)?(?:terms|important\s+information|instructions|polic(?:y|ies))\b',line):
+            active=True; continue
+        if active and re.match(r'^[A-Z][A-Z &/]{4,}$',line):
+            break
+        if active and len(line)>=12 and line not in out:
+            out.append(line)
+            if len(out)>=8: break
+    return out
+
 def _extract_hotel_local(text):
     raw=str(text or '')
     rooms=_hotel_local_value(raw,[r'(?:No\.?\s*of\s*)?Rooms?',r'Room\s*Count'],20)
@@ -114,6 +136,33 @@ def _extract_hotel_local(text):
     taxes=_hotel_local_amount(raw,[r'Tax(?:es)?',r'GST'])
     total=_hotel_local_amount(raw,[r'Grand\s*Total',r'Total\s*Amount',r'Amount\s*Payable'])
     if not base and total: base=max(0,total-taxes)
+    check_in=_hotel_local_value(raw,[r'Check[\s-]*in(?:\s*Date)?',r'Arrival\s*Date'])
+    check_out=_hotel_local_value(raw,[r'Check[\s-]*out(?:\s*Date)?',r'Departure\s*Date'])
+    if not re.search(r'\d',check_in) or re.search(r'(?i)check[\s-]*out',check_in):
+        check_in=_hotel_label_date(raw,r'Check[\s-]*in(?:\s*Date)?|Arrival\s*Date')
+    if not re.search(r'\d',check_out) or re.search(r'(?i)check[\s-]*in',check_out):
+        check_out=_hotel_label_date(raw,r'Check[\s-]*out(?:\s*Date)?|Departure\s*Date')
+    pair=re.search(r'(?im)^.*\bcheck[\s-]*in\b.*\bcheck[\s-]*out\b.*\n([^\n]+)',raw)
+    if pair:
+        paired_dates=re.findall(_DATE_TOKEN,pair.group(1),re.I)
+        if len(paired_dates)>=2:
+            check_in=re.sub(r'\s+',' ',paired_dates[0]).strip()
+            check_out=re.sub(r'\s+',' ',paired_dates[1]).strip()
+    room_type=_hotel_local_value(raw,[r'Room\s*(?:Type|Category)',r'Accommodation'])
+    if not room_type:
+        m=re.search(r'(?im)^\s*((?:Deluxe|Superior|Standard|Executive|Premium|Suite|Family|Double|Twin)[^\n]{0,70}\bRoom\b[^\n]{0,30})$',raw)
+        if m: room_type=re.sub(r'\s+',' ',m.group(1)).strip()
+    occupancy=_hotel_local_value(raw,[r'Occupancy(?:\s*Summary)?',r'Pax',r'Guests?(?!\s*Name)'])
+    if not occupancy:
+        m=re.search(r'(?i)\b\d+\s*Adults?\b(?:\s*[,;+&]\s*\d+\s*(?:Children|Child|Infants?))?',raw)
+        if m: occupancy=m.group(0)
+    meal=_hotel_local_value(raw,[r'Meal\s*Plan',r'Board\s*Basis',r'Meals?'])
+    if not meal:
+        m=re.search(r'(?i)\b(?:CPAI?|MAPAI?|APAI?|EP|Room\s*Only|Bed\s*(?:&|and)\s*Breakfast|Breakfast\s+Included|Half\s*Board|Full\s*Board)\b',raw)
+        if m: meal=m.group(0)
+    costs=[]
+    if base>0: costs.append({'description':'Room Charges','quantity':1,'rate':base,'nights':1,'total':base})
+    if taxes>0: costs.append({'description':'Taxes and Fees','quantity':1,'rate':taxes,'nights':1,'total':taxes})
     return {
         'reservation_id':_hotel_local_value(raw,[r'(?:Reservation|Confirmation|Booking)\s*(?:ID|Number|No\.?|Reference)']),
         'guest_name':_hotel_local_value(raw,[r'(?:Lead\s*)?Guest\s*(?:Name)?',r'Booked\s*For']),
@@ -121,14 +170,14 @@ def _extract_hotel_local(text):
         'hotel_name':_hotel_local_value(raw,[r'Hotel\s*(?:Name)?',r'Property\s*(?:Name)?']),
         'hotel_address':_hotel_local_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address']),
         'hotel_city':_hotel_local_value(raw,[r'Hotel\s*City',r'City',r'Destination']),
-        'check_in':_hotel_local_value(raw,[r'Check[\s-]*in(?:\s*Date)?',r'Arrival\s*Date']),
-        'check_out':_hotel_local_value(raw,[r'Check[\s-]*out(?:\s*Date)?',r'Departure\s*Date']),
+        'check_in':check_in,
+        'check_out':check_out,
         'nights':_hotel_local_value(raw,[r'(?:No\.?\s*of\s*)?Nights?'],20),
-        'room_type':_hotel_local_value(raw,[r'Room\s*(?:Type|Category)',r'Accommodation']),
-        'occupancy_summary':_hotel_local_value(raw,[r'Occupancy(?:\s*Summary)?',r'Pax',r'Guests?']),
+        'room_type':room_type,
+        'occupancy_summary':occupancy,
         'room_count':room_count,'extra_bed_count':extra_count,
-        'meal_plan':_hotel_local_value(raw,[r'Meal\s*Plan',r'Board\s*Basis',r'Meals?']),
-        'base_fare':base,'taxes':taxes,'terms':[],'cost_components':[],
+        'meal_plan':meal,
+        'base_fare':base,'taxes':taxes,'terms':_hotel_terms(raw),'cost_components':costs,
     }
 
 

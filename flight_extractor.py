@@ -2072,19 +2072,41 @@ def _local_baggage_summary(raw):
 def _local_passengers_from_text(raw,baggage_summary=''):
     lines=[re.sub(r'\s+',' ',x).strip() for x in str(raw or '').splitlines() if str(x).strip()]
     passengers=[]; seen=set()
-    title_pat=re.compile(r"(?i)\b(Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof)\.?\s+([A-Za-z][A-Za-z .'/-]{2,70})")
+    title_pat=re.compile(r"(?i)\b(Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof)\.?\s+([A-Za-z][A-Za-z .'/-]{2,90})")
+    suffix_pat=re.compile(r"(?i)^\s*([A-Z][A-Z\'-]{1,35})\s*[/,]\s*([A-Z][A-Z .\'-]{1,55}?)\s+(MR|MRS|MS|MISS|MASTER|MSTR)\.?\b")
+    end_title_pat=re.compile(r"(?i)^\s*([A-Z][A-Z .\'-]{3,90}?)\s+(MR|MRS|MS|MISS|MASTER|MSTR)\.?\s*(?:(?:ADT|CHD|INF|Adult|Child|Infant)\b|$)")
     row_pat=re.compile(r"(?i)^\s*\d{1,2}[.)]?\s+([A-Za-z][A-Za-z .'/-]{2,60}?)\s+(Adult|Child|Infant|ADT|CHD|INF)\b")
-    for line in lines:
+    stop_pat=r'Adult|Child|Infant|ADT|CHD|INF|DOB|Ticket|PNR|Baggage|Check[- ]?in|Cabin|Seat|Type'
+    for line_no,line in enumerate(lines):
         title=''; name=''; ptype=''
-        m=title_pat.search(line)
+        m=suffix_pat.search(line)
         if m:
-            title=m.group(1)+('.' if not m.group(1).endswith('.') else '')
-            name=m.group(2)
-            name=re.split(r'(?i)\s+(?:Adult|Child|Infant|ADT|CHD|INF|DOB|Ticket|PNR|Baggage|\d{10,})\b',name)[0].strip(' ,-')
+            name=(m.group(2).strip()+' '+m.group(1).strip()).title()
+            title=m.group(3).title()+'.'
         else:
-            m=row_pat.search(line)
+            m=end_title_pat.search(line)
             if m:
-                name=m.group(1).strip(' ,-'); ptype=m.group(2)
+                name=m.group(1).strip(' ,-').title(); title=m.group(2).title()+'.'
+            else:
+                m=title_pat.search(line)
+                if m:
+                    title=m.group(1)+('.' if not m.group(1).endswith('.') else '')
+                    name=m.group(2)
+                    name=re.split(r'(?i)\s+(?:'+stop_pat+r'|\d{10,})\b',name)[0].strip(' ,-')
+                    # Selectable PDF tables sometimes wrap the surname onto the next text
+                    # line. Join one clean name-only continuation before accepting the row.
+                    if not re.search(r'(?i)\b(?:'+stop_pat+r')\b',line[m.end():]) and line_no+1<len(lines):
+                        nxt=lines[line_no+1]
+                        cm=re.match(r"^([A-Za-z][A-Za-z'\-]{1,35})(?=\s+(?:"+stop_pat+r")\b|$)",nxt,re.I)
+                        continuation=cm.group(1) if cm else ''
+                        looks_like_pnr=(continuation.isupper() and 5<=len(continuation)<=9)
+                        if (continuation and not looks_like_pnr
+                                and not re.search(r'(?i)\b(?:flight|airport|booking|fare|total|status|operator)\b',nxt)):
+                            name=(name+' '+continuation).strip()
+                else:
+                    m=row_pat.search(line)
+                    if m:
+                        name=m.group(1).strip(' ,-'); ptype=m.group(2)
         if not name or len(name)<3 or re.search(r'(?i)\b(?:flight|airport|booking|customer|support|fare|payment)\b',name):
             continue
         low=(ptype+' '+title+' '+line).lower()
