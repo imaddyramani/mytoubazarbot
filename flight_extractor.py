@@ -1,10 +1,26 @@
 import json, re, zlib
+from contextvars import ContextVar
+from functools import wraps
+import copy
 from pathlib import Path
 from google import genai
 from google.genai import types
 
 from ai_retry import call_with_high_demand_retry
 from performance_utils import collect_local_document_text
+
+_layout_cache = ContextVar('air_layout_cache', default=None)
+
+
+def _layout_session(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        token = _layout_cache.set({})
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _layout_cache.reset(token)
+    return wrapped
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 SCHEMA={"type":"object","properties":{
@@ -889,12 +905,18 @@ def _airport_name_richness(value, city='', code=''):
 
 def _pdf_layout_lines(pdf_path):
     """Extract selectable PDF text spans with exact source coordinates."""
+    cache = _layout_cache.get()
+    source_id = str(Path(pdf_path).resolve())
+    if cache is not None and source_id in cache:
+        return copy.deepcopy(cache[source_id])
     spans=[]
     try:
         import fitz
         doc=fitz.open(str(pdf_path))
         for page_no,page in enumerate(doc):
-            payload=page.get_text('dict') or {}
+            # Default dict extraction embeds decoded image bytes. Geometry only
+            # needs text, so never load supplier artwork into these dictionaries.
+            payload=page.get_text('dict', flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES) or {}
             page_rect=page.rect
             for block in payload.get('blocks') or []:
                 if block.get('type',0) != 0:
@@ -907,7 +929,7 @@ def _pdf_layout_lines(pdf_path):
                             continue
                         bbox=span.get('bbox') or line.get('bbox') or (0,0,0,0)
                         spans.append({
-                            'page':page_no,
+                            'page':(source_id,page_no),
                             'page_width':float(page_rect.width),
                             'page_height':float(page_rect.height),
                             'x0':float(bbox[0]),'y0':float(bbox[1]),
@@ -917,6 +939,8 @@ def _pdf_layout_lines(pdf_path):
         doc.close()
     except Exception:
         return []
+    if cache is not None:
+        cache[source_id] = copy.deepcopy(spans)
     return spans
 
 
@@ -2225,8 +2249,9 @@ BAGGAGE IS MANDATORY WHEN PRINTED:
 
 Return every flight sector separately; never merge connections. Preserve PNR/ticket numbers, flight number, departure/arrival date/time/IATA/airport/terminal, duration/stops only when printed, and supplier payment rows/total. Ignore terms/marketing. Return JSON only."""
 
+@_layout_session
 def extract_flight_ticket(file_parts, source_text, api_key, model):
-    """Extract an Air Print entirely through deterministic parsing and local OCR."""
+    """Local-first Air Print with one repair request for missing core fields."""
     raw_source_text=_plain_source_text(file_parts,source_text)
     original_paths=[Path(item.get('path') or '') for item in (file_parts or []) if item.get('path')]
     data=_local_first_air_extract(raw_source_text,original_paths)
@@ -2249,6 +2274,10 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         pass
     data=_final_endpoint_safety_gate(data)
 
+    from supplier_repair import repair_if_needed
+    data=repair_if_needed('flight',data,raw_source_text,SCHEMA,api_key,model)
+    used_ai=bool(data.get('_ai_fallback_used'))
+    data=_apply_baggage_summary(data)
     data=_apply_air_output_defaults(data,raw_source_text)
 
     clean=[]

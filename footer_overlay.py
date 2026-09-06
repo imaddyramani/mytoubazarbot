@@ -46,23 +46,23 @@ def _prepare_footer_image():
     """Load the supplied footer and remove only its blank outer border."""
     _verify_footer_source()
     img = Image.open(SOURCE_FOOTER).convert("RGBA")
-    rgb = img.convert("RGB")
-    pix = rgb.load()
-    w, h = rgb.size
-    xs, ys = [], []
-    for yy in range(h):
-        for xx in range(w):
-            r, g, b = pix[xx, yy]
-            if min(r, g, b) < 245:
-                xs.append(xx)
-                ys.append(yy)
-    if xs:
+    from PIL import ImageChops
+    w,h=img.size
+    # Equivalent near-white crop, without two huge Python coordinate lists.
+    with img.convert('RGB') as rgb:
+        r,g,b=rgb.split()
+        with ImageChops.darker(r,g) as rg:
+            with ImageChops.darker(rg,b) as minimum:
+                with minimum.point(lambda value:255 if value<245 else 0) as mask:
+                    bounds=mask.getbbox()
+        r.close(); g.close(); b.close()
+    if bounds:
         pad = 4
         box = (
-            max(0, min(xs) - pad), max(0, min(ys) - pad),
-            min(w, max(xs) + 1 + pad), min(h, max(ys) + 1 + pad),
+            max(0, bounds[0] - pad), max(0, bounds[1] - pad),
+            min(w, bounds[2] + pad), min(h, bounds[3] + pad),
         )
-        img = img.crop(box)
+        cropped=img.crop(box); img.close(); img=cropped
     return img
 
 
@@ -108,56 +108,8 @@ def _add_footer_links(writer, page_index, geometry):
 
 
 def add_footer_to_pdf(input_path, output_path):
-    """Add the supplied footer to the final page without hiding itinerary data.
-
-    If the final page does not have enough free space, a clean additional page of
-    the exact same paper size is appended. No existing itinerary element is
-    resized, squeezed, or covered.
-    """
-    reader = PdfReader(str(input_path))
-    if not reader.pages:
-        raise ValueError("Cannot add footer to an empty PDF")
-
-    last_index = len(reader.pages) - 1
-    last = reader.pages[last_index]
-    page_w = float(last.mediabox.width)
-    page_h = float(last.mediabox.height)
-
-    # Determine the lowest existing content boundary. Text blocks are preferred;
-    # if extraction fails, conservatively treat the page as full.
-    try:
-        import fitz
-        doc = fitz.open(str(input_path))
-        fpage = doc[last_index]
-        blocks = fpage.get_text("blocks")
-        max_y = max((float(b[3]) for b in blocks if len(b) >= 4), default=page_h)
-        doc.close()
-    except Exception:
-        max_y = page_h
-
-    img, scale, x, y, draw_w, draw_h, bottom = _footer_geometry(page_w, page_h)
-    safety = 5 * 72 / 25.4
-    free_space = page_h - max_y - bottom - safety
-
-    writer = PdfWriter()
-    if free_space >= draw_h:
-        # Preserve all original pages and merge artwork onto the final page.
-        overlay_buf = io.BytesIO()
-        c = canvas.Canvas(overlay_buf, pagesize=(page_w, page_h))
-        c.drawImage(ImageReader(img), x, y, width=draw_w, height=draw_h,
-                    preserveAspectRatio=True, mask="auto")
-        c.showPage(); c.save(); overlay_buf.seek(0)
-        overlay_page = PdfReader(overlay_buf).pages[0]
-        for p in reader.pages:
-            writer.add_page(p)
-        writer.pages[last_index].merge_page(overlay_page)
-        _add_footer_links(writer, last_index, (img.size[0], img.size[1], scale, x, y))
-    else:
-        for p in reader.pages:
-            writer.add_page(p)
-        footer_page, geometry = _make_footer_page(page_w, page_h)
-        writer.add_page(footer_page)
-        _add_footer_links(writer, len(writer.pages) - 1, geometry)
-
-    with open(output_path, "wb") as f:
-        writer.write(f)
+    from pdf_footer import add_footer
+    def geometry(w,h):
+        image,scale,x,y,dw,dh,bottom=_footer_geometry(w,h)
+        return image,*image.size,scale,x,y,dw,dh
+    return add_footer(input_path, output_path, geometry, LINK_BOXES)

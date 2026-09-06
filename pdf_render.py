@@ -7,9 +7,24 @@ import sys
 import tempfile
 import threading
 import time
+import re
 
 _LOCK = threading.Lock()
 log = logging.getLogger('mytourbazar.pdf')
+
+
+def _pagination_html(html):
+    # Long descriptions must be allowed to span pages. Repeat table headers,
+    # and keep section headings with the first following row/paragraph.
+    css='''<style>
+    .day,.terms,.policy-block,.optional-activities,.logistics,.cost-box {
+      break-inside:auto!important; page-break-inside:auto!important;
+    }
+    thead {display:table-header-group}
+    h2,h3,.section {break-after:avoid;page-break-after:avoid}
+    p,li {orphans:2;widows:2}
+    </style>'''
+    return re.sub(r'</head>',lambda m:css+m.group(0),html,count=1,flags=re.I) if re.search(r'</head>',html,re.I) else css+html
 
 
 def write_pdf(html, output_path, base_url=None):
@@ -22,7 +37,7 @@ def write_pdf(html, output_path, base_url=None):
         with tempfile.TemporaryDirectory(prefix='mtb_pdf_', dir=output.parent) as folder:
             source = Path(folder)/'document.html'
             target = Path(folder)/'document.pdf'
-            source.write_text(html, encoding='utf-8')
+            source.write_text(_pagination_html(html), encoding='utf-8')
             env = os.environ.copy()
             env.update(OMP_THREAD_LIMIT='1', OMP_NUM_THREADS='1', MALLOC_ARENA_MAX='2')
             log.info('PDF_STAGE render_start')

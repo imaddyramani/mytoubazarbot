@@ -74,46 +74,5 @@ def _add_links(writer, page_index, geometry):
 
 
 def add_footer2_to_pdf(input_path, output_path):
-    """Append/overlay the supplied Footer 2 design without shrinking itinerary content."""
-    reader = PdfReader(str(input_path))
-    if not reader.pages:
-        raise ValueError('Cannot add Footer 2 to an empty PDF')
-
-    last_index = len(reader.pages) - 1
-    last = reader.pages[last_index]
-    page_w = float(last.mediabox.width)
-    page_h = float(last.mediabox.height)
-    img, iw, ih, scale, x, y, draw_w, draw_h = _geometry(page_w, page_h)
-
-    try:
-        import fitz
-        doc = fitz.open(str(input_path))
-        blocks = doc[last_index].get_text('blocks')
-        max_y = max((float(b[3]) for b in blocks if len(b) >= 4), default=page_h)
-        doc.close()
-    except Exception:
-        max_y = page_h
-
-    safety = 5 * 72 / 25.4
-    free_space = page_h - max_y - y - safety
-
-    writer = PdfWriter()
-    for p in reader.pages:
-        writer.add_page(p)
-
-    if free_space >= draw_h:
-        buf = io.BytesIO()
-        c = canvas.Canvas(buf, pagesize=(page_w, page_h))
-        c.drawImage(ImageReader(img), x, y, width=draw_w, height=draw_h,
-                    preserveAspectRatio=True, mask='auto')
-        c.showPage(); c.save(); buf.seek(0)
-        overlay = PdfReader(buf).pages[0]
-        writer.pages[last_index].merge_page(overlay)
-        _add_links(writer, last_index, (iw, ih, scale, x, y))
-    else:
-        footer_page, geometry = _footer_page(page_w, page_h)
-        writer.add_page(footer_page)
-        _add_links(writer, len(writer.pages) - 1, geometry)
-
-    with open(output_path, 'wb') as fh:
-        writer.write(fh)
+    from pdf_footer import add_footer
+    return add_footer(input_path, output_path, _geometry, LINK_BOXES)

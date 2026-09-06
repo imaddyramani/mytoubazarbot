@@ -5,7 +5,7 @@ from pathlib import Path
 from html import escape
 from google import genai
 from google.genai import types
-from weasyprint import HTML
+from pdf_render import write_pdf
 
 from print_settings import apply_css_settings
 from ai_retry import call_with_high_demand_retry
@@ -133,8 +133,9 @@ def _extract_hotel_local(text):
 
 
 def extract_hotel_voucher(file_parts, source_text, api_key, model):
+    from supplier_repair import repair_if_needed
     text=collect_local_document_text(file_parts,source_text,max_chars=45000)
-    return _extract_hotel_local(text)
+    return repair_if_needed('hotel',_extract_hotel_local(text),text,HOTEL_VOUCHER_SCHEMA,api_key,model)
 
 
 def _esc(v):
@@ -306,5 +307,5 @@ ul {{ margin:4px 0; padding-left:18px; font-size:11px; }} li {{ margin-bottom:5p
 </body></html>"""
     html = html.replace("size:A4", f"size:{page_size}")
     html = apply_css_settings(html, kind="hotel", text_scale_override=text_scale_override, logo_scale_override=logo_scale_override)
-    HTML(string=html, base_url=str(Path(output_path).parent)).write_pdf(str(output_path))
+    write_pdf(html, output_path, base_url=str(Path(output_path).parent.resolve()))
     return output_path

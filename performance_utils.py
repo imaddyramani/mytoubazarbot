@@ -2,6 +2,38 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 import re
+import io
+import os
+import shutil
+import subprocess
+import time
+from contextvars import ContextVar
+
+_read_deadline = ContextVar('supplier_read_deadline', default=None)
+MAX_SUPPLIER_CHARS = 1000000
+
+
+def _read_scan(image):
+    """One bounded local OCR process; no global lock or background retry."""
+    executable = os.environ.get('TESSERACT_CMD') or shutil.which('tesseract')
+    if not executable:
+        raise LocalExtractionError('Scanned input requires local Tesseract. Rebuild using the updated Dockerfile or send selectable text.')
+    remaining = (_read_deadline.get() or (time.monotonic()+100))-time.monotonic()
+    if remaining <= 0:
+        raise LocalExtractionError('Scanned input exceeded the 100-second reading budget. Send the remaining pages separately.')
+    image.thumbnail((2200,2200))
+    with io.BytesIO() as buffer:
+        image.save(buffer,format='PNG')
+        env=os.environ.copy(); env['OMP_THREAD_LIMIT']='1'; env['OMP_NUM_THREADS']='1'
+        try:
+            result=subprocess.run([executable,'stdin','stdout','-l','eng','--psm','3'],
+                input=buffer.getvalue(),capture_output=True,timeout=min(20,remaining),env=env)
+        except subprocess.TimeoutExpired as exc:
+            raise LocalExtractionError('A scanned page took too long to read. Send a clearer copy or selectable text.') from exc
+    text=result.stdout.decode('utf-8',errors='replace').strip()
+    if result.returncode or not text:
+        raise LocalExtractionError('A scanned page could not be read. Send a clearer copy or paste its text.')
+    return text
 
 
 class LocalExtractionError(ValueError):
@@ -9,12 +41,14 @@ class LocalExtractionError(ValueError):
 
 
 def extract_image_text(path, max_chars=30000):
-    raise LocalExtractionError(
-        'Image extraction is disabled. Send a selectable-text PDF or paste the supplier booking details.')
+    from PIL import Image, ImageOps
+    with Image.open(path) as original:
+        with ImageOps.exif_transpose(original).convert('L') as image:
+            return _read_scan(image)
 
 
 def extract_supplier_pdf_text(path, max_chars=60000):
-    """Read embedded text locally; never rasterize pages or run OCR."""
+    """Read every page; only rasterize image pages missing a text layer."""
     try:
         import fitz
         chunks=[]
@@ -24,11 +58,16 @@ def extract_supplier_pdf_text(path, max_chars=60000):
             for index,page in enumerate(doc):
                 text=page.get_text('text',sort=True) or ''
                 # Do not silently accept an unreadable page within a mixed PDF.
-                if not text.strip() and (page.get_images() or page.get_drawings()):
-                    raise LocalExtractionError(
-                        f'Supplier page {index+1} has no selectable text. Send a text PDF or paste its booking details.')
+                if len(re.sub(r'\s+','',text))<40 and page.get_images():
+                    from PIL import Image
+                    zoom=min(2,2200/max(page.rect.width,page.rect.height))
+                    pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),colorspace=fitz.csGRAY,alpha=False)
+                    image=Image.frombytes('L',(pix.width,pix.height),pix.samples)
+                    del pix
+                    try: text=_read_scan(image)
+                    finally: image.close()
                 chunks.append(text)
-                if sum(map(len,chunks))+2*len(chunks)>max_chars:
+                if sum(map(len,chunks))+2*len(chunks)>MAX_SUPPLIER_CHARS:
                     raise LocalExtractionError('Supplier text is too long. Split it into smaller uploads.')
         result='\n\n'.join(chunks).strip()
         if not result:
@@ -46,6 +85,14 @@ def extract_pdf_text_with_local_ocr(path, max_chars=60000, max_ocr_pages=20):
 
 
 def collect_local_document_text(file_parts,source_text='',max_chars=60000):
+    token=_read_deadline.set(time.monotonic()+100)
+    try:
+        return _collect_local_document_text(file_parts,source_text,max_chars)
+    finally:
+        _read_deadline.reset(token)
+
+
+def _collect_local_document_text(file_parts,source_text='',max_chars=60000):
     """Collect PDF/image facts locally for Air, Bus and Hotel workflows."""
     chunks=[str(source_text or '')]
     for item in file_parts or []:
@@ -57,7 +104,7 @@ def collect_local_document_text(file_parts,source_text='',max_chars=60000):
         else:
             value=extract_image_text(path,max_chars=max_chars)
         if value: chunks.append(value)
-        if len('\n\n'.join(chunks))>max_chars:
+        if len('\n\n'.join(chunks))>MAX_SUPPLIER_CHARS:
             raise LocalExtractionError('Combined supplier text is too long. Split the booking into smaller uploads.')
     result='\n\n'.join(chunks).strip()
     if not result:

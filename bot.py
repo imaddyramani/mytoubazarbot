@@ -2516,11 +2516,8 @@ async def _render_ticket_with_automatic_fit(kind, data, fare, logo_path, footer_
 
     base_pages,final_pages=await render_once(None,'fast1')
     selected_scale=None
-    # At most ONE fit retry. No page-size scanning and no repeated 95/90/85/80/75 loops.
-    if ((not explicit or explicit=='auto') and paper=='A4' and base_pages==1 and final_pages>1
-            and footer_mode!='none' and not clean):
-        _,final_pages2=await render_once(0.90,'fast2')
-        selected_scale=0.90
+    # A footer on an extra page is valid. Do not render the whole itinerary
+    # again merely to save that page; long documents retain readable type.
     return final,paper,selected_scale
 
 
@@ -6724,7 +6721,9 @@ def modify_size_keyboard(reference):
 
 def _pdf_page_count(path):
     try:
-        return len(PdfReader(str(path)).pages)
+        import fitz
+        with fitz.open(str(path)) as doc:
+            return len(doc)
     except Exception:
         return 0
 

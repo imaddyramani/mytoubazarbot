@@ -4,7 +4,7 @@ import re
 from html import escape
 from google import genai
 from google.genai import types
-from weasyprint import HTML
+from pdf_render import write_pdf
 
 from print_settings import apply_css_settings
 from ai_retry import call_with_high_demand_retry
@@ -99,15 +99,9 @@ def _extract_bus_local(text):
     return data
 
 def extract_bus_ticket(file_parts, source_text, api_key, model):
-    paths=[]
-    try:
-        paths=[Path(item['path']) for item in file_parts or []]
-        text=collect_local_document_text(file_parts,source_text,max_chars=40000)
-        return _extract_bus_local(text)
-    finally:
-        for p in paths:
-            try:p.unlink(missing_ok=True)
-            except:pass
+    from supplier_repair import repair_if_needed
+    text=collect_local_document_text(file_parts,source_text,max_chars=40000)
+    return repair_if_needed('bus',_extract_bus_local(text),text,SCHEMA,api_key,model)
 
 def distribute_fare(updated_total, original_base, original_tax):
     total=float(updated_total); ob=max(float(original_base or 0),0); ot=max(float(original_tax or 0),0)
@@ -163,4 +157,4 @@ def generate_bus_ticket(data, updated_total, output_path, logo_path=None, page_s
 </body></html>'''
     html = html.replace("size:A4", f"size:{page_size}")
     html = apply_css_settings(html, kind="bus", text_scale_override=text_scale_override, logo_scale_override=logo_scale_override)
-    HTML(string=html).write_pdf(str(output_path)); return base,tax
+    write_pdf(html, output_path); return base,tax
