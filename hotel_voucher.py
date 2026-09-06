@@ -190,9 +190,8 @@ def _extract_hotel_local(text):
 
 
 def extract_hotel_voucher(file_parts, source_text, api_key, model):
-    from supplier_repair import repair_if_needed
     text=collect_local_document_text(file_parts,source_text,max_chars=45000)
-    return repair_if_needed('hotel',_extract_hotel_local(text),text,HOTEL_VOUCHER_SCHEMA,api_key,model)
+    return _extract_hotel_local(text)
 
 
 def _esc(v):

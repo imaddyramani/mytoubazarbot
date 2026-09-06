@@ -2710,7 +2710,10 @@ async def _auto_print_after_countdown(message, context, kind, supplier_total, pr
         )
         await finish('✅ PDF generated and sent.')
     except asyncio.CancelledError:
-        await finish(f'Print cancelled during: {stage}.')
+        # A fare button intentionally replaces the countdown workflow.  Task
+        # cancellation is therefore a normal state transition, not a print
+        # failure that should overwrite the Add Cost prompt.
+        logger.info('AUTO_PRINT_CANCELLED kind=%s stage=%s', kind, stage)
         return
     except Exception as exc:
         logger.exception("Automatic 5-second print failed")
@@ -3699,7 +3702,7 @@ async def smart_process(update, context):
         if forced_kind in ("flight", "bus", "hotel", "package"):
             result = {"kind": forced_kind, "confidence": 1.0, "reason": f"{forced_kind.title()} mode was selected manually.", "reference": "", "instruction": text}
         elif parts or supplier_text:
-            result = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_classify, parts, text, AI_API_KEY, AI_MODEL), ["🤖 AI is identifying the supplier document type...", "🔎 Reading the supplied material..."], 20, 48)
+            result = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_classify, parts, text, AI_API_KEY, AI_MODEL), ["⚡ Identifying the supplier document type locally...", "🔎 Reading the supplied material..."], 20, 48)
         else:
             # V168: deterministic no-prefix routing before Groq AI planning.
             # This prevents natural Tour briefs such as "Goa 4N/5D..." from being
@@ -5640,13 +5643,6 @@ async def process_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END if 'tour' != 'tour' else None
     context.user_data['_source_processing'] = 'tour'
     _cancel_source_auto_process(context)
-    if not AI_API_KEY:
-        await update.message.reply_text(
-            "❌ GROQ_API_KEY is not configured in Northflank.",
-            reply_markup=main_keyboard()
-        )
-        return
-
     # Always create the live progress message at the BOTTOM of the chat when real
     # processing begins. Editing the earlier "source received" acknowledgement made
     # the owner scroll upward to watch progress.
@@ -5713,11 +5709,11 @@ async def process_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await progress(58, "🏨 Organizing accommodation, transport and day-wise itinerary...")
         await asyncio.sleep(0.2)
-        await progress(72, "🗺️ AI-writing detailed day-wise sightseeing descriptions...")
+        await progress(72, "🗺️ Preserving the supplier day-wise plan...")
         await asyncio.sleep(0.2)
-        await progress(84, "🧳 AI-building professional package inclusions from the itinerary...")
+        await progress(84, "🧳 Building concise package inclusions locally...")
         await asyncio.sleep(0.2)
-        await progress(92, "🚫 AI-building professional customer-facing exclusions...")
+        await progress(92, "🚫 Building concise package exclusions locally...")
         await asyncio.sleep(0.2)
 
         # Apply any user-added inclusions/exclusions.
@@ -6250,10 +6246,10 @@ def build_whatsapp_itinerary(data, detail_level=None):
             lines.append(f"• {h.get('destination','')} — " + " | ".join(parts))
     if data.get("inclusions"):
         lines += ["", "✅ INCLUSIONS"]
-        lines.extend(f"• {x}" for x in data.get("inclusions", []))
+        lines.extend(f"• {x}" for x in (data.get("inclusions", []) or [])[:8])
     if data.get("exclusions"):
         lines += ["", "❌ EXCLUSIONS"]
-        lines.extend(f"• {x}" for x in data.get("exclusions", []))
+        lines.extend(f"• {x}" for x in (data.get("exclusions", []) or [])[:6])
     costs=data.get("package_costs") or []
     if costs and data.get("show_cost", True):
         lines += ["", "💰 PACKAGE COST"]

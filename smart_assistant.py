@@ -113,15 +113,44 @@ If the user is asking for a document operation, explain the next action briefly;
 
 
 def enhance_package_itinerary(current_data, api_key, model, detail_level="detailed"):
-    """Re-write an existing tour itinerary at basic or detailed level while preserving confirmed facts."""
+    """Rewrite day plans only; every non-day field remains local and immutable."""
+    source=json.loads(json.dumps(current_data or {}))
+    days=list(source.get('days') or [])
+    requested=str(detail_level).lower()
+    if requested == 'basic' and all(str(x.get('description') or '').strip() for x in days):
+        for day in days:
+            words=str(day.get('description') or '').split()
+            day['description']=' '.join(words[:70]).strip()
+            day['optional_activities']=[]
+        source['days']=days
+        source['detail_level']='basic'
+        return source
+
+    # A complete supplier narrative needs no AI rewriting. Preserve it exactly.
+    if requested == 'detailed' and days and all(len(str(x.get('description') or '').split()) >= 90 for x in days):
+        source['detail_level']='detailed'
+        return source
+    if not api_key:
+        source['detail_level']=requested
+        return source
+
     client = genai.Client(api_key=api_key)
-    mode = "BASIC" if str(detail_level).lower() == "basic" else "DETAILED"
+    mode = "BASIC" if requested == "basic" else "DETAILED"
+    day_schema={
+        'type':'object','properties':{'days':{'type':'array','items':{
+            'type':'object','properties':{
+                'day':{'type':'string'},'title':{'type':'string'},
+                'description':{'type':'string'},
+                'optional_activities':{'type':'array','items':{'type':'string'}},
+            },'required':['day','title','description','optional_activities']
+        }}},'required':['days']
+    }
     prompt = f"""
 You are MyTourBazar's senior travel itinerary editor.
-Rewrite the existing tour itinerary at {mode} detail level.
+Write ONLY the day-wise tour plan at {mode} detail level.
 
 FACT SAFETY:
-- Preserve all confirmed dates, hotels, transport, meal plans, inclusions and exclusions exactly.
+- Use only the supplied day titles/descriptions and destination as factual evidence.
 - Never invent a hotel, flight, booking, price or confirmed service.
 - You may improve destination descriptions using normal travel knowledge.
 - Optional activities are suggestions only and must never be presented as included/booked.
@@ -132,7 +161,7 @@ BASIC MODE:
 - optional_activities must be [].
 
 DETAILED MODE:
-- 200-300 words per day. This must read like a full agency-prepared, client-ready itinerary, not a summary.
+- 90-140 words per day. Keep it useful, polished and free of repetitive filler.
 - Give every day a clear professional flow: arrival/start, morning, sightseeing sequence, afternoon, evening, hotel return/check-in and overnight stay wherever supported.
 - Explain each confirmed attraction and experience meaningfully, including what the guest will see or do, without inventing booked services.
 - Structure each day naturally as a professional travel planner would: morning/start of the day, sightseeing and experiences in logical sequence, afternoon, and evening/return or leisure where applicable.
@@ -144,32 +173,35 @@ DETAILED MODE:
 - Keep the writing polished, warm and customer-facing, like a professional tour operator's final itinerary.
 - Add 2-4 destination-appropriate optional activities for EVERY day where leisure or sightseeing makes them possible. Travel-only days should still receive 1-2 sensible optional suggestions when practical. Label them clearly as OPTIONAL / AT OWN COST and never present them as included.
 
-Return ONLY the complete JSON matching the supplied itinerary schema.
+Return ONLY JSON containing the days array. Do not return title, dates, hotels,
+cost, guests, transport, inclusions, exclusions or any other package field.
 
-CURRENT ITINERARY:
-{json.dumps(current_data, ensure_ascii=False, indent=2)}
+DESTINATION: {source.get('destination') or ''}
+SOURCE DAYS:
+{json.dumps([{'day':x.get('day',''),'title':x.get('title',''),'description':x.get('description','')} for x in days], ensure_ascii=False, indent=2)}
 """
     response = call_with_high_demand_retry(lambda: client.models.generate_content(
         model=model,
         contents=[prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=ITINERARY_SCHEMA,
+            response_schema=day_schema,
             temperature=0.25,
         ),
     ))
     if not response.text:
         raise RuntimeError("Gemini returned an empty itinerary enhancement response.")
-    data = json.loads(response.text)
-    # Basic/Detailed is a day-description rewrite, not a fresh extraction.
-    # These source/draft lists are authoritative and must survive unchanged into
-    # WhatsApp and PDF output even if the model returns empty arrays.
-    data["inclusions"] = list((current_data or {}).get("inclusions") or [])
-    data["exclusions"] = list((current_data or {}).get("exclusions") or [])
-    data["detail_level"] = str(detail_level).lower()
-    for day in data.get("days", []):
+    generated = json.loads(response.text).get('days') or []
+    by_day={str(x.get('day') or '').strip().lower():x for x in generated}
+    merged=[]
+    for original in days:
+        day=dict(original)
+        candidate=by_day.get(str(original.get('day') or '').strip().lower()) or {}
+        for key in ('title','description','optional_activities'):
+            if candidate.get(key) not in (None,''):
+                day[key]=candidate[key]
         day.setdefault("optional_activities", [])
-        if str(detail_level).lower() == "basic":
+        if requested == "basic":
             day["optional_activities"] = []
         elif not day.get("optional_activities"):
             # Last-resort client-safe suggestions. These are deliberately generic,
@@ -178,7 +210,10 @@ CURRENT ITINERARY:
                 "Explore the nearby local market and shop for regional products at own cost",
                 "Try a local café or regional dining experience during available leisure time at own cost",
             ]
-    return data
+        merged.append(day)
+    source['days']=merged
+    source["detail_level"] = requested
+    return source
 
 
 def _classifier_source(item, work_dir):
@@ -227,37 +262,24 @@ def _extract_local_source_text(path, max_chars=50000):
     return ''
 
 def classify(parts, text, api_key, model):
-    """Fast source-aware classification: text-first for PDFs, visuals only when text is unavailable."""
-    client=genai.Client(api_key=api_key)
-    contents=[CLASSIFIER_PROMPT]
-    combined=str(text or '').strip(); visual=[]
+    """Classify supplier material locally without consuming a Groq request."""
+    combined=str(text or '').strip()
     for item in parts or []:
         local=_extract_local_source_text(item.get('path',''))
         if local: combined += '\n' + local
-        else: visual.append(item)
-    if combined: contents.append('\nCOMPLETE NORMALIZED SOURCE TEXT:\n'+combined[:50000])
-    work_dir=Path(__file__).resolve().parent/'data'/'tmp_classifier'; temps=[]
-    try:
-        for item in visual[:3]:
-            prepared,tmp=_classifier_source(item,work_dir)
-            if tmp: temps.append(Path(tmp))
-            p=Path(prepared['path']); contents.append(types.Part.from_bytes(data=p.read_bytes(),mime_type=prepared['mime_type']))
-        response=call_with_high_demand_retry(lambda: client.models.generate_content(model=model,contents=contents,config=types.GenerateContentConfig(response_mime_type='application/json',response_schema=CLASS_SCHEMA,temperature=0)))
-        if not response.text: raise RuntimeError('AI classification returned an empty response.')
-        result=json.loads(response.text)
-        low=combined.lower()
-        tour_hits=sum(x in low for x in ('day 1','day 2','day 3','day 4','inclusions','exclusions','package cost','accommodation schedule','per adult','sightseeing'))
-        if tour_hits>=3 and ('day 1' in low or 'day 2' in low) and len(low)>800:
-            result['kind']='package'; result['confidence']=max(float(result.get('confidence',0) or 0),0.92)
-            result['reason']='Multi-day package structure detected; embedded flights/hotels are treated as tour components.'
-        return result
-    finally:
-        for q in temps:
-            try:q.unlink(missing_ok=True)
-            except:pass
-        try:
-            if work_dir.exists() and not any(work_dir.iterdir()): work_dir.rmdir()
-        except:pass
+    low=combined.lower()
+    tour_hits=sum(x in low for x in ('day 1','day 2','day 3','inclusions','exclusions','package cost','accommodation','sightseeing','cwb','cnb'))
+    scores={
+        'package':tour_hits + (4 if re.search(r'(?im)^\s*day\s*[12]\b',combined) else 0),
+        'flight':sum(x in low for x in ('airline','flight no','flight number','e-ticket','sector','airport','gds pnr')),
+        'bus':sum(x in low for x in ('bus operator','boarding point','dropping point','seat no','coach','bus pnr')),
+        'hotel':sum(x in low for x in ('check-in','check in','check-out','check out','room type','hotel confirmation','number of nights')),
+    }
+    kind=max(scores,key=scores.get) if max(scores.values(),default=0)>0 else 'unknown'
+    confidence=min(0.99,0.55+(scores.get(kind,0)*0.07)) if kind!='unknown' else 0.0
+    return {'kind':kind,'confidence':confidence,
+            'reason':f'Local document markers matched {kind}.' if kind!='unknown' else 'No reliable local document markers found.',
+            'reference':'','instruction':str(text or '')}
 
 
 NEW_TOUR_BRIEF_PROMPT = """
@@ -320,30 +342,23 @@ OWNER BRIEF:
 """
 
 def generate_package_from_brief(brief, api_key, model, detail_level="basic"):
-    """Create a new Tour itinerary from the owner's natural-language brief."""
-    client = genai.Client(api_key=api_key)
-    mode = "DETAILED" if str(detail_level).lower() == "detailed" else "BASIC"
-    prompt = (
-        NEW_TOUR_BRIEF_PROMPT
-        + "\nREQUESTED DETAIL LEVEL: " + mode
-        + "\n\n" + str(brief or "").strip()
-    )
-    response = call_with_high_demand_retry(lambda: client.models.generate_content(
-        model=model,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ITINERARY_SCHEMA,
-            temperature=0.22,
-        ),
-    ))
-    if not response.text:
-        raise RuntimeError("AI Assistant returned an empty Tour itinerary.")
-    data = json.loads(response.text)
-    data["detail_level"] = str(detail_level).lower()
-    for day in data.get("days", []):
-        day.setdefault("optional_activities", [])
-    return data
+    """Create local package facts, using Groq only to write missing day plans."""
+    from extractor import extract_itinerary_from_parts
+    data=extract_itinerary_from_parts([],str(brief or ''),api_key,model)
+    if not data.get('days'):
+        import re
+        m=re.search(r'(?i)\b(\d{1,2})\s*(?:days?|d)\b',str(brief or ''))
+        if not m:
+            nights=re.search(r'(?i)\b(\d{1,2})\s*(?:nights?|n)\b',str(brief or ''))
+            count=int(nights.group(1))+1 if nights else 1
+        else:
+            count=int(m.group(1))
+        destination=data.get('destination') or 'Destination'
+        data['days']=[{'day':str(i),'date':'','title':f'{destination} – Day {i}',
+                      'description':'','stay':'','meal_plan':'','optional_activities':[]}
+                     for i in range(1,min(count,31)+1)]
+        data['duration']=data.get('duration') or f'{count} Days'
+    return enhance_package_itinerary(data,api_key,model,detail_level)
 
 
 def chat(text, api_key, model):

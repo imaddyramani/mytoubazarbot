@@ -153,9 +153,8 @@ def _extract_bus_local(text):
     return data
 
 def extract_bus_ticket(file_parts, source_text, api_key, model):
-    from supplier_repair import repair_if_needed
     text=collect_local_document_text(file_parts,source_text,max_chars=40000)
-    return repair_if_needed('bus',_extract_bus_local(text),text,SCHEMA,api_key,model)
+    return _extract_bus_local(text)
 
 def distribute_fare(updated_total, original_base, original_tax):
     total=float(updated_total); ob=max(float(original_base or 0),0); ot=max(float(original_tax or 0),0)

@@ -14,6 +14,26 @@ def logo_uri(path):
         return ""
     return "data:image/png;base64," + base64.b64encode(Path(path).read_bytes()).decode()
 
+def tour_display_title(data):
+    destination=str((data or {}).get('destination') or '').strip()
+    low=destination.lower()
+    titles=(('kashmir','Mesmerizing Kashmir'),('kerala','Mesmerizing Kerala'),
+            ('goa','Gorgeous Goa'),('rajasthan','Royal Rajasthan'),
+            ('himachal','Himachal Highlights'),('manali','Magical Manali'),
+            ('bhutan','Beautiful Bhutan'),('bali','Beautiful Bali'),
+            ('dubai','Dazzling Dubai'),('andaman','Amazing Andaman'),
+            ('ladakh','Legendary Ladakh'))
+    if 'sikkim' in low and 'darjeeling' in low:
+        return 'Enchanting Sikkim & Darjeeling'
+    for key,title in titles:
+        if re.search(r'\b'+re.escape(key)+r'\b',low):
+            return title
+    if destination:
+        return f'Discover {destination}'
+    old=str((data or {}).get('tour_title') or '').strip()
+    old=re.sub(r'(?i)\b\d+\s*(?:nights?|days?|n|d)\b.*$','',old).strip(' |-')
+    return old or 'Customized Holiday'
+
 STANDARD_POLICIES = {
     "TERMS & CONDITIONS:-": [
         "No refund will be made for any unused accommodation, missed meals, transportation segments, sightseeing tours or any other service.",
@@ -457,8 +477,9 @@ def generate_pdf(data, output_path, logo_path=None, page_size="A4", text_scale_o
         )
     days = "".join(day_blocks) or "<p>No day-wise details provided.</p>"
 
-    inc = "".join(f"<li>{esc(x)}</li>" for x in data.get("inclusions", [])) or "<li>Not specified.</li>"
-    exc = "".join(f"<li>{esc(x)}</li>" for x in data.get("exclusions", [])) or "<li>Not specified.</li>"
+    # Keep service lists compact in every PDF, including older saved drafts.
+    inc = "".join(f"<li>{esc(x)}</li>" for x in (data.get("inclusions", []) or [])[:8]) or "<li>Not specified.</li>"
+    exc = "".join(f"<li>{esc(x)}</li>" for x in (data.get("exclusions", []) or [])[:6]) or "<li>Not specified.</li>"
     logo_html = f"<a href='{MYTOURBAZAR_LOGO_URL}'><img src='{logo}'></a>" if logo else ""
     total_text = sum(len(str(x.get('description',''))) for x in data.get('days', [])) + sum(len(str(x.get('hotel_name',''))) + len(str(x.get('room_category',''))) for x in data.get('hotels', []))
     total_rows = len(data.get('days', [])) + len(data.get('hotels', [])) + len(data.get('transit', []))
@@ -523,7 +544,7 @@ li{{margin-bottom:4px;font-size:8pt}}.policies{{font-size:7.8pt;white-space:pre-
 .transit-self{{text-align:center!important;vertical-align:middle!important;height:58px;font-weight:700}}.transit-airport{{font-size:7.5pt;color:#555}}.transit-ticket-note{{margin:2mm 1mm 3mm;padding:2mm 2.6mm;background:#fff7ed;border-left:3px solid #f4a62a;color:#5a4931;font-size:7.8pt;line-height:1.35}}</style></head><body class='{density_class}'>
 <div class='banner'><div class='logo'>{logo_html}</div><div class='head'>
 <div class='label'>{esc(data.get('document_title') or 'OFFICIAL TOUR ITINERARY')}</div><div class='client'>{esc(data.get('client_name'))}</div>
-<div class='title'>{esc(data.get('travel_dates'))} | {esc(data.get('tour_title'))} {('(' + esc(data.get('duration')) + ')') if data.get('duration') else ''}</div>
+<div class='title'>{esc(tour_display_title(data))}</div>
 </div></div>
 <div class='greet'>{greeting_html}</div>
 

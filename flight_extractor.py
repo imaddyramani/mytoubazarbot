@@ -2296,9 +2296,8 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         pass
     data=_final_endpoint_safety_gate(data)
 
-    from supplier_repair import repair_if_needed
-    data=repair_if_needed('flight',data,raw_source_text,SCHEMA,api_key,model)
-    used_ai=bool(data.get('_ai_fallback_used'))
+    # Air extraction is deliberately source-only. Groq is reserved for Tour
+    # day-plan writing and must never block an Air Print.
     data=_apply_baggage_summary(data)
     data=_apply_air_output_defaults(data,raw_source_text)
 
