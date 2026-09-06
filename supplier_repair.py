@@ -243,7 +243,16 @@ def repair_if_needed(kind, local, source, schema, api_key, model):
             continue
         # Correct a label captured as its own value, and expand locally shortened
         # values such as a one-line hotel address or operator/property name.
-        suspicious=bool(re.fullmatch(r'(?:checkin|checkout|arrival|departure|from|to|hotel|guest|room|operator|status)',old_norm))
+        suspicious=bool(
+            re.fullmatch(r'(?:checkin|checkout|arrival|departure|from|to|hotel|guest|room|operator|status)',old_norm)
+            or re.search(r'(?:detail|information|confirmationvoucher|hotelconfirmation|bookingbreakdown)',old_norm)
+        )
+        if key=='mobile' and (re.search(r'[A-Za-z]{3}',str(merged.get(key) or '')) or len(re.sub(r'\D','',str(merged.get(key) or '')))>13):
+            suspicious=True
+        if key in ('dep_city','arr_city') and re.search(r'(?i)\b(?:from|to|departure|arrival)\s*:',str(merged.get(key) or '')):
+            suspicious=True
+        if key in ('operator','dep_date') and re.search(r'(?i)\b(?:bus\s*type|dep(?:arture)?\s*time|journey\s*date)\s*:',str(merged.get(key) or '')):
+            suspicious=True
         if not old_norm or suspicious or (old_norm in new_norm and len(new_norm)>len(old_norm)):
             merged[key]=candidate.strip()
     if kind in ('flight','bus') and repaired.get('passengers'):

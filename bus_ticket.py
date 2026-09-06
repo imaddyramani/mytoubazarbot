@@ -46,8 +46,20 @@ def _fast_bus_pdf_text(path):
 def _local_value(text,labels,max_len=100):
     label='|'.join(labels)
     m=re.search(r'(?im)^\s*(?:'+label+r')\s*[:#\-]?\s*([^\r\n|]{1,'+str(max_len)+r'})',text)
+    if not m:
+        # Flattened PDF tables place the second column label after the first
+        # column's value, for example "From: Delhi  To: Nagpur".
+        m=re.search(r'(?im)(?:^|\s)(?:'+label+r')\s*[:#\-]\s*([^\r\n|]{1,'+str(max_len)+r'})',text)
     if not m: return ''
-    return re.sub(r'\s+',' ',m.group(1)).strip(' :-|')
+    value=re.sub(r'\s+',' ',m.group(1)).strip(' :-|')
+    # PDF table cells are often flattened onto one line. Never let the value in
+    # one column consume the next labelled column.
+    value=re.split(
+        r'(?i)\s+(?=(?:Ticket\s*Number|Seat\s*Number|Price|From|To|Travels|Bus\s*Type|'
+        r'Journey\s*Date|Dep(?:arture)?\s*Time|Arrival\s*Time|Boarding\s*(?:Time|Address)|'
+        r'Location|Landmark|Address|Contact\s*Number|RedBus\s*Help)\s*:)',value,maxsplit=1
+    )[0]
+    return value.strip(' :-|')
 
 def _local_amount(text,labels):
     value=_local_value(text,labels,80)
@@ -65,7 +77,7 @@ def _local_bus_passengers(text,boarding=''):
         else:
             # Common redBus/AbhiBus rows: SURNAME/FIRSTNAME MR, or a numbered
             # passenger row where type and seat follow the complete name.
-            m=re.search(r'(?i)(?:^|\b)(Mr|Mrs|Ms|Miss|Master|Mstr|Dr)\.?\s+([A-Za-z][A-Za-z .\'/\-]{2,60}?)(?=\s+(?:Seat|Adult|Child|Infant|ADT|CHD|INF|\d{1,2}[A-Z]?)\b|$)',clean)
+            m=re.search(r'(?i)(?:^|\b)(Mr|Mrs|Ms|Miss|Master|Mstr|Dr)\.?\s+([A-Za-z][A-Za-z .\'/\-]{2,60}?)(?=\s+(?:Seat|Adult|Child|Infant|ADT|CHD|INF|[A-Z0-9]{6,}|\d{1,2}[A-Z]?)\b|$)',clean)
             if m:
                 title=m.group(1)+'.'; name=m.group(2).strip(' ,-')
             else:
@@ -78,36 +90,65 @@ def _local_bus_passengers(text,boarding=''):
         seat=''; sm=re.search(r'(?i)\bSeat(?:\s*(?:No|Number))?\s*[:#\-]?\s*([A-Z0-9\-]{1,8})',clean)
         if not sm:
             sm=re.search(r'(?i)\b(?:Adult|Child|Infant|ADT|CHD|INF)\b\s+([A-Z]?(?:\d{1,3}[A-Z]?|[A-Z]\d{1,3}))\b',clean)
+        if not sm:
+            sm=re.search(r'\b[A-Z0-9]{6,}\b\s+([A-Z]?(?:\d{1,3}[A-Z]?|[A-Z]\d{1,3}))\s*$',clean,re.I)
         if sm: seat=sm.group(1)
         ptype='Child' if re.search(r'(?i)\b(?:Child|CHD)\b',clean) or title.lower().startswith(('master','mstr')) else 'Infant' if re.search(r'(?i)\b(?:Infant|INF)\b',clean) else 'Adult'
         out.append({'name':name,'title':title,'seat':seat,'type':ptype,'dob':'','boarding':boarding})
     return out
 
+def _bus_time(text,labels):
+    value=_local_value(text,labels,100)
+    hits=re.findall(r'(?i)\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\s*(?:AM|PM)?\b',value)
+    return hits[-1].strip() if hits else value
+
+def _bus_date(text,labels):
+    value=_local_value(text,labels,100)
+    m=re.search(r'(?i)\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|[0-3]?\d[-/]\d{1,2}[-/]\d{2,4}|[0-3]?\d\s+[A-Za-z]{3,9}\s+\d{2,4})\b',value)
+    return m.group(0) if m else value
+
+def _bus_boarding(text):
+    raw=str(text or '')
+    section=raw
+    m=re.search(r'(?is)\bBoarding\s+Address\b(.*?)(?=\b(?:Cancellation\s+Details|Terms\s*(?:&|and)|Passenger\s+Details)\b|$)',raw)
+    if m: section=m.group(1)
+    location=_local_value(section,[r'Location'],100)
+    landmark=_local_value(section,[r'Landmark'],100)
+    address=_local_value(section,[r'Address'],140)
+    parts=[]
+    if location: parts.append(location)
+    if landmark and landmark.lower()!=location.lower(): parts.append('Landmark: '+landmark)
+    if address and address.lower() not in {location.lower(),landmark.lower()}: parts.append('Address: '+address)
+    return ' | '.join(parts)
+
 def _extract_bus_local(text):
     raw=str(text or '')
-    boarding=_local_value(raw,[r'Boarding\s*(?:Point|Location)?',r'Pickup\s*(?:Point|Location)?'])
+    boarding=_bus_boarding(raw) or _local_value(raw,[r'Boarding\s*(?:Point|Location)',r'Pickup\s*(?:Point|Location)'])
     data={
         'booking_id':_local_value(raw,[r'Booking\s*(?:ID|Number|No\.?|Reference)',r'Ticket\s*(?:ID|Number|No\.?)']),
         'booking_date':_local_value(raw,[r'Booking\s*Date',r'Booked\s*On']),
         'pnr':_local_value(raw,[r'(?:Bus\s*)?PNR(?:\s*(?:Number|No\.?))?']),
         'status':_local_value(raw,[r'Status']),
-        'mobile':_local_value(raw,[r'(?:Passenger|Customer|Contact)\s*(?:Mobile|Phone)',r'Mobile\s*(?:No\.?|Number)?']),
+        'mobile':_local_value(raw,[r'(?:Passenger|Customer)\s*(?:Mobile|Phone)(?:\s*(?:No\.?|Number))?']),
         'operator':_local_value(raw,[r'Bus\s*Operator',r'Operator',r'Travels']),
         'bus_number':_local_value(raw,[r'Bus\s*(?:No\.?|Number|Registration)']),
         'bus_type':_local_value(raw,[r'Bus\s*Type',r'Coach\s*Type']),
-        'dep_time':_local_value(raw,[r'Departure\s*Time',r'Departs?']),
+        'dep_time':_bus_time(raw,[r'Departure\s*Time',r'Dep\s*Time',r'Departs?']),
         'dep_city':_local_value(raw,[r'From',r'Origin',r'Departure\s*City']),
-        'dep_date':_local_value(raw,[r'(?:Journey|Travel|Departure)\s*Date']),
+        'dep_date':_bus_date(raw,[r'(?:Journey|Travel|Departure)\s*Date']),
         'boarding_point':boarding,
-        'arr_time':_local_value(raw,[r'Arrival\s*Time',r'Arrives?']),
+        'arr_time':_bus_time(raw,[r'Arrival\s*Time',r'Arrives?']),
         'arr_city':_local_value(raw,[r'To',r'Destination',r'Arrival\s*City']),
-        'arr_date':_local_value(raw,[r'Arrival\s*Date']),
+        'arr_date':_bus_date(raw,[r'Arrival\s*Date']),
         'drop_point':_local_value(raw,[r'(?:Drop|Dropping)\s*(?:Point|Location)?']),
         'duration':_local_value(raw,[r'Duration',r'Travel\s*Time']),
-        'base_fare':_local_amount(raw,[r'Base\s*Fare',r'Ticket\s*Fare']),
+        'base_fare':_local_amount(raw,[r'Base\s*Fare',r'Ticket\s*Fare',r'Price',r'Total\s*Fare']),
         'taxes':_local_amount(raw,[r'Tax(?:es)?',r'GST']),
     }
     data['passengers']=_local_bus_passengers(raw,boarding)
+    if not data['booking_id']:
+        m=re.search(r'(?im)^\s*(?:Mr|Mrs|Ms|Miss|Master|Mstr|Dr)\.?\s+[A-Za-z][A-Za-z .\'/\-]{2,80}?\s+([A-Z0-9]{6,})\s+[A-Z0-9\-]{1,8}\s*$',raw)
+        if m: data['booking_id']=m.group(1)
     if not data['status']: data['status']='CONFIRMED' if data['pnr'] else 'PENDING'
     return data
 

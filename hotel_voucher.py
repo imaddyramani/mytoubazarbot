@@ -95,7 +95,15 @@ def _fast_hotel_pdf_text(path):
 def _hotel_local_value(text,labels,max_len=140):
     label='|'.join(labels)
     m=re.search(r'(?im)^\s*(?:'+label+r')\s*[:#\-]?\s*([^\r\n|]{1,'+str(max_len)+r'})',text)
-    return re.sub(r'\s+',' ',m.group(1)).strip(' :-|') if m else ''
+    if not m: return ''
+    value=re.sub(r'\s+',' ',m.group(1)).strip(' :-|')
+    value=re.split(
+        r'(?i)\s+(?=(?:Guest|Mobile|Hotel|Property|Address|City|Destination|Check[\s-]*in|'
+        r'Check[\s-]*out|Nights?|Room\s*(?:Type|Category|Count)|Occupancy|Pax|Meal\s*Plan|'
+        r'Board\s*Basis|Base\s*(?:Fare|Amount)|Tax(?:es)?|GST|Grand\s*Total|Total\s*Amount)\s*:)',
+        value,maxsplit=1
+    )[0]
+    return value.strip(' :-|')
 
 def _hotel_local_amount(text,labels):
     value=_hotel_local_value(text,labels,80)
@@ -152,7 +160,7 @@ def _extract_hotel_local(text):
     if not room_type:
         m=re.search(r'(?im)^\s*((?:Deluxe|Superior|Standard|Executive|Premium|Suite|Family|Double|Twin)[^\n]{0,70}\bRoom\b[^\n]{0,30})$',raw)
         if m: room_type=re.sub(r'\s+',' ',m.group(1)).strip()
-    occupancy=_hotel_local_value(raw,[r'Occupancy(?:\s*Summary)?',r'Pax',r'Guests?(?!\s*Name)'])
+    occupancy=_hotel_local_value(raw,[r'Occupancy(?:\s*Summary)?',r'Pax(?=\s*:)'])
     if not occupancy:
         m=re.search(r'(?i)\b\d+\s*Adults?\b(?:\s*[,;+&]\s*\d+\s*(?:Children|Child|Infants?))?',raw)
         if m: occupancy=m.group(0)
@@ -165,9 +173,9 @@ def _extract_hotel_local(text):
     if taxes>0: costs.append({'description':'Taxes and Fees','quantity':1,'rate':taxes,'nights':1,'total':taxes})
     return {
         'reservation_id':_hotel_local_value(raw,[r'(?:Reservation|Confirmation|Booking)\s*(?:ID|Number|No\.?|Reference)']),
-        'guest_name':_hotel_local_value(raw,[r'(?:Lead\s*)?Guest\s*(?:Name)?',r'Booked\s*For']),
+        'guest_name':_hotel_local_value(raw,[r'(?:Lead\s*)?Guest\s*Name',r'Guest(?=\s*:)',r'Booked\s*For']),
         'mobile':_hotel_local_value(raw,[r'(?:Guest|Customer|Contact)\s*(?:Mobile|Phone)',r'Mobile\s*(?:No\.?|Number)?']),
-        'hotel_name':_hotel_local_value(raw,[r'Hotel\s*(?:Name)?',r'Property\s*(?:Name)?']),
+        'hotel_name':_hotel_local_value(raw,[r'Hotel\s*Name',r'Hotel(?=\s*:)',r'Property\s*Name',r'Property(?=\s*:)']),
         'hotel_address':_hotel_local_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address']),
         'hotel_city':_hotel_local_value(raw,[r'Hotel\s*City',r'City',r'Destination']),
         'check_in':check_in,
