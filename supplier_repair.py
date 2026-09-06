@@ -1,5 +1,6 @@
 """One Groq repair only when deterministic booking extraction is incomplete."""
 import copy
+from difflib import SequenceMatcher
 import json
 import logging
 import math
@@ -172,6 +173,47 @@ def _normalize(value):
     return re.sub(r'[^a-z0-9]','',str(value).lower())
 
 
+def _name_tokens(value):
+    tokens=re.findall(r'[a-z0-9]+',str(value or '').lower())
+    titles={'mr','mrs','ms','miss','master','mstr','dr','prof','adult','child','infant','adt','chd','inf'}
+    return [x for x in tokens if x not in titles]
+
+
+def _name_similarity(left,right):
+    a=''.join(_name_tokens(left)); b=''.join(_name_tokens(right))
+    if not a or not b: return 0.0
+    direct=SequenceMatcher(None,a,b).ratio()
+    ordered=SequenceMatcher(None,''.join(sorted(_name_tokens(left))),''.join(sorted(_name_tokens(right)))).ratio()
+    return max(direct,ordered)
+
+
+def _person_name_supported(name,source,local_names=()):
+    """Verify names across OCR line wraps and SURNAME/FIRSTNAME layouts."""
+    key=_normalize(name)
+    normalized_source=_normalize(source)
+    if key and key in normalized_source:
+        return True
+    wanted=_name_tokens(name)
+    if not wanted: return False
+    lines=[re.sub(r'[^a-z0-9]+',' ',x.lower()).split() for x in str(source or '').splitlines()]
+    for i in range(len(lines)):
+        window=sum(lines[i:min(len(lines),i+3)],[])
+        if all(token in window for token in wanted):
+            return True
+    candidates=_source_person_names(source)
+    if any(_name_similarity(name,candidate)>=0.82 for candidate in candidates):
+        return True
+    # A very close local extraction is safe fallback evidence for a minor OCR or
+    # punctuation normalization difference. Prefix-only expansions are excluded.
+    for candidate in local_names:
+        a=''.join(_name_tokens(name)); b=''.join(_name_tokens(candidate))
+        if a and b and not (a.startswith(b) or b.startswith(a)) and _name_similarity(name,candidate)>=0.88:
+            return True
+        if a==b and a:
+            return True
+    return False
+
+
 def _validate(value, schema):
     expected=schema.get('type')
     if expected=='object':
@@ -219,9 +261,16 @@ def repair_if_needed(kind, local, source, schema, api_key, model):
         raise ValueError('Groq repair failed. Retry later or supply the missing booking fields as text.') from exc
     # At minimum names and endpoint codes must be transcriptions of this source.
     normalized_source=_normalize(source)
+    local_names=[str(row.get('name') or '') for row in local.get('passengers') or []]
+    accepted=[]; rejected=0
     for row in repaired.get('passengers') or []:
-        if row.get('name') and _normalize(row['name']) not in normalized_source:
-            raise ValueError('AI passenger name could not be verified against supplier text.')
+        if not row.get('name') or _person_name_supported(row['name'],source,local_names):
+            accepted.append(row)
+        else:
+            rejected+=1
+    if rejected:
+        LOGGER.warning('Ignored %d unverified AI passenger row(s); retaining local source rows.',rejected)
+        repaired['passengers']=accepted
     for key in ('guest_name','airline_pnr','gds_pnr','pnr'):
         if repaired.get(key) and _normalize(repaired[key]) not in normalized_source:
             raise ValueError('AI '+key+' could not be verified against supplier text.')
