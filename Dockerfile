@@ -5,6 +5,9 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV OMP_THREAD_LIMIT=1
+ENV OMP_NUM_THREADS=1
+ENV MALLOC_ARENA_MAX=2
 
 # System libraries required by WeasyPrint/Pango + common PDF/image/font operations.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,6 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpangoft2-1.0-0 \
     libpng16-16 \
     poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     fonts-dejavu-core \
     fonts-liberation \
     fonts-noto-core \
