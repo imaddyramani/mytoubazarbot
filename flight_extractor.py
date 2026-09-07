@@ -3,10 +3,6 @@ from contextvars import ContextVar
 from functools import wraps
 import copy
 from pathlib import Path
-from google import genai
-from google.genai import types
-
-from ai_retry import call_with_high_demand_retry
 from performance_utils import collect_local_document_text
 
 _layout_cache = ContextVar('air_layout_cache', default=None)
@@ -782,14 +778,11 @@ def _clean_pnr_candidate(value):
 
 
 def _sanitize_air_identifiers(data):
-    """Repair PNR/Trip-ID field shifts caused by flattened supplier PDF labels."""
+    """Validate each identifier only in its labelled field."""
     data=data or {}
     airline=_clean_pnr_candidate(data.get('airline_pnr'))
     gds=_clean_pnr_candidate(data.get('gds_pnr'))
     booking_raw=str(data.get('booking_id') or '').strip()
-    misplaced=_clean_pnr_candidate(booking_raw)
-    if not airline and misplaced:
-        airline=misplaced
     data['airline_pnr']=airline
     data['gds_pnr']=gds
     if not re.fullmatch(r'\d{5}',booking_raw):
@@ -1467,86 +1460,20 @@ def _apply_verified_endpoint_rows(data, verified):
 
 
 def _verify_endpoint_rows(client, model, original_paths, source_text=''):
-    """One focused multimodal pass that reads each Departure/Arrival row independently."""
-    contents = [ENDPOINT_ROW_PROMPT]
-    if source_text:
-        contents.append(
-            '\nSOURCE TEXT (use only as supporting evidence; preserve visual row ownership):\n'
-            + str(source_text)[:18000]
-        )
-
-    added = 0
-    for p in original_paths or []:
-        try:
-            p = Path(p)
-            if not p.exists():
-                continue
-            suffix = p.suffix.lower()
-            if suffix == '.pdf':
-                mime = 'application/pdf'
-            elif suffix in ('.png',):
-                mime = 'image/png'
-            elif suffix in ('.webp',):
-                mime = 'image/webp'
-            else:
-                mime = 'image/jpeg'
-            contents.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
-            added += 1
-        except Exception:
-            continue
-
-    if not added and not source_text:
-        return {'segments': []}
-
-    rr = call_with_high_demand_retry(lambda: client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type='application/json',
-            response_schema=ENDPOINT_ROW_SCHEMA,
-            temperature=0,
-        )
-    ))
-    if not rr.text:
-        return {'segments': []}
-    return json.loads(rr.text)
+    """Retained compatibility hook; endpoints are verified locally upstream."""
+    return {'segments': []}
 
 
 def _focused_endpoint_verify(client, model, original_paths, seg, source_text=''):
-    """One sector per model call: prevents connection-row cross-contamination."""
-    identity=(
-        f"TARGET SECTOR ONLY:\n"
-        f"Flight: {seg.get('flight_number','')}\n"
-        f"Departure: {seg.get('dep_code','')} {seg.get('dep_time','')}\n"
-        f"Arrival: {seg.get('arr_code','')} {seg.get('arr_time','')}\n"
-    )
-    contents=[FOCUSED_ENDPOINT_PROMPT,identity]
-    if source_text:
-        contents.append('\nSOURCE TEXT (supporting only; visual row ownership wins):\n'+str(source_text)[:18000])
-    added=0
-    for p in original_paths or []:
-        try:
-            p=Path(p)
-            if not p.exists(): continue
-            suffix=p.suffix.lower()
-            mime='application/pdf' if suffix=='.pdf' else ('image/png' if suffix=='.png' else ('image/webp' if suffix=='.webp' else 'image/jpeg'))
-            contents.append(types.Part.from_bytes(data=p.read_bytes(),mime_type=mime)); added+=1
-        except Exception:
-            continue
-    if not added and not source_text:
-        return {}
-    rr=call_with_high_demand_retry(lambda: client.models.generate_content(
-        model=model,contents=contents,
-        config=types.GenerateContentConfig(response_mime_type='application/json',response_schema=FOCUSED_ENDPOINT_SCHEMA,temperature=0)
-    ))
-    return json.loads(rr.text) if rr.text else {}
+    """Retained compatibility hook; no remote verification is performed."""
+    return {}
 
 
 def _apply_focused_endpoint(seg,row):
     if not row: return seg
     dep_text,dep_terminal=_compose_verified_endpoint(row.get('dep_endpoint_text'),row.get('dep_terminal'),row.get('dep_terminal_evidence'))
     arr_text,arr_terminal=_compose_verified_endpoint(row.get('arr_endpoint_text'),row.get('arr_terminal'),row.get('arr_terminal_evidence'))
-    # Never replace a deterministic selectable-PDF lock with AI text.
+    # Never replace a deterministic selectable-PDF lock with unverified text.
     if not seg.get('dep_airport_source_locked') and dep_text and not _endpoint_is_suspicious(dep_text):
         dep_field=_separate_endpoint_code_prefix(dep_text,seg.get('dep_code'))
         seg['dep_endpoint_source_raw']=dep_text; seg['dep_airport']=dep_field; seg['dep_airport_source_exact']=dep_field; seg['dep_terminal']=dep_terminal
@@ -2070,9 +1997,14 @@ def _local_baggage_summary(raw):
 
 
 def _local_passengers_from_text(raw,baggage_summary=''):
-    lines=[re.sub(r'\s+',' ',x).strip() for x in str(raw or '').splitlines() if str(x).strip()]
+    lines=[]
+    for value in str(raw or '').splitlines():
+        value=re.sub(r'(?<=[a-z])(?=[A-Z])',' ',str(value or ''))
+        value=re.sub(r'(?i)^(Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof)(?=[A-Z])',r'\1 ',value)
+        value=re.sub(r'\s+',' ',value).strip()
+        if value: lines.append(value)
     passengers=[]; seen=set()
-    title_pat=re.compile(r"(?i)\b(Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof)\.?\s+([A-Za-z][A-Za-z .'/-]{2,90})")
+    title_pat=re.compile(r"(?i)\b(Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof|Me|Mt)[.,]?\s+([A-Za-z][A-Za-z .'/-]{2,90})")
     suffix_pat=re.compile(r"(?i)^\s*([A-Z][A-Z\'-]{1,35})\s*[/,]\s*([A-Z][A-Z .\'-]{1,55}?)\s+(MR|MRS|MS|MISS|MASTER|MSTR)\.?\b")
     end_title_pat=re.compile(r"(?i)^\s*([A-Z][A-Z .\'-]{3,90}?)\s+(MR|MRS|MS|MISS|MASTER|MSTR)\.?\s*(?:(?:ADT|CHD|INF|Adult|Child|Infant)\b|$)")
     row_pat=re.compile(r"(?i)^\s*\d{1,2}[.)]?\s+([A-Za-z][A-Za-z .'/-]{2,60}?)\s+(Adult|Child|Infant|ADT|CHD|INF)\b")
@@ -2090,7 +2022,9 @@ def _local_passengers_from_text(raw,baggage_summary=''):
             else:
                 m=title_pat.search(line)
                 if m:
-                    title=m.group(1)+('.' if not m.group(1).endswith('.') else '')
+                    raw_title=m.group(1)
+                    if raw_title.lower() in ('me','mt'): raw_title='Mr'
+                    title=raw_title+('.' if not raw_title.endswith('.') else '')
                     name=m.group(2)
                     name=re.split(r'(?i)\s+(?:'+stop_pat+r'|\d{10,})\b',name)[0].strip(' ,-')
                     # Selectable PDF tables sometimes wrap the surname onto the next text
@@ -2099,7 +2033,7 @@ def _local_passengers_from_text(raw,baggage_summary=''):
                         nxt=lines[line_no+1]
                         cm=re.match(r"^([A-Za-z][A-Za-z'\-]{1,35})(?=\s+(?:"+stop_pat+r")\b|$)",nxt,re.I)
                         continuation=cm.group(1) if cm else ''
-                        looks_like_pnr=(continuation.isupper() and 5<=len(continuation)<=9)
+                        looks_like_pnr=(continuation.isupper() and 5<=len(continuation)<=9) or continuation.lower() in _PNR_LABEL_WORDS
                         if (continuation and not looks_like_pnr
                                 and not re.search(r'(?i)\b(?:flight|airport|booking|fare|total|status|operator)\b',nxt)):
                             name=(name+' '+continuation).strip()
@@ -2296,8 +2230,8 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         pass
     data=_final_endpoint_safety_gate(data)
 
-    # Air extraction is deliberately source-only. Groq is reserved for Tour
-    # day-plan writing and must never block an Air Print.
+    # Missing optional fields remain blank. A remote repair must never block
+    # Air Print or overwrite names, PNR, baggage and sectors recovered locally.
     data=_apply_baggage_summary(data)
     data=_apply_air_output_defaults(data,raw_source_text)
 

@@ -15,23 +15,16 @@ def logo_uri(path):
     return "data:image/png;base64," + base64.b64encode(Path(path).read_bytes()).decode()
 
 def tour_display_title(data):
-    destination=str((data or {}).get('destination') or '').strip()
-    low=destination.lower()
-    titles=(('kashmir','Mesmerizing Kashmir'),('kerala','Mesmerizing Kerala'),
-            ('goa','Gorgeous Goa'),('rajasthan','Royal Rajasthan'),
-            ('himachal','Himachal Highlights'),('manali','Magical Manali'),
-            ('bhutan','Beautiful Bhutan'),('bali','Beautiful Bali'),
-            ('dubai','Dazzling Dubai'),('andaman','Amazing Andaman'),
-            ('ladakh','Legendary Ladakh'))
-    if 'sikkim' in low and 'darjeeling' in low:
-        return 'Enchanting Sikkim & Darjeeling'
+    destination=str((data or {}).get('destination') or '').strip(); low=destination.lower()
+    titles=(('kashmir','Mesmerizing Kashmir'),('kerala','Mesmerizing Kerala'),('goa','Gorgeous Goa'),
+            ('rajasthan','Royal Rajasthan'),('himachal','Himachal Highlights'),('manali','Magical Manali'),
+            ('bhutan','Beautiful Bhutan'),('bali','Beautiful Bali'),('dubai','Dazzling Dubai'),
+            ('andaman','Amazing Andaman'),('ladakh','Legendary Ladakh'))
+    if 'sikkim' in low and 'darjeeling' in low: return 'Enchanting Sikkim & Darjeeling'
     for key,title in titles:
-        if re.search(r'\b'+re.escape(key)+r'\b',low):
-            return title
-    if destination:
-        return f'Discover {destination}'
-    old=str((data or {}).get('tour_title') or '').strip()
-    old=re.sub(r'(?i)\b\d+\s*(?:nights?|days?|n|d)\b.*$','',old).strip(' |-')
+        if re.search(r'\b'+re.escape(key)+r'\b',low): return title
+    if destination: return f'Discover {destination}'
+    old=re.sub(r'(?i)\b\d+\s*(?:nights?|days?|n|d)\b.*$','',str((data or {}).get('tour_title') or '')).strip(' |-')
     return old or 'Customized Holiday'
 
 STANDARD_POLICIES = {
@@ -477,7 +470,6 @@ def generate_pdf(data, output_path, logo_path=None, page_size="A4", text_scale_o
         )
     days = "".join(day_blocks) or "<p>No day-wise details provided.</p>"
 
-    # Keep service lists compact in every PDF, including older saved drafts.
     inc = "".join(f"<li>{esc(x)}</li>" for x in (data.get("inclusions", []) or [])[:8]) or "<li>Not specified.</li>"
     exc = "".join(f"<li>{esc(x)}</li>" for x in (data.get("exclusions", []) or [])[:6]) or "<li>Not specified.</li>"
     logo_html = f"<a href='{MYTOURBAZAR_LOGO_URL}'><img src='{logo}'></a>" if logo else ""

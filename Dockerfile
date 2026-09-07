@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig1 \
     libfreetype6 \
     libglib2.0-0 \
+    libgl1 \
+    libgomp1 \
     libgdk-pixbuf-2.0-0 \
     libharfbuzz0b \
     libharfbuzz-subset0 \
@@ -28,8 +30,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpangoft2-1.0-0 \
     libpng16-16 \
     poppler-utils \
-    tesseract-ocr \
-    tesseract-ocr-eng \
     fonts-dejavu-core \
     fonts-liberation \
     fonts-noto-core \

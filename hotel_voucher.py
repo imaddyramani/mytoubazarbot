@@ -3,12 +3,9 @@ import base64
 import re
 from pathlib import Path
 from html import escape
-from google import genai
-from google.genai import types
 from pdf_render import write_pdf
 
 from print_settings import apply_css_settings
-from ai_retry import call_with_high_demand_retry
 from performance_utils import extract_pdf_text, collect_local_document_text
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"

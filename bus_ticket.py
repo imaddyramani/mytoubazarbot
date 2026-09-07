@@ -2,12 +2,9 @@ import json, base64
 from pathlib import Path
 import re
 from html import escape
-from google import genai
-from google.genai import types
 from pdf_render import write_pdf
 
 from print_settings import apply_css_settings
-from ai_retry import call_with_high_demand_retry
 from performance_utils import extract_pdf_text, collect_local_document_text
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
@@ -77,7 +74,7 @@ def _local_bus_passengers(text,boarding=''):
         else:
             # Common redBus/AbhiBus rows: SURNAME/FIRSTNAME MR, or a numbered
             # passenger row where type and seat follow the complete name.
-            m=re.search(r'(?i)(?:^|\b)(Mr|Mrs|Ms|Miss|Master|Mstr|Dr)\.?\s+([A-Za-z][A-Za-z .\'/\-]{2,60}?)(?=\s+(?:Seat|Adult|Child|Infant|ADT|CHD|INF|[A-Z0-9]{6,}|\d{1,2}[A-Z]?)\b|$)',clean)
+            m=re.search(r'(?i)(?:^|\b)(Mr|Mrs|Ms|Miss|Master|Mstr|Dr)\.?\s+([A-Za-z][A-Za-z .\'/\-]{2,80}?)(?=\s+(?:Seat|Adult|Child|Infant|ADT|CHD|INF|[A-Z0-9]*\d[A-Z0-9]{5,}|\d{1,2}[A-Z]?)\b|$)',clean)
             if m:
                 title=m.group(1)+'.'; name=m.group(2).strip(' ,-')
             else:

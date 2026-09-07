@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from local_tour_planner import attractive_title, infer_destination
 
 LOGGER = logging.getLogger('mytourbazar.extractor')
 
@@ -497,164 +498,19 @@ def _ensure_generated_inclusion_exclusion_lists(data):
         if not (data.get('transit') or []):
             exc.insert(0,'Airfare, train fare or bus fare unless specifically included')
         data['exclusions']=exc
-    def compact(items, limit):
-        out=[]
+    def compact(items,limit):
+        out=[]; seen=set()
         for value in items or []:
             value=re.sub(r'\s+',' ',str(value or '')).strip(' •-–—')
-            if not value:
-                continue
-            # Supplier PDFs sometimes join the next paragraph to a bullet. A
-            # compact service line is more useful than a page-long list item.
-            if len(value)>150:
-                value=value[:147].rsplit(' ',1)[0].rstrip(' ,;:')+'…'
+            if not value: continue
+            if len(value)>150: value=value[:147].rsplit(' ',1)[0].rstrip(' ,;:')+'…'
             key=re.sub(r'\W+',' ',value).strip().lower()
-            if key and key not in {re.sub(r'\W+',' ',x).strip().lower() for x in out}:
-                out.append(value)
-            if len(out)>=limit:
-                break
+            if key and key not in seen: seen.add(key); out.append(value)
+            if len(out)>=limit: break
         return out
     data['inclusions']=compact(data.get('inclusions'),8)
     data['exclusions']=compact(data.get('exclusions'),6)
     return data
-
-
-_DESTINATION_TITLES = (
-    ('sikkim', 'Enchanting Sikkim'), ('darjeeling', 'Enchanting Darjeeling'),
-    ('kashmir', 'Mesmerizing Kashmir'), ('kerala', 'Mesmerizing Kerala'),
-    ('rajasthan', 'Royal Rajasthan'), ('himachal', 'Himachal Highlights'),
-    ('manali', 'Magical Manali'), ('goa', 'Gorgeous Goa'),
-    ('bhutan', 'Beautiful Bhutan'), ('bali', 'Beautiful Bali'),
-    ('dubai', 'Dazzling Dubai'), ('andaman', 'Amazing Andaman'),
-    ('ladakh', 'Legendary Ladakh'), ('uttarakhand', 'Enchanting Uttarakhand'),
-)
-
-
-def _label_value(text, labels, max_len=120):
-    joined='|'.join(labels)
-    match=re.search(r'(?im)^\s*(?:'+joined+r')\s*[:\-]\s*([^\n]{1,'+str(max_len)+r'})\s*$',text)
-    return re.sub(r'\s+',' ',match.group(1)).strip() if match else ''
-
-
-def _local_destination(text, days):
-    explicit=_label_value(text,(r'destination',r'place',r'tour\s+destination'))
-    haystack=' '.join([explicit,text[:20000]]+[str(x.get('title') or '') for x in days]).lower()
-    found=[]
-    for key,title in _DESTINATION_TITLES:
-        if re.search(r'\b'+re.escape(key)+r'\b',haystack):
-            found.append((key,title))
-    if found:
-        # Sikkim and Darjeeling are commonly sold as one circuit.
-        keys={x[0] for x in found}
-        if {'sikkim','darjeeling'} <= keys:
-            return 'Sikkim & Darjeeling'
-        return found[0][0].title()
-    if explicit:
-        return re.sub(r'(?i)\b\d+\s*(?:nights?|days?|n|d)\b.*$','',explicit).strip(' |-')
-    return ''
-
-
-def _attractive_tour_title(destination):
-    low=str(destination or '').lower()
-    if 'sikkim' in low and 'darjeeling' in low:
-        return 'Enchanting Sikkim & Darjeeling'
-    for key,title in _DESTINATION_TITLES:
-        if re.search(r'\b'+re.escape(key)+r'\b',low):
-            return title
-    clean=re.sub(r'(?i)\b(?:\d+\s*(?:nights?|days?|n|d)|from|to|dated?)\b.*$','',str(destination or '')).strip(' |-')
-    return f'Discover {clean}' if clean else 'Customized Holiday'
-
-
-def _extract_local_hotels(text, days):
-    """Recover common labelled and pipe-separated supplier hotel rows locally."""
-    lines=[re.sub(r'\s+',' ',x).strip() for x in str(text or '').splitlines() if x.strip()]
-    rows=[]
-    hotel_label=re.compile(r'(?i)^(?:hotel|resort|property)(?:\s+name)?\s*[:\-]\s*(.+)$')
-    for index,line in enumerate(lines):
-        match=hotel_label.match(line)
-        if match:
-            window='\n'.join(lines[max(0,index-4):min(len(lines),index+7)])
-            rows.append({
-                'dates':_label_value(window,(r'dates?',r'check[ -]?in(?:\s*/\s*check[ -]?out)?')),
-                'destination':_label_value(window,(r'destination',r'city',r'location')),
-                'hotel_name':match.group(1).strip(),
-                'room_category':_label_value(window,(r'room\s+(?:category|type)',r'category')),
-                'hotel_category':_label_value(window,(r'hotel\s+category',r'star\s+category')),
-                'rooms':_label_value(window,(r'total\s+rooms?',r'rooms?',r'rooming')),
-                'room_type':_label_value(window,(r'room\s+type',)),
-                'meal_plan':_label_value(window,(r'meal\s+plan',r'meals?',r'plan')),
-                'option':'Option 1',
-            })
-    for line in lines:
-        cells=[x.strip() for x in re.split(r'\s*[|│]\s*|\t+',line) if x.strip()]
-        if len(cells)<3 or not re.search(r'(?i)hotel|resort|inn|villa|palace|retreat|camp',line):
-            continue
-        if re.search(r'(?i)hotel\s*name|destination.*room|meal\s*plan',line):
-            continue
-        hotel_index=next((i for i,x in enumerate(cells) if re.search(r'(?i)hotel|resort|inn|villa|palace|retreat|camp',x)),None)
-        if hotel_index is None: continue
-        rows.append({
-            'dates':cells[0] if hotel_index>1 else '',
-            'destination':cells[hotel_index-1] if hotel_index else '',
-            'hotel_name':cells[hotel_index],
-            'room_category':cells[hotel_index+1] if hotel_index+1<len(cells) else '',
-            'hotel_category':'','rooms':cells[hotel_index+2] if hotel_index+2<len(cells) else '',
-            'room_type':'','meal_plan':cells[-1] if len(cells)>hotel_index+2 else '',
-            'option':'Option 1',
-        })
-    clean=[]; seen=set()
-    for row in rows:
-        key=re.sub(r'\W+',' ',str(row.get('hotel_name') or '')).strip().lower()
-        if key and key not in seen:
-            seen.add(key); clean.append(row)
-    if not clean:
-        for stay in dict.fromkeys(str(x.get('stay') or '').strip() for x in days):
-            if stay:
-                clean.append({'dates':'','destination':stay,'hotel_name':'','room_category':'',
-                              'hotel_category':'','rooms':'','room_type':'','meal_plan':'','option':'Option 1'})
-    return clean
-
-
-def _local_tour_data(text, source_days):
-    result=_local_day_itinerary(source_days)
-    destination=_local_destination(text,source_days)
-    result['destination']=destination
-    result['tour_title']=_attractive_tour_title(destination)
-    result['travel_dates']=_label_value(text,(r'travel\s+dates?',r'tour\s+dates?',r'dates?'))
-    duration=_label_value(text,(r'duration',r'tour\s+duration'))
-    if not duration:
-        m=re.search(r'(?i)\b(\d{1,2})\s*nights?\s*(?:and|&|/)?\s*(\d{1,2})\s*days?\b',text)
-        if m: duration=f'{m.group(1)} Nights and {m.group(2)} Days'
-        elif source_days: duration=f'{len(source_days)} Days'
-    result['duration']=duration
-    result['vehicle']=_label_value(text,(r'vehicle(?:\s+type)?',r'transport'))
-    result['pickup']=_label_value(text,(r'pick[ -]?up(?:\s+point|\s+hub)?',))
-    result['drop']=_label_value(text,(r'drop(?:\s+point|\s+hub)?',))
-    counts={
-        'adult_count':r'(\d+)\s*(?:adults?|adt)\b',
-        'child_cwb_count':r'(\d+)\s*(?:cwb|child(?:ren)?\s+with\s+bed)\b',
-        'child_cnb_count':r'(\d+)\s*(?:cnb|child(?:ren)?\s+(?:without|no)\s+bed)\b',
-        'extra_bed_count':r'(\d+)\s*(?:extra\s+bed|eb)\b',
-    }
-    for key,pattern in counts.items():
-        m=re.search(pattern,text,re.I); result[key]=int(m.group(1)) if m else 0
-    result['child_count']=result['child_cwb_count']+result['child_cnb_count']
-    parts=[]
-    if result['adult_count']: parts.append(f"{result['adult_count']} Adult(s)")
-    if result['child_cwb_count']: parts.append(f"{result['child_cwb_count']} CWB")
-    if result['child_cnb_count']: parts.append(f"{result['child_cnb_count']} CNB")
-    result['guests']=', '.join(parts)
-    for day in result['days']:
-        body=str(day.get('description') or '')
-        stay=re.search(r'(?i)(?:overnight|stay)\s+(?:at|in)\s+([^\n.;]{2,80})',body)
-        meal=re.search(r'(?i)\b(?:meal\s*plan|meals?)\s*[:\-]\s*([^\n.;]{2,50})',body)
-        if stay: day['stay']=stay.group(1).strip()
-        if meal: day['meal_plan']=meal.group(1).strip()
-    result['hotels']=_extract_local_hotels(text,result['days'])
-    result['package_costs']=_extract_supplier_package_costs(text)
-    lists=_extract_supplier_inclusion_exclusion_lists(text)
-    result.update(lists)
-    result['_ai_fallback_used']=False
-    return _ensure_generated_inclusion_exclusion_lists(result)
 
 
 def _money_value(value):
@@ -709,30 +565,19 @@ def _extract_supplier_package_costs(source_text):
     }]
 
 def extract_transit_from_parts(file_parts, source_text, api_key, model):
-    """Convert locally extracted flight sectors into Tour transit rows."""
     from flight_extractor import extract_flight_ticket
-    flight=extract_flight_ticket(file_parts,source_text,api_key,model)
-    rows=[]
+    flight=extract_flight_ticket(file_parts,source_text,api_key,model); rows=[]
     for segment in flight.get('segments') or []:
         origin=segment.get('dep_code') or segment.get('dep_city') or ''
         destination=segment.get('arr_code') or segment.get('arr_city') or ''
-        rows.append({
-            'date':segment.get('dep_date') or '',
-            'segment_mode':'Flight','journey_type':'Flight',
-            'carrier':segment.get('flight') or '',
-            'flight_number':segment.get('flight_number') or '',
-            'route':f'{origin} → {destination}'.strip(' →'),
-            'from':segment.get('dep_city') or origin,
-            'to':segment.get('arr_city') or destination,
-            'departure':segment.get('dep_time') or '',
-            'arrival':segment.get('arr_time') or '',
-            'from_airport':segment.get('dep_airport') or '',
-            'to_airport':segment.get('arr_airport') or '',
-            'departure_terminal':segment.get('dep_terminal') or '',
-            'arrival_terminal':segment.get('arr_terminal') or '',
-            'aircraft':segment.get('aircraft') or '',
-            'pnr':flight.get('airline_pnr') or flight.get('gds_pnr') or '',
-        })
+        rows.append({'date':segment.get('dep_date') or '','segment_mode':'Flight','journey_type':'Flight',
+            'carrier':segment.get('flight') or '','flight_number':segment.get('flight_number') or '',
+            'route':f'{origin} → {destination}'.strip(' →'),'from':segment.get('dep_city') or origin,
+            'to':segment.get('arr_city') or destination,'departure':segment.get('dep_time') or '',
+            'arrival':segment.get('arr_time') or '','from_airport':segment.get('dep_airport') or '',
+            'to_airport':segment.get('arr_airport') or '','departure_terminal':segment.get('dep_terminal') or '',
+            'arrival_terminal':segment.get('arr_terminal') or '','aircraft':segment.get('aircraft') or '',
+            'pnr':flight.get('airline_pnr') or flight.get('gds_pnr') or ''})
     return {'transit':_dedupe_transit(rows)}
 
 
@@ -759,7 +604,7 @@ def _source_days(text):
 
 
 def _local_day_itinerary(source_days):
-    """Keep an explicit supplier itinerary usable when Groq rejects a request."""
+    """Keep an explicit supplier itinerary usable without rebuilding its days."""
     days=[]
     for item in source_days:
         day=dict(item)
@@ -777,13 +622,66 @@ def _local_day_itinerary(source_days):
     }
 
 
+def _label_value(text, labels, max_len=120):
+    joined='|'.join(labels)
+    match=re.search(r'(?im)^\s*(?:'+joined+r')\s*[:\-]\s*([^\n]{1,'+str(max_len)+r'})\s*$',str(text or ''))
+    return re.sub(r'\s+',' ',match.group(1)).strip() if match else ''
+
+
+def _local_hotels(text,days):
+    lines=[re.sub(r'\s+',' ',x).strip() for x in str(text or '').splitlines() if x.strip()]
+    rows=[]
+    for index,line in enumerate(lines):
+        match=re.match(r'(?i)^(?:hotel|resort|property)(?:\s+name)?\s*[:\-]\s*(.+)$',line)
+        if not match: continue
+        window='\n'.join(lines[max(0,index-4):min(len(lines),index+7)])
+        room=_label_value(window,(r'room\s+(?:category|type)',r'category'))
+        rows.append({'dates':_label_value(window,(r'dates?',r'check[ -]?in')),
+            'destination':_label_value(window,(r'destination',r'city',r'location')),
+            'hotel_name':match.group(1).strip(),'room_category':room,
+            'hotel_category':_label_value(window,(r'hotel\s+category',r'star\s+category')),
+            'rooms':_label_value(window,(r'total\s+rooms?',r'rooms?',r'rooming')),'room_type':room,
+            'meal_plan':_label_value(window,(r'meal\s+plan',r'meals?',r'plan')),'option':'Option 1'})
+    if not rows:
+        for stay in dict.fromkeys(str(x.get('stay') or '').strip() for x in days):
+            if stay: rows.append({'dates':'','destination':stay,'hotel_name':'','room_category':'','hotel_category':'','rooms':'','room_type':'','meal_plan':'','option':'Option 1'})
+    return rows
+
+
+def _local_tour_result(text,source_days):
+    result=_local_day_itinerary(source_days)
+    result['client_name']=_label_value(text,(r'authoritative\s+guest\s*/\s*client\s+name',r'guest\s+name',r'client\s+name',r'lead\s+guest'))
+    destination,key=infer_destination(text); result['destination']=destination
+    result['tour_title']=attractive_title(destination,key)
+    result['travel_dates']=_label_value(text,(r'travel\s+dates?',r'tour\s+dates?',r'dates?'))
+    result['duration']=_label_value(text,(r'duration',r'tour\s+duration'))
+    if not result['duration']:
+        match=re.search(r'(?i)\b(\d{1,2})\s*nights?\s*(?:and|&|/)?\s*(\d{1,2})\s*days?\b',text)
+        result['duration']=f'{match.group(1)} Nights and {match.group(2)} Days' if match else (f'{len(source_days)} Days' if source_days else '')
+    result['vehicle']=_label_value(text,(r'vehicle(?:\s+type)?',r'transport'))
+    result['pickup']=_label_value(text,(r'pick[ -]?up(?:\s+point|\s+hub)?',)); result['drop']=_label_value(text,(r'drop(?:\s+point|\s+hub)?',))
+    patterns={'adult_count':r'(\d+)\s*(?:adults?|adt)\b','child_cwb_count':r'(\d+)\s*(?:cwb|child(?:ren)?\s+with\s+bed)\b','child_cnb_count':r'(\d+)\s*(?:cnb|child(?:ren)?\s+(?:without|no)\s+bed)\b','extra_bed_count':r'(\d+)\s*(?:extra\s+bed|eb)\b'}
+    for field,pattern in patterns.items():
+        match=re.search(pattern,text,re.I); result[field]=int(match.group(1)) if match else 0
+    result['child_count']=result['child_cwb_count']+result['child_cnb_count']
+    result['guests']=', '.join(x for x in (f"{result['adult_count']} Adult(s)" if result['adult_count'] else '',f"{result['child_cwb_count']} CWB" if result['child_cwb_count'] else '',f"{result['child_cnb_count']} CNB" if result['child_cnb_count'] else '') if x)
+    for day in result['days']:
+        body=str(day.get('description') or '')
+        stay=re.search(r'(?i)(?:overnight|stay)\s+(?:at|in)\s+([^\n.;]{2,80})',body)
+        meal=re.search(r'(?i)\b(?:meal\s*plan|meals?)\s*[:\-]\s*([^\n.;]{2,50})',body)
+        if stay: day['stay']=stay.group(1).strip()
+        if meal: day['meal_plan']=meal.group(1).strip()
+    result['hotels']=_local_hotels(text,result['days'])
+    result['package_costs']=_extract_supplier_package_costs(text)
+    result.update(_extract_supplier_inclusion_exclusion_lists(text))
+    return _ensure_generated_inclusion_exclusion_lists(result)
+
+
 def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
     from performance_utils import collect_local_document_text
     source_text=collect_local_document_text(file_parts,source_text)
     source_days,_=_source_days(source_text)
     if not source_days:
-        # Accept common compact briefs without spending an AI request merely to
-        # split numbered lines into days.
         matches=list(re.finditer(r'(?im)^\s*(\d{1,2})[.)]\s+([^\n]+)',source_text))
         source_days=[{'day':m.group(1),'title':m.group(2).strip(),'description':m.group(2).strip()} for m in matches]
-    return _local_tour_data(source_text,source_days)
+    return _local_tour_result(source_text,source_days)

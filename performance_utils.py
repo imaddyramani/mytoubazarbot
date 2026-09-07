@@ -2,37 +2,48 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 import re
-import io
-import os
-import shutil
-import subprocess
 import time
+import threading
 from contextvars import ContextVar
 
 _read_deadline = ContextVar('supplier_read_deadline', default=None)
 MAX_SUPPLIER_CHARS = 1000000
 
 
+_rapidocr_engine = None
+_rapidocr_lock = threading.Lock()
+_document_text_cache = {}
+
+
+def _cache_key(path,kind,max_chars):
+    p=Path(path)
+    try: stat=p.stat(); return (str(p.resolve()),kind,int(stat.st_mtime_ns),stat.st_size)
+    except Exception: return (str(p),kind,0,0)
+
+
 def _read_scan(image):
-    """One bounded local OCR process; no global lock or background retry."""
-    executable = os.environ.get('TESSERACT_CMD') or shutil.which('tesseract')
-    if not executable:
-        raise LocalExtractionError('Scanned input requires local Tesseract. Rebuild using the updated Dockerfile or send selectable text.')
-    remaining = (_read_deadline.get() or (time.monotonic()+100))-time.monotonic()
+    """Read a scanned page with local RapidOCR; no shell process or cloud API."""
+    global _rapidocr_engine
+    remaining = (_read_deadline.get() or (time.monotonic()+90))-time.monotonic()
     if remaining <= 0:
-        raise LocalExtractionError('Scanned input exceeded the 100-second reading budget. Send the remaining pages separately.')
-    image.thumbnail((2200,2200))
-    with io.BytesIO() as buffer:
-        image.save(buffer,format='PNG')
-        env=os.environ.copy(); env['OMP_THREAD_LIMIT']='1'; env['OMP_NUM_THREADS']='1'
-        try:
-            result=subprocess.run([executable,'stdin','stdout','-l','eng','--psm','3'],
-                input=buffer.getvalue(),capture_output=True,timeout=min(20,remaining),env=env)
-        except subprocess.TimeoutExpired as exc:
-            raise LocalExtractionError('A scanned page took too long to read. Send a clearer copy or selectable text.') from exc
-    text=result.stdout.decode('utf-8',errors='replace').strip()
-    if result.returncode or not text:
-        raise LocalExtractionError('A scanned page could not be read. Send a clearer copy or paste its text.')
+        raise LocalExtractionError('The scanned input exceeded the local reading budget. Send fewer pages together.')
+    try:
+        import numpy as np
+        from rapidocr_onnxruntime import RapidOCR
+    except Exception as exc:
+        raise LocalExtractionError('Local scan reader is unavailable. Rebuild from the updated requirements or send a selectable-text PDF.') from exc
+    image.thumbnail((1900,1900))
+    with _rapidocr_lock:
+        if _rapidocr_engine is None:
+            _rapidocr_engine = RapidOCR()
+        result, _ = _rapidocr_engine(np.asarray(image.convert('RGB')))
+    lines=[]
+    for row in result or []:
+        if len(row) >= 2 and str(row[1] or '').strip():
+            lines.append(str(row[1]).strip())
+    text='\n'.join(lines).strip()
+    if not text:
+        raise LocalExtractionError('The scanned page could not be read. Send a clearer scan or paste its booking text.')
     return text
 
 
@@ -40,39 +51,70 @@ class LocalExtractionError(ValueError):
     """Actionable source-reading failure, not an empty booking."""
 
 
+def _booking_core_complete(text):
+    low=str(text or '').lower()
+    identity=any(x in low for x in ('passenger','traveller','guest name','lead guest'))
+    reference=any(x in low for x in ('pnr','booking id','booking reference','confirmation number','ticket number'))
+    flight=any(x in low for x in ('flight','airline','e-ticket')) and 'departure' in low and 'arrival' in low
+    bus=any(x in low for x in ('bus operator','boarding point','coach')) and any(x in low for x in ('drop point','dropping point','arrival'))
+    hotel=any(x in low for x in ('hotel','property')) and any(x in low for x in ('check-in','check in')) and any(x in low for x in ('check-out','check out'))
+    tour=('day 1' in low and 'day 2' in low and any(x in low for x in ('inclusions','exclusions','sightseeing')))
+    return identity and (reference or tour) and (flight or bus or hotel or tour)
+
+
 def extract_image_text(path, max_chars=30000):
     from PIL import Image, ImageOps
+    key=_cache_key(path,'image',max_chars)
+    if key in _document_text_cache: return _document_text_cache[key][:max_chars]
     with Image.open(path) as original:
         with ImageOps.exif_transpose(original).convert('L') as image:
-            return _read_scan(image)
+            text=_read_scan(image)[:max_chars]
+    _document_text_cache[key]=text
+    return text
 
 
-def extract_supplier_pdf_text(path, max_chars=60000):
-    """Read every page; only rasterize image pages missing a text layer."""
+def extract_supplier_pdf_text(path, max_chars=60000, max_ocr_pages=8):
+    """Read selectable text quickly and OCR only a bounded number of scan pages."""
+    key=_cache_key(path,'pdf',max_chars)
+    if key in _document_text_cache: return _document_text_cache[key][:max_chars]
     try:
         import fitz
         chunks=[]
         with fitz.open(str(path)) as doc:
             if doc.needs_pass:
                 raise LocalExtractionError('Supplier PDF is password protected. Send an unlocked copy.')
+            ocr_pages=0
+            total=0
             for index,page in enumerate(doc):
                 text=page.get_text('text',sort=True) or ''
-                # Do not silently accept an unreadable page within a mixed PDF.
-                if len(re.sub(r'\s+','',text))<40 and page.get_images():
+                accumulated='\n'.join(chunks)
+                if index>0 and _booking_core_complete(accumulated) and re.search(
+                    r'(?im)^\s*(?:terms(?:\s+and\s+conditions)?|cancellation\s+policy|privacy\s+policy|fare\s+rules)\s*$',text):
+                    break
+                if len(re.sub(r'\s+','',text))<40 and page.get_images() and ocr_pages < max_ocr_pages:
                     from PIL import Image
-                    zoom=min(2,2200/max(page.rect.width,page.rect.height))
+                    zoom=min(1.8,1900/max(page.rect.width,page.rect.height))
                     pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),colorspace=fitz.csGRAY,alpha=False)
                     image=Image.frombytes('L',(pix.width,pix.height),pix.samples)
                     del pix
-                    try: text=_read_scan(image)
+                    try:
+                        text=_read_scan(image)
+                        ocr_pages += 1
+                    except LocalExtractionError:
+                        text=''
                     finally: image.close()
-                chunks.append(text)
-                if sum(map(len,chunks))+2*len(chunks)>MAX_SUPPLIER_CHARS:
-                    raise LocalExtractionError('Supplier text is too long. Split it into smaller uploads.')
+                if text:
+                    chunks.append(f'\n--- PAGE {index+1} ---\n{text}')
+                    total += len(text)
+                if total >= min(max_chars,MAX_SUPPLIER_CHARS):
+                    break
+                if total>=30000 and _booking_core_complete('\n'.join(chunks)):
+                    break
         result='\n\n'.join(chunks).strip()
         if not result:
             raise LocalExtractionError('No selectable supplier text found. Paste the booking details or send a text PDF.')
-        return result
+        _document_text_cache[key]=result[:max_chars]
+        return _document_text_cache[key]
     except LocalExtractionError:
         raise
     except Exception as exc:
@@ -80,8 +122,8 @@ def extract_supplier_pdf_text(path, max_chars=60000):
 
 
 def extract_pdf_text_with_local_ocr(path, max_chars=60000, max_ocr_pages=20):
-    """Compatibility entry point for older modules; text extraction only."""
-    return extract_supplier_pdf_text(path, max_chars)
+    """Compatibility entry point for the bounded RapidOCR fallback."""
+    return extract_supplier_pdf_text(path, max_chars, max_ocr_pages=min(max_ocr_pages,8))
 
 
 def collect_local_document_text(file_parts,source_text='',max_chars=60000):

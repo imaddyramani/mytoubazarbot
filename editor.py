@@ -1,161 +1,114 @@
-import json
+"""Deterministic document edits that never rebuild unrelated booking data."""
+from __future__ import annotations
+
+import copy
 import re
-from google import genai
-from google.genai import types
-from ai_retry import call_with_high_demand_retry
 
 
-
-def _restore_named_train_carriers(updated_data, instruction):
-    # Local safety guard: never replace an owner-supplied train name with a generic label.
-    if not isinstance(updated_data, dict):
-        return updated_data
-    raw = str(instruction or "")
-    names = []
-    patterns = [
-        r"(?i)\b([A-Za-z0-9.&' -]{2,60}?(?:Express|Mail|Superfast|Intercity|Passenger|Special))\b",
-        r"(?i)\b(Vande Bharat|Rajdhani(?: Express)?|Shatabdi(?: Express)?|Duronto(?: Express)?|Humsafar(?: Express)?|Tejas(?: Express)?|Jan Shatabdi|Garib Rath|Sampark Kranti|Gatimaan Express)\b",
-    ]
+def _value_after(text, labels):
+    label='|'.join(labels)
+    patterns=(
+        rf'(?is)\b(?:change|set|update|replace)\s+(?:the\s+)?(?:{label})\s+(?:to|as)\s+(.+?)(?=\s+(?:and\s+)?(?:change|set|update|replace|add|remove)\b|$)',
+        rf'(?im)^\s*(?:{label})\s*[:=\-]\s*(.+?)\s*$',
+    )
     for pattern in patterns:
-        for m in re.finditer(pattern, raw):
-            name = " ".join(m.group(1).split()).strip(" ,.-")
-            if name and name.lower() not in [x.lower() for x in names]:
-                names.append(name)
-    rows = updated_data.get("transit")
-    if not isinstance(rows, list) or not names:
-        return updated_data
-    generic = {"", "indian railways", "railways", "railway", "train"}
-    name_index = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("segment_mode") or "").strip().lower() != "train":
-            continue
-        carrier = str(row.get("carrier") or "").strip().lower()
-        if carrier in generic and name_index < len(names):
-            row["carrier"] = names[name_index]
-            name_index += 1
-    return updated_data
+        match=re.search(pattern,text)
+        if match: return re.sub(r'\s+',' ',match.group(1)).strip(' .')
+    return ''
 
 
-def _preserve_untargeted_tour_days(current_data, updated_data, instruction):
-    """Apply a day-specific AI edit as a patch without losing other tour days."""
-    old_days=list((current_data or {}).get('days') or [])
-    if not old_days or not isinstance(updated_data,dict):
-        return updated_data
-    targets={int(x) for x in re.findall(r'(?i)\bday\s*(\d{1,2})\b',str(instruction or ''))}
-    targets={x for x in targets if 1 <= x <= len(old_days)}
-    if not targets:
-        return updated_data
-    ai_days=list(updated_data.get('days') or [])
-    merged=[dict(x or {}) for x in old_days]
-    ordered=sorted(targets)
-    for target in ordered:
-        chosen=None
-        for row in ai_days:
-            m=re.search(r'\d+',str((row or {}).get('day') or ''))
-            if m and int(m.group())==target:
-                chosen=row; break
-        if chosen is None and len(ai_days)==len(targets):
-            chosen=ai_days[ordered.index(target)]
-        if isinstance(chosen,dict):
-            base=dict(merged[target-1]); base.update(chosen); merged[target-1]=base
-    updated_data['days']=merged
-    return updated_data
+def _amount(text, labels):
+    value=_value_after(text,labels)
+    if not value:
+        label='|'.join(labels)
+        match=re.search(rf'(?i)\b(?:{label})\b\D{{0,18}}(?:₹|INR|Rs\.?)?\s*([0-9][0-9,]*)',text)
+        value=match.group(1) if match else ''
+    match=re.search(r'[0-9][0-9,]*',value)
+    return float(match.group(0).replace(',','')) if match else None
 
-def apply_edit(doc_type, current_data, instruction, api_key, model, current_fare=None):
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured in .env")
 
-    type_names = {
-        "package": "Tour Itinerary",
-        "flight": "Air Ticket Itinerary",
-        "bus": "Bus Ticket Itinerary",
-        "hotel": "Hotel Confirmation Voucher",
+def _find_day(days, number):
+    for index,row in enumerate(days):
+        match=re.search(r'\d+',str((row or {}).get('day') or ''))
+        if match and int(match.group())==number: return index
+    return number-1 if 0<number<=len(days) else None
+
+
+def _edit_package(data, instruction):
+    changed=False; low=instruction.lower(); days=data.setdefault('days',[])
+    targets=list(dict.fromkeys(int(x) for x in re.findall(r'(?i)\bday\s*(\d{1,2})\b',instruction)))
+    for number in targets:
+        index=_find_day(days,number)
+        if index is None: continue
+        match=re.search(rf'(?is)\b(?:on\s+)?day\s*{number}\b\s*(?:[:=\-]|will\s+be|guest\s+will)?\s*(.+)$',instruction)
+        if match:
+            request=re.sub(r'(?i)^(?:change|update|replace|make)\s+(?:it\s+)?(?:to\s+)?','',match.group(1)).strip()
+            if request and request.lower() not in ('detailed','basic','more detailed'):
+                row=dict(days[index]); row['description']=request; days[index]=row; changed=True
+    scalar={
+        'client_name':(r'guest\s*name',r'client\s*name',r'traveller\s*name'),
+        'destination':(r'destination',), 'tour_title':(r'tour\s*title',r'package\s*title'),
+        'travel_dates':(r'travel\s*dates?',r'tour\s*dates?'), 'duration':(r'duration',),
+        'vehicle':(r'vehicle',r'cab'), 'pickup':(r'pick[ -]?up',), 'drop':(r'drop',),
     }
-    name = type_names.get(doc_type, doc_type)
+    for key,labels in scalar.items():
+        value=_value_after(instruction,labels)
+        if value: data[key]=value; changed=True
+    hotels=data.get('hotels') or []
+    if hotels:
+        fields={'hotel_name':(r'hotel(?:\s+name)?',r'property'), 'hotel_category':(r'hotel\s+category',r'star\s+category'),
+                'room_type':(r'room\s+type',r'room\s+category'), 'rooms':(r'total\s+rooms?',r'rooming'), 'meal_plan':(r'meal\s+plan',r'meals?')}
+        for key,labels in fields.items():
+            value=_value_after(instruction,labels)
+            if value:
+                hotels[0][key]=value
+                if key=='room_type': hotels[0]['room_category']=value
+                changed=True
+        star=re.search(r'(?i)\b([2-7])\s*star\s*(premium)?\b',instruction)
+        if star: hotels[0]['hotel_category']=f"{star.group(1)} Star"+(" Premium" if star.group(2) else ''); changed=True
+    add_inc=re.search(r'(?is)\badd\s+(?:to\s+)?inclusions?\s*[:\-]?\s*(.+)$',instruction)
+    add_exc=re.search(r'(?is)\badd\s+(?:to\s+)?exclusions?\s*[:\-]?\s*(.+)$',instruction)
+    if add_inc: data.setdefault('inclusions',[]).append(add_inc.group(1).strip()); changed=True
+    if add_exc: data.setdefault('exclusions',[]).append(add_exc.group(1).strip()); changed=True
+    costs=data.setdefault('package_costs',[])
+    if not costs: costs.append({'option':'Package','per_adult':'','per_child':'','per_child_cwb':'','per_child_cnb':'','per_extra_bed':'','total_cost':'','currency':'INR','notes':'','supplier_total':'','markup_total':'','final_total':''})
+    cost_fields={'per_adult':(r'adult',), 'per_child_cwb':(r'cwb',r'child\s+with\s+bed'),
+                 'per_child_cnb':(r'cnb',r'child\s+(?:without|no)\s+bed'), 'per_extra_bed':(r'extra\s+bed',r'\beb\b')}
+    for key,labels in cost_fields.items():
+        amount=_amount(instruction,labels)
+        if amount is not None: costs[0][key]=str(int(amount)); data['show_cost']=True; changed=True
+    if not any(str(x.get(k) or '') for x in costs for k in ('per_adult','per_child','per_child_cwb','per_child_cnb','per_extra_bed','total_cost','final_total')):
+        data['package_costs']=[]
+    return changed
 
-    prompt = f"""
-You are the document editor for MyTourBazar.
-You are editing an existing {name} using a user's natural-language change request.
 
-IMPORTANT RULES:
-1. Return ONLY valid JSON in this exact wrapper format:
-{{"updated_data": <complete updated data object>, "updated_fare": <number or null>}}
-2. Return the COMPLETE data object, not a partial patch.
-3. Make ONLY the requested changes. Preserve every other existing fact exactly.
-4. Do not invent missing bookings, dates, flight numbers, hotels, prices, times, passengers,
-   sightseeing, inclusions, or exclusions.
-5. For a Tour Itinerary, the user may change any day plan, day date/title/description,
-   hotel/stay, meal plan, logistics, greeting, title, inclusions, exclusions, customer costing,
-   or any number of transit sectors. TOUR COSTING IS DIRECT CUSTOMER SELLING COST - there is no
-   markup workflow. Understand natural wording such as "adult 43700", "make adult forty three
-   thousand seven hundred", "CWB should be 32000", "child without bed 26000", or mixed cost +
-   hotel/transit instructions. Update only the intended per_adult/per_child/per_child_cwb/
-   per_child_cnb/per_extra_bed fields, set show_cost=true when a customer cost is added/changed,
-   and preserve unrelated rates. Never calculate a markup from hidden supplier pricing. If the user
-   says to increase/decrease an already-visible customer rate, apply that relative change to the
-   existing customer rate only. Transit may mix flights, trains and buses in one natural message
-   or voice transcription. Infer the journey sequence from the described route order; no Onward/Return
-   prefix is required. Preserve every sector as a separate transit object and do not drop connections.
-   TRAIN NAME RULE: when the owner supplies a specific train/service name, put that exact supplied name
-   in the transit carrier field. Never replace a supplied train name with the generic text 'Indian Railways'.
-   If only a train number is supplied and no train name is supplied, keep carrier empty rather than inventing one.
-6. For Flight or Bus documents, the user may change any passenger, route, timing, service,
-   PNR, baggage, or fare information. If the user asks to change the fare, put the new total
-   in updated_fare and leave the supplier base_fare/taxes as historical source values unless
-   the request explicitly asks to change those source values.
-7. For Hotel documents, the user may change guest, hotel, room, dates, meal plan, address,
-   reservation details, terms, or CUSTOMER HOTEL COSTING. When the owner gives a customer hotel
-   selling cost naturally by text/voice, store it in updated_data.customer_hotel_cost using
-   {{"per_room": number-or-null, "eb": number-or-null, "total": number, "currency": "INR"}}.
-   Understand normal wording such as "per room 8500", "room cost 8500, extra bed 1200, total 18200",
-   or mixed hotel+cost changes. Do not overwrite supplier cost_components/base_fare/taxes. The Hotel
-   print uses its structured room-cost/GRAND TOTAL element and does not use a generic Total Fare box.
-7A. ACCOMMODATION ROOM CATEGORY: for Tour hotel rows, room_type and room_category are
-   important customer-facing facts and mean the actual room class/style, such as Premium, Standard,
-   Deluxe, Non AC, Executive, Superior, Suite or a supplied view/category. Preserve both when both
-   are present. Never put room counts into these fields, never replace them with a star rating, and
-   never drop these fields while editing another part.
-7B. TOTAL ROOMS / ROOMING: keep the room count/occupancy separately in hotels[].rooms. Understand
-   natural edits such as "2 double rooms", "3 triple sharing", "2 dbl plus 1 extra mattress"
-   and save a concise value such as "2 DBL", "3 Triple Sharing", or "2 DBL + 1 EB". Extra
-   mattress/extra mat may be represented as EB in the rooming display. Never infer DBL/Triple/EB
-   from guest count unless the owner explicitly says it.
-7C. PREMIUM HOTEL STAR RULE: understand normal owner wording without any command prefix. If the
-   owner says the hotels are `3 star premium`, preserve/apply hotel_category as `3 Star Premium`;
-   `4 star premium` means `4 Star Premium`. These are rendered as 3 or 4 full golden stars plus
-   one visual half star. Do not invent Premium and do not confuse a separate Premium room type
-   with a premium hotel-star rating unless the owner actually describes the hotel rating that way.
-8. If the user asks for a wording improvement to a day plan, rewrite only that day in polished
-   travel-agency language while retaining the confirmed facts already present.
-9. If the requested change is ambiguous, make the safest interpretation and do not alter unrelated data.
+def _edit_booking(doc_type,data,instruction,current_fare):
+    changed=False
+    mappings={
+        'flight':{'airline_pnr':(r'airline\s+pnr',r'pnr'),'gds_pnr':(r'gds\s+pnr',),'booking_id':(r'trip\s+id',r'booking\s+id'),'status':(r'status',),'baggage_summary':(r'baggage',),'mobile':(r'mobile',r'phone')},
+        'bus':{'pnr':(r'bus\s+pnr',r'pnr'),'booking_id':(r'booking\s+id',r'ticket\s+id'),'status':(r'status',),'operator':(r'bus\s+operator',r'operator'),'boarding_point':(r'boarding\s+point',),'drop_point':(r'drop(?:ping)?\s+point',)},
+        'hotel':{'guest_name':(r'guest\s+name',r'client\s+name'),'hotel_name':(r'hotel\s+name',r'property'),'check_in':(r'check[ -]?in',),'check_out':(r'check[ -]?out',),'room_type':(r'room\s+type',r'room\s+category'),'meal_plan':(r'meal\s+plan',),'booking_id':(r'booking\s+id',r'confirmation\s+number')},
+    }
+    for key,labels in mappings.get(doc_type,{}).items():
+        value=_value_after(instruction,labels)
+        if value: data[key]=value; changed=True
+    name=_value_after(instruction,(r'passenger\s+name',r'traveller\s+name'))
+    if name and data.get('passengers'):
+        data['passengers'][0]['name']=name; changed=True
+    fare=None
+    if re.search(r'(?i)\b(?:fare|cost|total|price)\b',instruction):
+        fare=_amount(instruction,(r'fare',r'cost',r'total',r'price'))
+        if fare is not None: changed=True
+    return changed,fare if fare is not None else current_fare
 
-CURRENT DOCUMENT DATA:
-{json.dumps(current_data, ensure_ascii=False, indent=2)}
 
-CURRENT PRINTED FARE (if applicable): {current_fare if current_fare is not None else 'N/A'}
-
-USER CHANGE REQUEST:
-{instruction}
-"""
-
-    client = genai.Client(api_key=api_key)
-    response = call_with_high_demand_retry(lambda: client.models.generate_content(
-        model=model,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0,
-        ),
-    ))
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty edit response.")
-    result = json.loads(response.text)
-    if not isinstance(result, dict) or not isinstance(result.get("updated_data"), dict):
-        raise RuntimeError("Gemini returned an invalid edit response.")
-    updated_data = result.get("updated_data")
-    if doc_type == "package":
-        updated_data = _preserve_untargeted_tour_days(current_data, updated_data, instruction)
-        updated_data = _restore_named_train_carriers(updated_data, instruction)
-    return updated_data, result.get("updated_fare")
+def apply_edit(doc_type, current_data, instruction, api_key=None, model=None, current_fare=None):
+    data=copy.deepcopy(current_data or {}); raw=str(instruction or '').strip()
+    if not raw: raise ValueError('Write the field or Day number you want to change.')
+    if doc_type=='package':
+        changed=_edit_package(data,raw); fare=current_fare
+    else:
+        changed,fare=_edit_booking(doc_type,data,raw,current_fare)
+    if not changed:
+        raise ValueError('I could not identify a supported field. Example: “change Day 1 to …”, “set hotel name to …” or “change fare to 15000”.')
+    return data,fare

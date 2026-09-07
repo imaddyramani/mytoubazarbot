@@ -12,7 +12,7 @@ REM Keep WeasyPrint's Windows DLL path available when MSYS2 UCRT64 is installed.
 if exist "C:\msys64\ucrt64\bin" set "WEASYPRINT_DLL_DIRECTORIES=C:\msys64\ucrt64\bin"
 
 REM Install dependencies only when a required Python package is missing.
-python -c "import telegram, dotenv, pypdf, PIL, fitz, reportlab, google.genai, weasyprint" >nul 2>&1
+python -c "import telegram, dotenv, pypdf, PIL, fitz, reportlab, rapidocr_onnxruntime, weasyprint" >nul 2>&1
 if errorlevel 1 (
     echo Required Python packages are missing. Installing from requirements.txt...
     python -m pip install --upgrade pip

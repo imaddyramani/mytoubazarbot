@@ -24,10 +24,6 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, filters
 )
 
-# Groq provider compatibility layer. This must run before project AI modules import google.genai.
-from groq_genai_compat import install_google_genai_shim
-install_google_genai_shim()
-
 from extractor import extract_itinerary_from_parts, extract_transit_from_parts
 from template import generate_pdf
 from hotel_voucher import extract_hotel_voucher, generate_hotel_voucher
@@ -42,7 +38,6 @@ from footer_overlay import add_footer_to_pdf
 from footer_bar_overlay import add_contact_bar_to_pdf
 from footer2_overlay import add_footer2_to_pdf
 from print_settings import load_settings, save_settings, set_font, adjust_text_scale, adjust_logo_scale, get_logo_scale, toggle_button, reset_settings, FONT_OPTIONS, button_enabled, set_default_terms, set_default_footer, get_default_footer, set_tour_last_page, get_tour_last_page
-from ai_retry import set_retry_notifier, reset_retry_notifier
 from performance_utils import prepare_supplier_for_ai, parse_transit_files_local, apply_missing_accommodation_locally
 from voice_edit import transcribe_voice_note
 
@@ -137,12 +132,9 @@ def mtb_airline_logo_html(airline_text, alt=None):
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b").strip() or "qwen/qwen3.6-27b"
-
-# Keep one generic pair for every existing extractor/editor function.
-AI_API_KEY = GROQ_API_KEY
-AI_MODEL = GROQ_MODEL
+# Compatibility arguments retained while all implementations run locally.
+AI_API_KEY = None
+AI_MODEL = "local"
 
 ADMIN_USER_IDS = {
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
@@ -1398,7 +1390,7 @@ def _supplier_total(data):
         return 0.0
 
 def _parse_reply_controls(instruction, current_fare, data, current_footer=False, current_logo=True, current_page_size="auto"):
-    """Parse non-content commands before Groq AI. Remaining text is sent to Groq AI."""
+    """Parse deterministic document commands before field-specific local edits."""
     original = str(instruction or "").strip()
     text = original
     lower = text.lower()
@@ -1482,7 +1474,7 @@ def _parse_reply_controls(instruction, current_fare, data, current_footer=False,
         text = re.sub(r"(?i)\b(?:page\s*size|paper\s*size|page|paper)\s*(?:to|=|:)??\s*(a5|a4|a3|letter|legal|auto|automatic)\b", "", text)
         text = re.sub(r"(?i)^\s*(a5|a4|a3|letter|legal|auto|automatic)\s*$", "", text)
 
-    # Global print font controls. These are handled before Groq AI so a request such as
+    # Global print font controls are handled before content edits so a request such as
     # "make the font Liberation Serif Bold" changes the actual print renderer, not the
     # itinerary data.
     font_match = None
@@ -1919,7 +1911,7 @@ async def reply_reference_edit(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Smart Make Changes button: once a reference is selected, the next natural-language
     # message is treated as the edit instruction even if the owner does not use Telegram's
-    # Reply action. This is intentionally open-ended; Groq AI handles arbitrary changes.
+    # Reply action routes supported wording through the deterministic editor.
     active_reference = context.user_data.get("editing_reference")
     if active_reference:
         # V160: once Modify & Regenerate/Voice-Text Edit is tapped, the next text
@@ -2027,7 +2019,7 @@ async def _begin_edit(update, context, reference):
         f"• `Detailed WhatsApp` → get only the detailed WhatsApp version.\n"
         f"• `Detailed draft` → return to an editable detailed draft first.\n\n"
         f"For Tour costing, tell me the final customer rate naturally - there is no separate markup system. "
-        f"Groq AI will understand the intent, preserve the rest, and regenerate the PDF.",
+        f"The local Smart Edit will preserve unrelated data and regenerate the PDF.",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
 
@@ -2035,7 +2027,7 @@ async def _begin_edit(update, context, reference):
 def _package_edit_is_cost_only(instruction, parsed_rates=None):
     """True when a Modify & Regenerate reply contains only customer costing.
 
-    Keep cost-only edits local so Groq AI cannot rebuild the tour and drop the
+    Keep cost-only edits isolated so the editor cannot rebuild the tour and drop the
     owner's Adult/CWB/CNB/EB selling rates before PDF rendering.
     """
     raw=str(instruction or '').strip()
@@ -2058,7 +2050,7 @@ def _package_edit_is_cost_only(instruction, parsed_rates=None):
 def _hotel_edit_is_cost_only(instruction, hotel_cost=None):
     """True when a Hotel Voice/Text edit contains only customer room costing.
 
-    Explicit room/EB/total amounts do not need Groq AI; they can be applied directly
+    Explicit room/EB/total amounts are applied directly
     to the structured Hotel cost box and regenerated reliably.
     """
     raw=str(instruction or '').strip()
@@ -2158,7 +2150,7 @@ async def perform_saved_edit(update, context, instruction):
         package_pdf = bool(doc_type == "package" and re.search(r"\b(?:pdf|print)\b", instruction, re.I))
 
         # Cost-only Hotel edits are deterministic/local. A direct room/EB/total
-        # change does not need Groq AI and immediately updates the structured Hotel cost box.
+        # change immediately updates the structured Hotel cost box.
         if doc_type == 'hotel' and hotel_cost_only and hotel_cost_update:
             new_data = copy.deepcopy(old_data or {})
             new_data['customer_hotel_cost'] = hotel_cost_update
@@ -2201,11 +2193,11 @@ async def perform_saved_edit(update, context, instruction):
             # Keep supplier fare data untouched; the Hotel renderer reads customer_hotel_cost.
         if doc_type == 'package' and package_rates:
             # Explicit numeric rates are owner-authored customer selling rates. Re-apply
-            # them after Groq AI so a mixed edit can never erase Adult/CWB/CNB/EB values.
+            # preserve them after an edit so mixed instructions cannot erase Adult/CWB/CNB/EB values.
             new_data = _tour_v2_apply_costs(new_data, package_rates)
             new_data['show_cost'] = True
         elif doc_type == 'package':
-            # If the local parser did not understand the wording, trust Groq AI's semantic
+            # If the local cost parser did not understand the wording, preserve the editor's
             # edit and reconcile only the rate fields that actually changed. This handles
             # normal/Hinglish voice phrasing without introducing a markup workflow.
             new_data, ai_package_rates = _tour_reconcile_ai_customer_costs(old_data,new_data,instruction)
@@ -2710,10 +2702,7 @@ async def _auto_print_after_countdown(message, context, kind, supplier_total, pr
         )
         await finish('✅ PDF generated and sent.')
     except asyncio.CancelledError:
-        # A fare button intentionally replaces the countdown workflow.  Task
-        # cancellation is therefore a normal state transition, not a print
-        # failure that should overwrite the Add Cost prompt.
-        logger.info('AUTO_PRINT_CANCELLED kind=%s stage=%s', kind, stage)
+        logger.info('AUTO_PRINT_CANCELLED kind=%s stage=%s',kind,stage)
         return
     except Exception as exc:
         logger.exception("Automatic 5-second print failed")
@@ -3401,7 +3390,7 @@ async def process_hotel_voucher(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END if 'hotel' != 'tour' else None
     context.user_data['_source_processing'] = 'hotel'
     _cancel_source_auto_process(context)
-    # Hotel Print extraction is local and does not require GROQ_API_KEY.
+    # Hotel Print extraction is fully local.
     files=context.user_data.get("voucher_files", [])
     source_text=context.user_data.get("voucher_text", "")
     if not files and not source_text:
@@ -3677,9 +3666,6 @@ def _looks_like_supplier_material(text):
 
 
 async def smart_process(update, context):
-    if not AI_API_KEY:
-        await update.message.reply_text("❌ GROQ_API_KEY is not configured in Northflank.", reply_markup=main_keyboard())
-        return ConversationHandler.END
     text = context.user_data.get("smart_text", "").strip()
     parts = _smart_parts(context)
     if not text and not parts:
@@ -3704,7 +3690,7 @@ async def smart_process(update, context):
         elif parts or supplier_text:
             result = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_classify, parts, text, AI_API_KEY, AI_MODEL), ["⚡ Identifying the supplier document type locally...", "🔎 Reading the supplied material..."], 20, 48)
         else:
-            # V168: deterministic no-prefix routing before Groq AI planning.
+            # Deterministic no-prefix routing before local planning.
             # This prevents natural Tour briefs such as "Goa 4N/5D..." from being
             # incorrectly redirected to Tour Guide, while MTB edits still win.
             direct_ref, direct_instruction = _smart_mtb_edit_request(text)
@@ -3721,7 +3707,7 @@ async def smart_process(update, context):
                     "reference": "", "instruction": text,
                 }
             else:
-                plan = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(agent_plan, text, text, AI_API_KEY, AI_MODEL), ["🧠 AI is understanding what you want...", "🧭 Selecting the correct MyTourBazar workflow..."], 10, 30)
+                plan = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(agent_plan, text, text, AI_API_KEY, AI_MODEL), ["🧠 Local Assistant is understanding the request...", "🧭 Selecting the correct MyTourBazar workflow..."], 10, 30)
                 action = str(plan.get("action", "ask_user"))
                 if action == "edit_document" and plan.get("reference"):
                     result = {"kind":"edit", "confidence":0.99, "reason":plan.get("reason","Existing document change requested."), "reference":plan.get("reference",""), "instruction":plan.get("instruction") or text}
@@ -3758,13 +3744,13 @@ async def smart_process(update, context):
             return ConversationHandler.END
 
         if kind == "chat":
-            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text, AI_API_KEY, AI_MODEL), ['💬 AI is preparing your reply...'], 60, 92)
+            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text, AI_API_KEY, AI_MODEL), ['💬 Local Assistant is preparing your reply...'], 60, 92)
             await safe_status_edit(status, update.message, answer or "I’m ready. Tell me what you want me to do.", parse_mode=None)
             await update.message.reply_text("Send another request or supplier document.", reply_markup=main_keyboard())
             return ConversationHandler.END
 
         if kind == "unknown" or conf < 0.45:
-            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text or "I sent a supplier document but its type could not be identified.", AI_API_KEY, AI_MODEL), ['💬 AI is reviewing what you sent...'], 60, 92)
+            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text or "I sent a supplier document but its type could not be identified.", AI_API_KEY, AI_MODEL), ['💬 Local Assistant is reviewing what you sent...'], 60, 92)
             await safe_status_edit(status, update.message, "🤔 *I need a little more information.*\n\n" + (answer or "Please tell me whether this is a tour, flight, bus or hotel document."))
             await update.message.reply_text("You can send another file/text or use a print button.", reply_markup=main_keyboard())
             return ConversationHandler.END
@@ -3916,8 +3902,8 @@ async def smart_process(update, context):
             return ConversationHandler.END
 
     except Exception as exc:
-        logger.exception("Smart AI processing failed")
-        await safe_status_edit(status, update.message, f"❌ *AI processing failed*\n\nReason: `{str(exc)[:800]}`", parse_mode="Markdown")
+        logger.exception("Smart local processing failed")
+        await safe_status_edit(status, update.message, f"❌ *Local processing failed*\n\nReason: `{str(exc)[:800]}`", parse_mode="Markdown")
         await update.message.reply_text("Try 🆕 Start Fresh and send the supplier material again.", reply_markup=main_keyboard())
         return ConversationHandler.END
 
@@ -3992,10 +3978,6 @@ async def smart_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.voice:
         return SMART_INPUT
-    if not AI_API_KEY:
-        await msg.reply_text("❌ GROQ_API_KEY is not configured in Northflank.", reply_markup=main_keyboard())
-        return ConversationHandler.END
-
     tg_file = await context.bot.get_file(msg.voice.file_id)
     path = TEMP_DIR / f"voice_ai_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.ogg"
     status = await msg.reply_text(
@@ -4260,7 +4242,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✍️ *Enter the flight / train details in text.*\n\n"
             "You can paste onward and return details together or send them one by one. "
-            "You do not need to format them perfectly — Groq AI will read and organize the details automatically.\n\n"
+            "You do not need special formatting — the local parser will organize supported details automatically.\n\n"
             "Example:\n`01 Oct: IndiGo 6E-594 Raipur → Mumbai 09:30 AM – 11:25 AM\n"
             "01 Oct: IndiGo 6E-273 Mumbai → Rajkot 01:10 PM – 03:50 PM\n"
             "05 Oct: IndiGo 6E-233 Rajkot → Mumbai 09:15 AM – 11:05 AM\n"
@@ -4423,7 +4405,7 @@ async def receive_guest_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"👤 Guest name saved: *{guest_name}*\n\n"
         "Now send *everything you have* — supplier PDF, supplier text, screenshots, hotel details, "
         "or flight screenshots.\n\n"
-        "You do NOT need to tell me what each file is. Groq AI will identify it automatically.\n\n"
+        "You do NOT need to tell me what each file is. The local classifier will identify it automatically.\n\n"
         "When you have finished sending all material, tap *✅ Done*.",
         parse_mode="Markdown",
         reply_markup=source_keyboard(),
@@ -4591,53 +4573,21 @@ async def continue_tour_preprint_options(message, context, data):
     return True
 
 async def _run_with_progress(status, chat_message, work, labels, start_pct=30, end_pct=58):
-    """Run AI/supplier work with one live status message.
-
-    Groq AI 503/high-demand errors are retried inside the extractor before temporary
-    source files are cleaned up. A contextvar notifier lets this loop temporarily
-    replace the normal progress animation with a visible retry countdown.
-    """
-    retry_state = {"attempt": 0, "until": 0.0, "reason": ""}
-
-    def _retry_notifier(attempt, delay, exc):
-        retry_state["attempt"] = int(attempt)
-        retry_state["until"] = time.monotonic() + int(delay)
-        retry_state["reason"] = str(exc)[:220]
-
-    token = set_retry_notifier(_retry_notifier)
+    """Run bounded local supplier work while keeping Telegram responsive."""
     task = asyncio.create_task(work())
     started_at = time.monotonic()
-    max_seconds = max(60, int(os.getenv('EXTRACTION_TIMEOUT_SECONDS', '150')))
+    max_seconds = max(45, int(os.getenv('EXTRACTION_TIMEOUT_SECONDS', '120')))
     tick = 0
     try:
         while not task.done():
             if time.monotonic() - started_at >= max_seconds:
                 task.cancel()
-                raise RuntimeError(
-                    f"Extraction stopped after {max_seconds} seconds instead of waiting indefinitely. Please retry the supplier file."
-                )
-            now = time.monotonic()
-            retry_until = float(retry_state.get("until") or 0)
-            if retry_until > now:
-                remaining = max(1, int(round(retry_until - now)))
-                attempt = int(retry_state.get("attempt") or 1)
-                pulse = "🔄" if remaining % 2 else "⏳"
-                await safe_status_edit(
-                    status, chat_message,
-                    f"⚠️ *AI model is experiencing high demand*\n\n"
-                    f"{pulse} Retrying automatically • Retry #{attempt}\n"
-                    f"⏱️ Next attempt in about *{remaining}s*\n\n"
-                    "I’ll keep retrying in the background until the request is delivered successfully.",
-                    parse_mode='Markdown'
-                )
-                await asyncio.sleep(1.0)
-                continue
-
+                raise RuntimeError(f"Local extraction stopped after {max_seconds} seconds. Send fewer pages together or a clearer scan.")
             pct = min(end_pct - 1, start_pct + tick * 3)
             filled = min(16, round(pct / 100 * 16))
             bar = '█' * filled + '░' * (16 - filled)
             label = labels[tick % len(labels)]
-            await safe_status_edit(status, chat_message, f"🤖 *Processing your supplier material...*\n\n{bar} {pct}%\n\n{label}", parse_mode='Markdown')
+            await safe_status_edit(status, chat_message, f"⚙️ *Processing your supplier material locally...*\n\n{bar} {pct}%\n\n{label}", parse_mode='Markdown')
             tick += 1
             await asyncio.sleep(1.5)
         return await task
@@ -4645,61 +4595,10 @@ async def _run_with_progress(status, chat_message, work, labels, start_pct=30, e
         if not task.done():
             task.cancel()
         raise
-    finally:
-        reset_retry_notifier(token)
 
 async def _run_ai_with_retry_status(chat_message, work, status=None):
-    """Run an AI task and only take over the UI if Groq AI reports high demand.
-
-    This is used for edit/detail operations that already have their own status text.
-    It preserves that normal text, but on a 503 it shows a live retry countdown and
-    keeps waiting until the underlying Groq AI call succeeds.
-    """
-    retry_state = {"attempt": 0, "until": 0.0}
-
-    def _retry_notifier(attempt, delay, exc):
-        retry_state["attempt"] = int(attempt)
-        retry_state["until"] = time.monotonic() + int(delay)
-
-    token = set_retry_notifier(_retry_notifier)
-    task = asyncio.create_task(work())
-    retry_message = status
-    created_retry_message = False
-    try:
-        while not task.done():
-            now = time.monotonic()
-            retry_until = float(retry_state.get("until") or 0)
-            if retry_until > now:
-                if retry_message is None:
-                    retry_message = await chat_message.reply_text(
-                        "⚠️ *AI model is experiencing high demand*\n\n🔄 Retrying automatically...",
-                        parse_mode="Markdown",
-                    )
-                    created_retry_message = True
-                remaining = max(1, int(round(retry_until - now)))
-                attempt = int(retry_state.get("attempt") or 1)
-                pulse = "🔄" if remaining % 2 else "⏳"
-                await safe_status_edit(
-                    retry_message, chat_message,
-                    f"⚠️ *AI model is experiencing high demand*\n\n"
-                    f"{pulse} Retrying automatically • Retry #{attempt}\n"
-                    f"⏱️ Next attempt in about *{remaining}s*\n\n"
-                    "I’ll keep retrying until the request is delivered successfully.",
-                    parse_mode="Markdown",
-                )
-                await asyncio.sleep(1.0)
-            else:
-                await asyncio.sleep(0.6)
-        result = await task
-        if created_retry_message and retry_message is not None:
-            await safe_status_edit(retry_message, chat_message, "✅ *AI responded.* Continuing your request...", parse_mode="Markdown")
-        return result
-    except Exception:
-        if not task.done():
-            task.cancel()
-        raise
-    finally:
-        reset_retry_notifier(token)
+    """Compatibility wrapper for local edit/detail operations."""
+    return await work()
 
 
 def _normalize_guest_counts(data):
@@ -4944,14 +4843,14 @@ def _tour_core_draft_signature(raw):
     """Return the non-cost/non-transit core of an editable Tour draft.
 
     This lets a resent full draft print locally when the owner only changed costing,
-    transit or PRINT TYPE/DETAIL. Hotel/day-plan edits still fall through to Groq AI.
+    transit or PRINT TYPE/DETAIL. Hotel/day-plan edits use the local editor.
     """
     s=str(raw or '')
     marker=re.search(r'(?i)AI-completed itinerary draft\s*:',s)
     if marker:
         s=s[marker.start():]
     # Journey and costing are parsed deterministically elsewhere, so exclude them
-    # from the core-comparison used to decide whether Groq AI is necessary.
+    # from the core-comparison used to decide whether a content edit is necessary.
     s=re.sub(r'(?is)\*?Journey\s*/\s*Transit\s*:\*?.*?(?=\n\s*\*?Package\s+Cost\s*:\*?|\Z)','',s)
     s=re.sub(r'(?is)\*?Package\s+Cost\s*:\*?.*?(?=\n\s*Edit this final draft|\Z)','',s)
     s=re.sub(r'(?is)\n\s*Edit this final draft.*$','',s)
@@ -4964,7 +4863,7 @@ def _tour_core_draft_signature(raw):
 
 def _tour_reply_is_simple_cost_transit_patch(raw):
     """True when the owner reply only changes costing/transit/print controls.
-    Such replies should never invoke Groq AI or rebuild the draft.
+    Such replies should never rebuild the draft.
     """
     s=str(raw or '')
     # Full draft markers imply there may be hotel/day edits that need the smart editor.
@@ -4977,7 +4876,7 @@ def _tour_reply_is_simple_cost_transit_patch(raw):
 async def _tour_v2_process_edited_final(message, context, edited_text):
     """Apply the owner's final Tour reply and print directly.
 
-    Simple costing/transit replies are processed entirely locally. Groq AI is used
+    Simple costing/transit replies are processed entirely locally. The editor is used
     only when the owner actually edits hotels, day plans or other free-form draft data.
     """
     current=copy.deepcopy(context.user_data.get('itinerary') or {})
@@ -5016,7 +4915,7 @@ async def _tour_v2_process_edited_final(message, context, edited_text):
 
         # 2) Natural Transit reply. No prefix, colon, pipe or template is required.
         # If the owner says Onward/Return/Connection (or otherwise clearly talks about
-        # a journey), Groq AI gets the raw reply and extracts every real sector.
+        # a journey), the local parser gets the raw reply and extracts supported sectors.
         local_transit=[]
         transit_changed=False
         clear_transit=bool(re.search(r'(?i)\b(?:no\s+transit|no\s+journey|skip\s+transit|done\s+by\s+self)\b',raw))
@@ -5027,7 +4926,7 @@ async def _tour_v2_process_edited_final(message, context, edited_text):
             transit_changed=True
         elif transit_signal:
             # A copied final draft already has a clean Journey / Transit block. Parse
-            # that block locally so resending the draft does not need another Groq AI
+            # that block locally so resending the draft does not need another content
             # call. Free-form line-by-line shorthand still uses the smart AI parser.
             local_backup=_tour_patch_transit_from_text(raw,data.get('transit'))
             structured_transit_block=bool(re.search(r'(?i)Journey\s*/\s*Transit\s*:',raw))
@@ -5053,7 +4952,7 @@ async def _tour_v2_process_edited_final(message, context, edited_text):
 
         # 3) Only call the general Tour editor for real hotel/day-plan/content edits.
         # If the owner resent the full draft but only changed costing/transit/controls,
-        # compare the non-cost/non-transit core and print locally without Groq AI.
+        # compare the non-cost/non-transit core and print locally.
         core_unchanged = (_tour_core_draft_signature(raw) == _tour_core_draft_signature(build_confirmation(current)))
         simple_final_patch = _tour_reply_is_simple_cost_transit_patch(raw) or core_unchanged
         if not simple_final_patch:
@@ -5567,9 +5466,9 @@ def _tour_v2_apply_costs(data, rates):
 
 
 def _tour_reconcile_ai_customer_costs(old_data, new_data, instruction):
-    """Convert Groq AI-understood Tour cost edits into clean customer selling rates.
+    """Convert locally parsed Tour cost edits into clean customer selling rates.
 
-    The old supplier/markup workflow is intentionally not used. When Groq AI understands a
+    The old supplier/markup workflow is intentionally not used. When the editor understands a
     natural request such as "make adult forty three thousand seven hundred" or a mixed
     hotel+cost edit, only the changed customer rate fields are copied into the cost box.
     """
@@ -5593,7 +5492,7 @@ def _tour_reconcile_ai_customer_costs(old_data, new_data, instruction):
         if nv > 0 and abs(nv-ov) >= 0.5:
             changed[field]=nv
 
-    # Groq AI may explicitly enable the customer cost box even when a requested value
+    # The editor may explicitly enable the customer cost box even when a requested value
     # happens to equal the supplier value. In that case, preserve all positive rates it
     # returned as customer-authored rates.
     if not changed and bool(new_data.get('show_cost')) and not bool(old_data.get('show_cost')):
@@ -5709,7 +5608,7 @@ async def process_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await progress(58, "🏨 Organizing accommodation, transport and day-wise itinerary...")
         await asyncio.sleep(0.2)
-        await progress(72, "🗺️ Preserving the supplier day-wise plan...")
+        await progress(72, "🗺️ Preparing the day-wise sightseeing descriptions locally...")
         await asyncio.sleep(0.2)
         await progress(84, "🧳 Building concise package inclusions locally...")
         await asyncio.sleep(0.2)
@@ -7143,7 +7042,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             "Paste whatever details you have. No special format is required. You can send onward and return journeys together or in separate messages.\n\n"
             "Example:\n`01 Oct: IndiGo 6E-594 Raipur → Mumbai 09:30 AM – 11:25 AM\n"
             "01 Oct: IndiGo 6E-273 Mumbai → Rajkot 01:10 PM – 03:50 PM`\n\n"
-            "Groq AI will extract the operator, flight/train number, route, date, departure and arrival automatically.\n\n"
+            "The local parser will extract the operator, service number, route, date, departure and arrival automatically.\n\n"
             "When finished, tap *✅ Done*.",
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardMarkup([["✍️ Flight Text"], ["✈️ Flight Screenshot"], ["✅ Done"]], resize_keyboard=True)
@@ -7191,7 +7090,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             return
         detail = query.data.split(":", 1)[1]
         try:
-            status = await query.message.reply_text("🤖 Updating the day plans with Groq AI...")
+            status = await query.message.reply_text("⚙️ Updating the day plans locally...")
             new_data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail), status=status)
             new_data["client_name"] = data.get("client_name", "")
             new_data["detail_level"] = detail
@@ -7286,7 +7185,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
         if not record:
             await query.message.reply_text('❌ Saved document not found.', reply_markup=main_keyboard()); return
         if record.get('type') == 'package':
-            # V155: one natural-language/voice edit entry for Tour. Groq AI can change
+            # One natural-language/voice edit entry for supported Tour fields can change
             # hotels/day plans as well as mixed flight/train/bus transit. Costing labels
             # (Adult/CWB/CNB/EB) are preserved locally after the AI edit.
             context.user_data['editing_reference']=reference
@@ -8329,7 +8228,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^❌ Cancel$"), cancel))
     app.add_error_handler(error_handler)
 
-    logger.info("MyTourBazar Groq AI bot is running | model=%s | key_loaded=%s", AI_MODEL, bool(AI_API_KEY))
+    logger.info("MyTourBazar local workflow bot is running")
     app.run_polling()
 
 
