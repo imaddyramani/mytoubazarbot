@@ -204,6 +204,13 @@ def _infer_hotel_city(address,current=''):
 
 def _extract_hotel_local(text):
     raw=str(text or '')
+    # Low-memory OCR may preserve CamelCase while omitting visual whitespace.
+    # Restore only safe typographic boundaries before applying field patterns.
+    raw=re.sub(r'(?<=[a-z])(?=[A-Z])',' ',raw)
+    raw=re.sub(r'\s*&\s*',' & ',raw)
+    raw=re.sub(r'(?i)\bfrontof\b','front of',raw)
+    raw=re.sub(r'(?i)\b(?:checkin)\b','Check-in',raw)
+    raw=re.sub(r'(?i)\b(?:checkout)\b','Check-out',raw)
     rooms=_hotel_local_value(raw,[r'(?:No\.?\s*of\s*)?Rooms?',r'Room\s*Count'],20)
     extra=_hotel_local_value(raw,[r'Extra\s*(?:Bed|Mattress)(?:\s*Count)?'],20)
     try: room_count=int(re.search(r'\d+',rooms).group()) if re.search(r'\d+',rooms) else 0
@@ -280,7 +287,7 @@ def extract_hotel_voucher(file_parts, source_text, api_key, model):
         for item in file_parts or []:
             path=Path(item.get('path') or '')
             if path.suffix.lower()=='.pdf' and path.is_file():
-                value=extract_pdf_visual_text(path,max_pages=2,max_chars=18000)
+                value=extract_pdf_visual_text(path,max_pages=1,max_chars=12000)
                 if value: visual.append(value)
         if visual:
             supplemented=_extract_hotel_local(text+'\n\n'+'\n\n'.join(visual))

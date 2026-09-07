@@ -1,7 +1,12 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
+import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 import time
 import threading
 from contextvars import ContextVar
@@ -10,7 +15,6 @@ _read_deadline = ContextVar('supplier_read_deadline', default=None)
 MAX_SUPPLIER_CHARS = 1000000
 
 
-_rapidocr_engine = None
 _rapidocr_lock = threading.Lock()
 _document_text_cache = {}
 
@@ -22,25 +26,29 @@ def _cache_key(path,kind,max_chars):
 
 
 def _read_scan(image):
-    """Read a scanned page with local RapidOCR; no shell process or cloud API."""
-    global _rapidocr_engine
+    """Read a scan in a disposable process so OCR memory cannot freeze the bot."""
     remaining = (_read_deadline.get() or (time.monotonic()+90))-time.monotonic()
     if remaining <= 0:
         raise LocalExtractionError('The scanned input exceeded the local reading budget. Send fewer pages together.')
-    try:
-        import numpy as np
-        from rapidocr_onnxruntime import RapidOCR
-    except Exception as exc:
-        raise LocalExtractionError('Local scan reader is unavailable. Rebuild from the updated requirements or send a selectable-text PDF.') from exc
-    image.thumbnail((1900,1900))
+    image.thumbnail((1500,1500))
     with _rapidocr_lock:
-        if _rapidocr_engine is None:
-            _rapidocr_engine = RapidOCR()
-        result, _ = _rapidocr_engine(np.asarray(image.convert('RGB')))
-    lines=[]
-    for row in result or []:
-        if len(row) >= 2 and str(row[1] or '').strip():
-            lines.append(str(row[1]).strip())
+        with tempfile.TemporaryDirectory(prefix='mtb_ocr_') as folder:
+            source=Path(folder)/'page.jpg'
+            image.convert('RGB').save(source,format='JPEG',quality=88,optimize=True)
+            env=os.environ.copy()
+            env.update(OMP_NUM_THREADS='1',OMP_THREAD_LIMIT='1',OPENBLAS_NUM_THREADS='1',MKL_NUM_THREADS='1')
+            timeout=max(8,min(45,int(remaining)))
+            try:
+                result=subprocess.run(
+                    [sys.executable,str(Path(__file__).with_name('local_ocr_worker.py')),str(source)],
+                    capture_output=True,text=True,timeout=timeout,env=env)
+            except subprocess.TimeoutExpired as exc:
+                raise LocalExtractionError('The scanned page exceeded the local reading budget. Send a clearer page or selectable-text PDF.') from exc
+            if result.returncode:
+                raise LocalExtractionError('The low-memory scan reader could not read this page. Send a clearer image or selectable-text PDF.')
+            try: lines=json.loads(result.stdout or '[]')
+            except json.JSONDecodeError as exc:
+                raise LocalExtractionError('The scan reader returned invalid text. Send the page again more clearly.') from exc
     text='\n'.join(lines).strip()
     if not text:
         raise LocalExtractionError('The scanned page could not be read. Send a clearer scan or paste its booking text.')
@@ -126,7 +134,7 @@ def extract_pdf_text_with_local_ocr(path, max_chars=60000, max_ocr_pages=20):
     return extract_supplier_pdf_text(path, max_chars, max_ocr_pages=min(max_ocr_pages,8))
 
 
-def extract_pdf_visual_text(path, max_pages=2, max_chars=20000):
+def extract_pdf_visual_text(path, max_pages=1, max_chars=20000):
     """OCR only likely booking pages of a mixed text/image PDF.
 
     Some supplier PDFs expose dates and rooms as selectable text while keeping the
@@ -151,7 +159,7 @@ def extract_pdf_visual_text(path, max_pages=2, max_chars=20000):
             chunks=[]
             for index in sorted(set(indexes)):
                 page=doc[index]
-                zoom=min(2.0,2100/max(page.rect.width,page.rect.height))
+                zoom=min(1.55,1500/max(page.rect.width,page.rect.height))
                 pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),colorspace=fitz.csRGB,alpha=False)
                 image=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
                 del pix
