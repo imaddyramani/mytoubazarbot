@@ -95,6 +95,11 @@ def _hotel_local_value(text,labels,max_len=140):
     label='|'.join(labels)
     m=re.search(r'(?im)^\s*(?:'+label+r')\s*[:#\-]?\s*([^\r\n|]{1,'+str(max_len)+r'})',text)
     if not m:
+        # Two-column PDFs commonly place "Guest: ... Hotel: ..." or
+        # "Mobile: ... Address: ..." on one text line. Require an explicit
+        # separator here so ordinary prose containing the word is not captured.
+        m=re.search(r'(?im)(?:^|[ \t]+)(?:'+label+r')\s*[:#\-]\s*([^\r\n|]{1,'+str(max_len)+r'})',text)
+    if not m:
         # OCR and many supplier PDFs put a label and its value on separate lines.
         line_match=re.search(r'(?im)^\s*(?:'+label+r')\s*[:#\-]?\s*$',text)
         if not line_match: return ''
@@ -114,6 +119,26 @@ def _hotel_local_value(text,labels,max_len=140):
         value,maxsplit=1
     )[0]
     return value.strip(' :-|')
+
+def _hotel_multiline_value(text,labels,max_len=300):
+    """Read a label value plus indented address continuation lines."""
+    label='|'.join(labels)
+    match=re.search(r'(?im)(?:^|[ \t]+)(?:'+label+r')\s*[:#\-]\s*([^\r\n|]{1,180})',str(text or ''))
+    if not match: return _hotel_local_value(text,labels,max_len)
+    captured=re.sub(r'\s+',' ',match.group(1)).strip(' :|')
+    value=_hotel_local_value(text,labels,180) or captured
+    if captured.endswith('-') and not value.endswith('-'): value+='-'
+    for raw_line in str(text or '')[match.end():].splitlines()[:4]:
+        if not raw_line.strip(): continue
+        candidate=re.sub(r'\s+',' ',raw_line).strip(' :-|')
+        if re.search(r'(?i)(?:guest|mobile|hotel|property|address|city|check[\s-]*in|check[\s-]*out|room|occupancy|meal|booking|reservation)\s*:',candidate): break
+        continuation=bool(
+            value.endswith('-') or re.search(r'(?i)\b\d{6}\b|\b(?:india|odisha|chhattisgarh|rajasthan|kerala|goa|kashmir|delhi|maharashtra)\b',candidate)
+        )
+        if not continuation: break
+        value=(value+candidate) if value.endswith('-') else (value+', '+candidate)
+        if len(value)>=max_len: break
+    return re.sub(r'\s+',' ',value)[:max_len].strip(' ,')
 
 def _hotel_local_amount(text,labels):
     value=_hotel_local_value(text,labels,80)
@@ -135,8 +160,11 @@ def _hotel_terms(text):
     for line in lines:
         if re.search(r'(?i)^(?:hotel\s+)?(?:terms|important\s+information|instructions|polic(?:y|ies))\b',line):
             active=True; continue
-        if active and re.match(r'^[A-Z][A-Z &/]{4,}$',line):
+        if active and (re.match(r'^[A-Z][A-Z &/]{4,}$',line) or re.search(r'(?i)^Email\s*:.*\b(?:Phone|Web)\s*:',line)):
             break
+        if active and line and out and (line[:1].islower() or len(line)<12):
+            out[-1]=(out[-1]+' '+line).strip()
+            continue
         if active and len(line)>=12 and line not in out:
             out.append(line)
             if len(out)>=8: break
@@ -253,7 +281,7 @@ def _extract_hotel_local(text):
         match=re.search(r'(?i)\b(\d+)\s*(?:Extra\s*(?:Beds?|Mattresses?)|EB)\b',' '.join((room_type,occupancy,raw)))
         extra_count=int(match.group(1)) if match else 0
     hotel_name=_infer_hotel_name(raw,_hotel_local_value(raw,[r'Hotel\s*Name',r'Hotel(?=\s*(?::|$))',r'Property\s*Name',r'Property(?=\s*(?::|$))']))
-    hotel_address=_infer_hotel_address(raw,hotel_name,_hotel_local_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address']))
+    hotel_address=_infer_hotel_address(raw,hotel_name,_hotel_multiline_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address']))
     hotel_city=_infer_hotel_city(hotel_address,_hotel_local_value(raw,[r'Hotel\s*City',r'City',r'Destination',r'Location']))
     costs=[]
     if base>0: costs.append({'description':'Room Charges','quantity':1,'rate':base,'nights':1,'total':base})
@@ -282,7 +310,7 @@ def extract_hotel_voucher(file_parts, source_text, api_key, model):
     # Mixed supplier PDFs often store the property header/address as artwork even
     # though the booking table itself is selectable text. OCR only the most likely
     # one or two pages, and only when identity/location fields are actually absent.
-    if not data.get('hotel_name') or not data.get('hotel_city') or not data.get('hotel_address'):
+    if not data.get('hotel_name') and not re.search(r'(?i)\b(?:hotel|property)\s*:',text):
         visual=[]
         for item in file_parts or []:
             path=Path(item.get('path') or '')
@@ -300,6 +328,10 @@ def extract_hotel_voucher(file_parts, source_text, api_key, model):
         location=resolve_hotel_location(data['hotel_name'],data['hotel_city'])
         data['hotel_address']=location.get('address') or ''
         data['maps_url']=location.get('maps_url') or ''
+    if not data.get('hotel_name'):
+        raise ValueError('Hotel name was not found in the supplier material. Send the hotel page or add Hotel Name and City as text; an incomplete voucher was not printed.')
+    if not data.get('hotel_address') and not data.get('hotel_city'):
+        raise ValueError('Hotel address/city was not found in the supplier material. Add the City as text so the location can be completed automatically; an incomplete voucher was not printed.')
     return data
 
 
