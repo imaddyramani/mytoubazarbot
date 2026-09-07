@@ -126,6 +126,47 @@ def extract_pdf_text_with_local_ocr(path, max_chars=60000, max_ocr_pages=20):
     return extract_supplier_pdf_text(path, max_chars, max_ocr_pages=min(max_ocr_pages,8))
 
 
+def extract_pdf_visual_text(path, max_pages=2, max_chars=20000):
+    """OCR only likely booking pages of a mixed text/image PDF.
+
+    Some supplier PDFs expose dates and rooms as selectable text while keeping the
+    hotel identity/address inside a header image. The normal fast path correctly
+    avoids OCR for those pages; this targeted fallback is called only when hotel
+    identity fields remain empty after local text parsing.
+    """
+    key=_cache_key(path,f'pdf_visual_{max_pages}',max_chars)
+    if key in _document_text_cache: return _document_text_cache[key][:max_chars]
+    try:
+        import fitz
+        from PIL import Image
+        with fitz.open(str(path)) as doc:
+            scored=[]
+            for index,page in enumerate(doc):
+                low=(page.get_text('text') or '').lower()
+                score=(5 if re.search(r'check[\s-]*in|check[\s-]*out',low) else 0)
+                score+=(4 if re.search(r'hotel|property|room\s*(?:type|category)',low) else 0)
+                score+=(2 if index==0 else 0)
+                scored.append((score,-index,index))
+            indexes=[row[2] for row in sorted(scored,reverse=True)[:max(1,min(int(max_pages),3))]]
+            chunks=[]
+            for index in sorted(set(indexes)):
+                page=doc[index]
+                zoom=min(2.0,2100/max(page.rect.width,page.rect.height))
+                pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),colorspace=fitz.csRGB,alpha=False)
+                image=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
+                del pix
+                try: value=_read_scan(image)
+                except LocalExtractionError: value=''
+                finally: image.close()
+                if value: chunks.append(f'--- VISUAL PAGE {index+1} ---\n{value}')
+                if sum(len(x) for x in chunks)>=max_chars: break
+        result='\n\n'.join(chunks)[:max_chars]
+        _document_text_cache[key]=result
+        return result
+    except Exception:
+        return ''
+
+
 def collect_local_document_text(file_parts,source_text='',max_chars=60000):
     token=_read_deadline.set(time.monotonic()+100)
     try:

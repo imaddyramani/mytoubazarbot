@@ -7,7 +7,7 @@ from html import escape
 from pdf_render import write_pdf
 
 from print_settings import apply_css_settings
-from performance_utils import extract_pdf_text, collect_local_document_text
+from performance_utils import extract_pdf_text, collect_local_document_text, extract_pdf_visual_text
 from hotel_location import google_maps_url, resolve_hotel_location
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
@@ -176,6 +176,32 @@ def _infer_hotel_name(text,current=''):
         candidates.append((score,line))
     return max(candidates,default=(0,''))[1]
 
+def _infer_hotel_address(text,hotel_name,current=''):
+    if str(current or '').strip(): return str(current).strip()
+    lines=[re.sub(r'\s+',' ',x).strip(' :-|') for x in str(text or '').splitlines()]
+    target=re.sub(r'[^a-z0-9]','',str(hotel_name or '').lower())
+    address_hint=re.compile(r'(?i)\b(?:road|rd\.?|street|st\.?|marg|nagar|colony|sector|plot|highway|lane|near|opposite|behind|front\s+of|district|india)\b|\b\d{6}\b')
+    for index,line in enumerate(lines):
+        norm=re.sub(r'[^a-z0-9]','',line.lower())
+        if not target or not norm or not (target in norm or norm in target): continue
+        following=[]
+        for candidate in lines[index+1:index+6]:
+            if not candidate: continue
+            if re.search(r'(?i)(?:check[\s-]*in|check[\s-]*out|reservation\s*(?:id|no|number|#)?|booking\s*(?:id|no|number|#)?|guest\s*(?:name|details)?|room\s+type|meal\s+plan)',candidate): break
+            if len(candidate)<=140: following.append(candidate)
+        joined=', '.join(following)
+        joined=re.sub(r'(?i)\b0disha\b','Odisha',joined)
+        joined=re.sub(r'\s*,\s*',', ',joined); joined=re.sub(r'(?:,\s*){2,}',', ',joined).strip(' ,')
+        if address_hint.search(joined): return joined[:300]
+    return ''
+
+def _infer_hotel_city(address,current=''):
+    if str(current or '').strip(): return str(current).strip()
+    raw=str(address or '')
+    match=re.search(r'(?i)(?:,|\b)([A-Za-z][A-Za-z .]{1,35})[-\s]+\d{6}\b',raw)
+    if match: return re.sub(r'\s+',' ',match.group(1)).strip(' ,.-')
+    return ''
+
 def _extract_hotel_local(text):
     raw=str(text or '')
     rooms=_hotel_local_value(raw,[r'(?:No\.?\s*of\s*)?Rooms?',r'Room\s*Count'],20)
@@ -220,8 +246,8 @@ def _extract_hotel_local(text):
         match=re.search(r'(?i)\b(\d+)\s*(?:Extra\s*(?:Beds?|Mattresses?)|EB)\b',' '.join((room_type,occupancy,raw)))
         extra_count=int(match.group(1)) if match else 0
     hotel_name=_infer_hotel_name(raw,_hotel_local_value(raw,[r'Hotel\s*Name',r'Hotel(?=\s*(?::|$))',r'Property\s*Name',r'Property(?=\s*(?::|$))']))
-    hotel_address=_hotel_local_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address'])
-    hotel_city=_hotel_local_value(raw,[r'Hotel\s*City',r'City',r'Destination',r'Location'])
+    hotel_address=_infer_hotel_address(raw,hotel_name,_hotel_local_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address']))
+    hotel_city=_infer_hotel_city(hotel_address,_hotel_local_value(raw,[r'Hotel\s*City',r'City',r'Destination',r'Location']))
     costs=[]
     if base>0: costs.append({'description':'Room Charges','quantity':1,'rate':base,'nights':1,'total':base})
     if taxes>0: costs.append({'description':'Taxes and Fees','quantity':1,'rate':taxes,'nights':1,'total':taxes})
@@ -246,6 +272,23 @@ def _extract_hotel_local(text):
 def extract_hotel_voucher(file_parts, source_text, api_key, model):
     text=collect_local_document_text(file_parts,source_text,max_chars=45000)
     data=_extract_hotel_local(text)
+    # Mixed supplier PDFs often store the property header/address as artwork even
+    # though the booking table itself is selectable text. OCR only the most likely
+    # one or two pages, and only when identity/location fields are actually absent.
+    if not data.get('hotel_name') or not data.get('hotel_city') or not data.get('hotel_address'):
+        visual=[]
+        for item in file_parts or []:
+            path=Path(item.get('path') or '')
+            if path.suffix.lower()=='.pdf' and path.is_file():
+                value=extract_pdf_visual_text(path,max_pages=2,max_chars=18000)
+                if value: visual.append(value)
+        if visual:
+            supplemented=_extract_hotel_local(text+'\n\n'+'\n\n'.join(visual))
+            for key in ('hotel_name','hotel_city','hotel_address','guest_name','mobile','room_type','occupancy_summary','meal_plan'):
+                if not data.get(key) and supplemented.get(key): data[key]=supplemented[key]
+            for key in ('room_count','extra_bed_count'):
+                if not int(data.get(key) or 0) and int(supplemented.get(key) or 0): data[key]=supplemented[key]
+            if not data.get('nights') and supplemented.get('nights'): data['nights']=supplemented['nights']
     if data.get('hotel_name') and data.get('hotel_city') and not data.get('hotel_address'):
         location=resolve_hotel_location(data['hotel_name'],data['hotel_city'])
         data['hotel_address']=location.get('address') or ''
