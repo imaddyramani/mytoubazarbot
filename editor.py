@@ -87,7 +87,7 @@ def _edit_booking(doc_type,data,instruction,current_fare):
     mappings={
         'flight':{'airline_pnr':(r'airline\s+pnr',r'pnr'),'gds_pnr':(r'gds\s+pnr',),'booking_id':(r'trip\s+id',r'booking\s+id'),'status':(r'status',),'baggage_summary':(r'baggage',),'mobile':(r'mobile',r'phone')},
         'bus':{'pnr':(r'bus\s+pnr',r'pnr'),'booking_id':(r'booking\s+id',r'ticket\s+id'),'status':(r'status',),'operator':(r'bus\s+operator',r'operator'),'boarding_point':(r'boarding\s+point',),'drop_point':(r'drop(?:ping)?\s+point',)},
-        'hotel':{'guest_name':(r'guest\s+name',r'client\s+name'),'hotel_name':(r'hotel\s+name',r'property'),'check_in':(r'check[ -]?in',),'check_out':(r'check[ -]?out',),'room_type':(r'room\s+type',r'room\s+category'),'meal_plan':(r'meal\s+plan',),'booking_id':(r'booking\s+id',r'confirmation\s+number')},
+        'hotel':{'guest_name':(r'guest\s+name',r'client\s+name'),'hotel_name':(r'hotel\s+name',r'property'),'hotel_address':(r'hotel\s+address',r'address'),'hotel_city':(r'hotel\s+city',r'city',r'location'),'check_in':(r'check[ -]?in',),'check_out':(r'check[ -]?out',),'nights':(r'total\s+nights?',r'nights?'),'room_type':(r'room\s+type',r'room\s+category'),'extra_bed_count':(r'extra\s+(?:bed|mattress)',r'\beb\b'),'meal_plan':(r'meal\s+plan',),'booking_id':(r'booking\s+id',r'confirmation\s+number')},
     }
     for key,labels in mappings.get(doc_type,{}).items():
         value=_value_after(instruction,labels)

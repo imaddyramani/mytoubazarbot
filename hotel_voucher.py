@@ -1,12 +1,14 @@
 import json
 import base64
 import re
+from datetime import datetime
 from pathlib import Path
 from html import escape
 from pdf_render import write_pdf
 
 from print_settings import apply_css_settings
 from performance_utils import extract_pdf_text, collect_local_document_text
+from hotel_location import google_maps_url, resolve_hotel_location
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 HOTEL_VOUCHER_SCHEMA = {
@@ -92,7 +94,18 @@ def _fast_hotel_pdf_text(path):
 def _hotel_local_value(text,labels,max_len=140):
     label='|'.join(labels)
     m=re.search(r'(?im)^\s*(?:'+label+r')\s*[:#\-]?\s*([^\r\n|]{1,'+str(max_len)+r'})',text)
-    if not m: return ''
+    if not m:
+        # OCR and many supplier PDFs put a label and its value on separate lines.
+        line_match=re.search(r'(?im)^\s*(?:'+label+r')\s*[:#\-]?\s*$',text)
+        if not line_match: return ''
+        tail=text[line_match.end():]
+        for candidate in tail.splitlines()[:4]:
+            candidate=re.sub(r'\s+',' ',candidate).strip(' :-|')
+            if not candidate: continue
+            if re.fullmatch(r'(?i)(?:Guest|Mobile|Hotel|Property|Address|City|Destination|Check[\s-]*in|Check[\s-]*out|Nights?|Room|Occupancy|Meal\s*Plan)',candidate):
+                continue
+            return candidate[:max_len]
+        return ''
     value=re.sub(r'\s+',' ',m.group(1)).strip(' :-|')
     value=re.split(
         r'(?i)\s+(?=(?:Guest|Mobile|Hotel|Property|Address|City|Destination|Check[\s-]*in|'
@@ -128,6 +141,40 @@ def _hotel_terms(text):
             out.append(line)
             if len(out)>=8: break
     return out
+
+def _hotel_date(value):
+    raw=re.sub(r'(?i)(\d)(st|nd|rd|th)\b',r'\1',str(value or ''))
+    raw=re.sub(r'[(),|]',' ',raw); raw=re.sub(r'\s+',' ',raw).strip()
+    patterns=(r'\d{1,2}[\s./-]+[A-Za-z]{3,9}[\s,./-]+\d{2,4}',r'\d{4}-\d{1,2}-\d{1,2}',r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}')
+    values=[raw]
+    for pattern in patterns:
+        match=re.search(pattern,raw,re.I)
+        if match: values.insert(0,match.group(0))
+    for item in values:
+        clean=re.sub(r'\s+',' ',item.replace(',',' ')).strip()
+        for fmt in ('%d %b %Y','%d %B %Y','%d-%b-%Y','%d-%B-%Y','%d-%b-%y','%d-%B-%y','%Y-%m-%d','%d-%m-%Y','%d/%m/%Y','%d/%m/%y'):
+            try: return datetime.strptime(clean,fmt)
+            except ValueError: pass
+    return None
+
+def _derive_nights(check_in,check_out,current=''):
+    match=re.search(r'\d+',str(current or ''))
+    if match and int(match.group())>0: return str(int(match.group()))
+    start,end=_hotel_date(check_in),_hotel_date(check_out)
+    if start and end and (end-start).days>0: return str((end-start).days)
+    return ''
+
+def _infer_hotel_name(text,current=''):
+    if str(current or '').strip(): return str(current).strip()
+    blocked=re.compile(r'(?i)\b(?:voucher|confirmation|reservation|booking|invoice|guest|room\s+type|hotel\s+information)\b')
+    property_word=re.compile(r'(?i)\b(?:hotel|resort|residency|palace|inn|suites?|retreat|lodge|hostel|villa)\b')
+    candidates=[]
+    for line in str(text or '').splitlines():
+        line=re.sub(r'\s+',' ',line).strip(' :-|')
+        if not 3<=len(line)<=100 or blocked.search(line) or not property_word.search(line): continue
+        score=3 + (2 if len(line.split())<=8 else 0) + (1 if line[:1].isupper() else 0)
+        candidates.append((score,line))
+    return max(candidates,default=(0,''))[1]
 
 def _extract_hotel_local(text):
     raw=str(text or '')
@@ -165,6 +212,16 @@ def _extract_hotel_local(text):
     if not meal:
         m=re.search(r'(?i)\b(?:CPAI?|MAPAI?|APAI?|EP|Room\s*Only|Bed\s*(?:&|and)\s*Breakfast|Breakfast\s+Included|Half\s*Board|Full\s*Board)\b',raw)
         if m: meal=m.group(0)
+    nights=_derive_nights(check_in,check_out,_hotel_local_value(raw,[r'(?:No\.?\s*of\s*)?Nights?'],20))
+    if room_count<=0:
+        match=re.search(r'(?i)\b(\d+)\s*Rooms?\b',' '.join((room_type,occupancy)))
+        room_count=int(match.group(1)) if match else 0
+    if extra_count<=0:
+        match=re.search(r'(?i)\b(\d+)\s*(?:Extra\s*(?:Beds?|Mattresses?)|EB)\b',' '.join((room_type,occupancy,raw)))
+        extra_count=int(match.group(1)) if match else 0
+    hotel_name=_infer_hotel_name(raw,_hotel_local_value(raw,[r'Hotel\s*Name',r'Hotel(?=\s*(?::|$))',r'Property\s*Name',r'Property(?=\s*(?::|$))']))
+    hotel_address=_hotel_local_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address'])
+    hotel_city=_hotel_local_value(raw,[r'Hotel\s*City',r'City',r'Destination',r'Location'])
     costs=[]
     if base>0: costs.append({'description':'Room Charges','quantity':1,'rate':base,'nights':1,'total':base})
     if taxes>0: costs.append({'description':'Taxes and Fees','quantity':1,'rate':taxes,'nights':1,'total':taxes})
@@ -172,12 +229,12 @@ def _extract_hotel_local(text):
         'reservation_id':_hotel_local_value(raw,[r'(?:Reservation|Confirmation|Booking)\s*(?:ID|Number|No\.?|Reference)']),
         'guest_name':_hotel_local_value(raw,[r'(?:Lead\s*)?Guest\s*Name',r'Guest(?=\s*:)',r'Booked\s*For']),
         'mobile':_hotel_local_value(raw,[r'(?:Guest|Customer|Contact)\s*(?:Mobile|Phone)',r'Mobile\s*(?:No\.?|Number)?']),
-        'hotel_name':_hotel_local_value(raw,[r'Hotel\s*Name',r'Hotel(?=\s*:)',r'Property\s*Name',r'Property(?=\s*:)']),
-        'hotel_address':_hotel_local_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address']),
-        'hotel_city':_hotel_local_value(raw,[r'Hotel\s*City',r'City',r'Destination']),
+        'hotel_name':hotel_name,
+        'hotel_address':hotel_address,
+        'hotel_city':hotel_city,
         'check_in':check_in,
         'check_out':check_out,
-        'nights':_hotel_local_value(raw,[r'(?:No\.?\s*of\s*)?Nights?'],20),
+        'nights':nights,
         'room_type':room_type,
         'occupancy_summary':occupancy,
         'room_count':room_count,'extra_bed_count':extra_count,
@@ -188,7 +245,12 @@ def _extract_hotel_local(text):
 
 def extract_hotel_voucher(file_parts, source_text, api_key, model):
     text=collect_local_document_text(file_parts,source_text,max_chars=45000)
-    return _extract_hotel_local(text)
+    data=_extract_hotel_local(text)
+    if data.get('hotel_name') and data.get('hotel_city') and not data.get('hotel_address'):
+        location=resolve_hotel_location(data['hotel_name'],data['hotel_city'])
+        data['hotel_address']=location.get('address') or ''
+        data['maps_url']=location.get('maps_url') or ''
+    return data
 
 
 def _esc(v):
@@ -207,8 +269,15 @@ def generate_hotel_voucher(data, output_path, logo_path=None, fare=None, page_si
     logo_html = f'<a href="{MYTOURBAZAR_LOGO_URL}"><img src="{logo}" class="logo" alt="MyTourBazar Logo"></a>' if logo else ""
     address = data.get("hotel_address") or ""
     hotel_city = data.get("hotel_city") or ""
-    query = "+".join(x for x in [data.get("hotel_name"), hotel_city] if x)
-    maps_url = f"https://www.google.com/maps/search/?api=1&query={query.replace(' ', '+')}" if query else ""
+    if data.get('hotel_name') and hotel_city and not address:
+        location=resolve_hotel_location(data.get('hotel_name'),hotel_city)
+        address=location.get('address') or ''
+        data['hotel_address']=address
+        data['maps_url']=location.get('maps_url') or ''
+    # If the free address directory cannot resolve the property, never leave the
+    # guest with a blank location: show the searchable hotel/city combination.
+    display_address=address or ', '.join(x for x in (str(data.get('hotel_name') or '').strip(),hotel_city) if x)
+    maps_url = data.get('maps_url') or google_maps_url(data.get('hotel_name'),hotel_city,address)
     maps_html = f'<a href="{_esc(maps_url)}" class="map-link">📍 View on Google Maps</a>' if maps_url else "Not available"
 
     terms = data.get("terms") or []
@@ -217,7 +286,8 @@ def generate_hotel_voucher(data, output_path, logo_path=None, fare=None, page_si
         terms_html = "<li>Please present a valid government-approved photo ID at check-in.</li>"
 
     reservation = data.get("reservation_id") or "—"
-    nights = data.get("nights") or "—"
+    nights = _derive_nights(data.get('check_in'),data.get('check_out'),data.get('nights')) or "—"
+    data['nights']=nights
     components=data.get("cost_components") or []
     cost_rows=[]
     for comp in components:
@@ -297,6 +367,9 @@ def generate_hotel_voucher(data, output_path, logo_path=None, fare=None, page_si
     room = data.get("room_type") or "—"
     occupancy = data.get("occupancy_summary") or "—"
     meal = data.get("meal_plan") or "—"
+    try: extra_beds=int(float(data.get('extra_bed_count') or 0))
+    except Exception: extra_beds=0
+    extra_bed_row=(f'<tr><td><strong>Extra Bed</strong></td><td>{extra_beds}</td></tr>' if extra_beds>0 else '')
 
     content_score = (len(str(data.get('hotel_address') or '')) + len(str(data.get('occupancy_summary') or '')) + len(str(data.get('hotel_name') or '')) + len(terms) * 55)
     if content_score <= 280:
@@ -342,15 +415,17 @@ ul {{ margin:4px 0; padding-left:18px; font-size:11px; }} li {{ margin-bottom:5p
 </table></div>
 <div class="section"><div class="section-title">Hotel Information</div><table class="info-table">
 <tr><td style="font-weight:bold;width:25%">Hotel:</td><td>{_esc(data.get('hotel_name'))}</td></tr>
-<tr><td style="font-weight:bold">Address:</td><td>{_esc(address) or '—'}</td></tr>
+<tr><td style="font-weight:bold">Address:</td><td>{_esc(display_address) or '—'}</td></tr>
 <tr><td style="font-weight:bold">Directions:</td><td>{maps_html}</td></tr>
 </table></div>
 </div>
 <div class="section" style="margin-top:10px"><div class="section-title">Booking Details &amp; Itinerary Breakdown</div>
 <table class="details-table"><tr><th>Category</th><th>Information</th></tr>
-<tr><td><strong>Check-in</strong></td><td>{_esc(check_in)} | { _esc(nights) } Nights</td></tr>
+<tr><td><strong>Check-in</strong></td><td>{_esc(check_in)}</td></tr>
+<tr><td><strong>Total Nights</strong></td><td>{_esc(nights)}</td></tr>
 <tr><td><strong>Check-out</strong></td><td>{_esc(check_out)}</td></tr>
 <tr><td><strong>Room Type</strong></td><td>{_esc(room)}</td></tr>
+{extra_bed_row}
 <tr><td><strong>Occupancy Summary</strong></td><td>{_esc(occupancy)}</td></tr>
 <tr><td><strong>Meal Plan</strong></td><td>{_esc(meal)}</td></tr>
 </table></div>
