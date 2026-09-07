@@ -3,6 +3,7 @@ from contextvars import ContextVar
 from functools import wraps
 import copy
 from pathlib import Path
+from ai_provider import complete_json
 from performance_utils import collect_local_document_text
 
 _layout_cache = ContextVar('air_layout_cache', default=None)
@@ -1926,10 +1927,21 @@ def _local_segments_from_pdf_geometry(original_paths):
 
 def _local_segments_from_text(raw):
     out=[]; seen=set(); raw=str(raw or '')
-    reject={'IN','ON','ID','NO','KG','RS','MR','MS','DR','AM','PM','JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'}
+    reject={'IN','ON','ID','NO','KG','RS','MR','MS','DR','AM','PM','AIR','PNR','GDS','REF','JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'}
     known3={k for k in _FLIGHT_AIRLINE_BY_CODE if len(k)==3}
     for fm in re.finditer(r'(?<![A-Z0-9])([A-Z0-9]{2,3})\s*[- ]?\s*(\d{1,4})(?!\d)',raw.upper()):
-        if fm.group(1) in reject or (len(fm.group(1))==3 and fm.group(1) not in known3):
+        if (not re.search(r'[A-Z]',fm.group(1)) or fm.group(1) in reject
+                or (len(fm.group(1))==3 and fm.group(1) not in known3)):
+            continue
+        line_start=raw.rfind('\n',0,fm.start())+1
+        line_end=raw.find('\n',fm.end())
+        if line_end<0: line_end=len(raw)
+        source_line=raw[line_start:line_end]
+        # Booking/PNR/ticket/fare labels often contain compact letter+digit IDs
+        # that resemble a flight number. Accept such a row only when it also
+        # explicitly labels the value as a flight/service number.
+        if (re.search(r'(?i)\b(?:booking|trip|reservation|pnr|ticket|invoice|fare|tax|total|baggage)\b',source_line)
+                and not re.search(r'(?i)\b(?:flight|service)\s*(?:no|number)?\b',source_line)):
             continue
         fn=f'{fm.group(1)} {fm.group(2)}'
         window=raw[max(0,fm.start()-150):min(len(raw),fm.end()+1200)]
@@ -2212,8 +2224,16 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     original_paths=[Path(item.get('path') or '') for item in (file_parts or []) if item.get('path')]
     data=_local_first_air_extract(raw_source_text,original_paths)
     used_ai=False
-    # All remaining verification is deterministic/local. No second source-truth,
-    # repair, endpoint-verifier or fare-recovery AI calls.
+    # Ask a remote model only when the bounded local pass is incomplete. Any
+    # provider/quota/timeout failure returns None and printing continues locally.
+    if _local_air_needs_ai(data):
+        remote=complete_json(
+            AIR_LIGHT_PROMPT,raw_source_text,SCHEMA,
+            purpose='air extraction recovery',max_tokens=6500,image_paths=original_paths,
+        )
+        if remote:
+            data=_merge_ai_into_local(data,remote)
+            used_ai=True
     data=_recover_source_only_fields(data,raw_source_text)
     data=_normalize_flight_segments(data)
     data=_sanitize_ticket_numbers(data)
@@ -2230,8 +2250,7 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         pass
     data=_final_endpoint_safety_gate(data)
 
-    # Missing optional fields remain blank. A remote repair must never block
-    # Air Print or overwrite names, PNR, baggage and sectors recovered locally.
+    # Missing optional fields remain blank. Remote repair never blocks Air Print.
     data=_apply_baggage_summary(data)
     data=_apply_air_output_defaults(data,raw_source_text)
 

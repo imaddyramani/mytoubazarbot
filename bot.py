@@ -40,6 +40,7 @@ from footer2_overlay import add_footer2_to_pdf
 from print_settings import load_settings, save_settings, set_font, adjust_text_scale, adjust_logo_scale, get_logo_scale, toggle_button, reset_settings, FONT_OPTIONS, button_enabled, set_default_terms, set_default_footer, get_default_footer, set_tour_last_page, get_tour_last_page
 from performance_utils import prepare_supplier_for_ai, parse_transit_files_local, apply_missing_accommodation_locally
 from voice_edit import transcribe_voice_note
+from ai_provider import configuration_summary
 
 # V55: LOCAL FOOTER SOURCE
 # The footer can ONLY come from this bot's own assets folder.
@@ -132,9 +133,10 @@ def mtb_airline_logo_html(airline_text, alt=None):
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-# Compatibility arguments retained while all implementations run locally.
-AI_API_KEY = None
-AI_MODEL = "local"
+# Compatibility arguments retained by the workflow functions. Provider routing
+# itself lives in ai_provider.py and remains local when AI_PROVIDER=local.
+AI_API_KEY = os.getenv("XKIRO_API_KEY", "").strip() or os.getenv("GROQ_API_KEY", "").strip() or None
+AI_MODEL = os.getenv("XKIRO_TEXT_MODEL", "").strip() or os.getenv("GROQ_MODEL", "").strip() or "auto"
 
 ADMIN_USER_IDS = {
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
@@ -3714,7 +3716,7 @@ async def smart_process(update, context):
                 elif action == "generate_brief":
                     result = {"kind":"package", "confidence":0.99, "reason":plan.get("reason","New tour itinerary requested."), "reference":"", "instruction":plan.get("instruction") or text}
                 elif action == "chat":
-                    result = {"kind":"chat", "confidence":0.99, "reason":plan.get("reason","Normal assistant request."), "reference":"", "instruction":text}
+                    result = {"kind":"chat", "confidence":0.99, "reason":plan.get("reason","Normal assistant request."), "reference":"", "instruction":text, "answer":plan.get("answer","")}
                 else:
                     result = {"kind":"unknown", "confidence":0.0, "reason":plan.get("needs_user_input") or "I need more information.", "reference":"", "instruction":text}
         kind = str(result.get("kind", "unknown")).lower()
@@ -3744,7 +3746,9 @@ async def smart_process(update, context):
             return ConversationHandler.END
 
         if kind == "chat":
-            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text, AI_API_KEY, AI_MODEL), ['💬 Local Assistant is preparing your reply...'], 60, 92)
+            answer = str(result.get("answer") or "").strip()
+            if not answer:
+                answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text, AI_API_KEY, AI_MODEL), ['💬 Local Assistant is preparing your reply...'], 60, 92)
             await safe_status_edit(status, update.message, answer or "I’m ready. Tell me what you want me to do.", parse_mode=None)
             await update.message.reply_text("Send another request or supplier document.", reply_markup=main_keyboard())
             return ConversationHandler.END
@@ -8101,6 +8105,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing in .env")
+    logger.info(configuration_summary())
 
     request = HTTPXRequest(connect_timeout=20, read_timeout=60, write_timeout=60, pool_timeout=20)
     polling_request = HTTPXRequest(connect_timeout=20, read_timeout=45, write_timeout=30, pool_timeout=20)

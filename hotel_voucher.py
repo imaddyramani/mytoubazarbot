@@ -6,6 +6,7 @@ from pathlib import Path
 from html import escape
 from pdf_render import write_pdf
 
+from ai_provider import complete_json
 from print_settings import apply_css_settings
 from performance_utils import extract_pdf_text, collect_local_document_text, extract_pdf_visual_text
 from hotel_location import google_maps_url, resolve_hotel_location
@@ -324,6 +325,24 @@ def extract_hotel_voucher(file_parts, source_text, api_key, model):
             for key in ('room_count','extra_bed_count'):
                 if not int(data.get(key) or 0) and int(supplemented.get(key) or 0): data[key]=supplemented[key]
             if not data.get('nights') and supplemented.get('nights'): data['nights']=supplemented['nights']
+    needs_ai=not all(str(data.get(key) or '').strip() for key in ('hotel_name','check_in','check_out')) or not (
+        str(data.get('hotel_address') or '').strip() or str(data.get('hotel_city') or '').strip()
+    )
+    if needs_ai:
+        remote=complete_json(
+            HOTEL_VOUCHER_PROMPT,text,HOTEL_VOUCHER_SCHEMA,
+            purpose='hotel extraction recovery',max_tokens=4000,
+            image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
+        )
+        if remote:
+            for key,value in remote.items():
+                if key in ('terms','cost_components'):
+                    if not data.get(key) and value: data[key]=value
+                elif key in ('room_count','extra_bed_count','base_fare','taxes'):
+                    if not float(data.get(key) or 0) and float(value or 0): data[key]=value
+                elif not str(data.get(key) or '').strip() and str(value or '').strip():
+                    data[key]=value
+            data['_ai_fallback_used']=True
     if data.get('hotel_name') and data.get('hotel_city') and not data.get('hotel_address'):
         location=resolve_hotel_location(data['hotel_name'],data['hotel_city'])
         data['hotel_address']=location.get('address') or ''

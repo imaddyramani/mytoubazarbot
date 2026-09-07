@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from ai_provider import complete_json
 from local_tour_planner import attractive_title, infer_destination
 
 LOGGER = logging.getLogger('mytourbazar.extractor')
@@ -684,4 +685,16 @@ def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
     if not source_days:
         matches=list(re.finditer(r'(?im)^\s*(\d{1,2})[.)]\s+([^\n]+)',source_text))
         source_days=[{'day':m.group(1),'title':m.group(2).strip(),'description':m.group(2).strip()} for m in matches]
-    return _local_tour_result(source_text,source_days)
+    local=_local_tour_result(source_text,source_days)
+    remote=complete_json(
+        SYSTEM_PROMPT,
+        "Extract and professionally structure this supplier Tour. Preserve every explicit supplier fact and "
+        "return the complete schema. SOURCE PRESENT = COPY; SOURCE ABSENT = BLANK.\n\n"+source_text,
+        SCHEMA,purpose='tour supplier extraction',max_tokens=9000,
+        image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
+    )
+    if remote:
+        # Imported at runtime to keep the local extraction module independently usable.
+        from smart_assistant import merge_ai_package
+        return merge_ai_package(local,remote)
+    return local

@@ -1,0 +1,12 @@
+MyTourBazar V204 — xKiro Qwen Across All Workflows
+
+- Free Qwen is the preferred xKiro model for text and PDF/image recovery.
+- Tour, Air, Bus and Hotel keep their fast local extraction and printing paths.
+- xKiro repairs incomplete extraction without replacing valid supplier data.
+- The private assistant can classify requests, plan workflows and answer bot questions.
+- Smart edits use schema-limited patch operations and preserve unrelated booking fields.
+- Northflank startup logs show the active provider and model without exposing keys.
+- AI timeouts, invalid JSON and provider outages fall back safely to local behavior.
+- No API keys or Telegram tokens are stored in GitHub.
+
+Deployment variables are documented in XKIRO_SETUP.md.

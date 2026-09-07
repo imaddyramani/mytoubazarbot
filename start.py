@@ -233,7 +233,7 @@ def main():
 
     health_thread = threading.Thread(
         target=run_health_server,
-        name="back4app-health",
+        name="northflank-health",
         daemon=True,
     )
     health_thread.start()
