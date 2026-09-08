@@ -678,14 +678,37 @@ def _local_tour_result(text,source_days):
     return _ensure_generated_inclusion_exclusion_lists(result)
 
 
+def _merge_local_fallback_into_ai_package(remote, local):
+    """Keep Qwen's structured itinerary and backfill only genuinely blank facts."""
+    result=dict(remote or {}); local=local or {}
+    for key,value in local.items():
+        if key in ('days','hotels','inclusions','exclusions','transit','package_costs'):
+            continue
+        if result.get(key) in ('',None,0,[]) and value not in ('',None,0,[]):
+            result[key]=value
+    for key in ('inclusions','exclusions','transit','package_costs'):
+        if not result.get(key) and local.get(key): result[key]=local[key]
+    for key in ('days','hotels'):
+        remote_rows=list(result.get(key) or []); local_rows=list(local.get(key) or [])
+        if not remote_rows:
+            result[key]=local_rows; continue
+        for index,row in enumerate(remote_rows):
+            fallback=local_rows[index] if index<len(local_rows) else {}
+            if not isinstance(row,dict): continue
+            for field,value in (fallback or {}).items():
+                if row.get(field) in ('',None,0,[]) and value not in ('',None,0,[]): row[field]=value
+        result[key]=remote_rows
+    result['_ai_primary_used']=True
+    return _ensure_generated_inclusion_exclusion_lists(result)
+
+
 def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
-    from performance_utils import collect_local_document_text
-    source_text=collect_local_document_text(file_parts,source_text)
+    from performance_utils import collect_complete_supplier_text
+    source_text=collect_complete_supplier_text(file_parts,source_text)
     source_days,_=_source_days(source_text)
     if not source_days:
         matches=list(re.finditer(r'(?im)^\s*(\d{1,2})[.)]\s+([^\n]+)',source_text))
         source_days=[{'day':m.group(1),'title':m.group(2).strip(),'description':m.group(2).strip()} for m in matches]
-    local=_local_tour_result(source_text,source_days)
     remote=complete_json(
         SYSTEM_PROMPT,
         "Extract and professionally structure this supplier Tour. Preserve every explicit supplier fact and "
@@ -693,8 +716,7 @@ def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
         SCHEMA,purpose='tour supplier extraction',max_tokens=9000,
         image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
     )
+    local=_local_tour_result(source_text,source_days)
     if remote:
-        # Imported at runtime to keep the local extraction module independently usable.
-        from smart_assistant import merge_ai_package
-        return merge_ai_package(local,remote)
+        return _merge_local_fallback_into_ai_package(remote,local)
     return local

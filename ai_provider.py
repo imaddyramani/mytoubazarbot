@@ -1,8 +1,8 @@
-"""Small, fail-safe OpenAI-compatible client for xKiro and GROQ.
+"""Fail-safe OpenAI-compatible document client for xKiro and optional GROQ.
 
-The document workflows are deliberately local-first.  This module is only a
-remote enhancement/recovery layer: callers must keep their local result when
-``complete_json`` returns ``None``.
+Supplier workflows may use Qwen as their primary structuring engine.  Callers
+must still retain a deterministic fallback when ``complete_json`` returns
+``None`` so a provider outage never freezes printing.
 """
 from __future__ import annotations
 
@@ -72,9 +72,9 @@ def _timeout():
 
 def _max_input_chars():
     try:
-        return max(4000, min(int(os.getenv("AI_MAX_INPUT_CHARS", "60000")), 120000))
+        return max(4000, min(int(os.getenv("AI_MAX_INPUT_CHARS", "1000000")), 1000000))
     except ValueError:
-        return 60000
+        return 1000000
 
 
 def _provider_order():
@@ -136,47 +136,122 @@ def _provider_config(provider, vision=False):
     raise AIProviderError(f"Unsupported provider: {provider}")
 
 
-def _vision_parts(image_paths):
-    """Create bounded JPEG data URLs; render only a few PDF pages at low memory."""
+def _vision_batch_size():
     try:
-        limit=max(1,min(int(os.getenv("AI_MAX_VISION_PAGES","3")),6))
+        return max(1,min(int(os.getenv("AI_VISION_BATCH_PAGES","6")),8))
     except ValueError:
-        limit=3
-    parts=[]
+        return 6
+
+
+def _max_vision_pages():
+    try:
+        return max(1,min(int(os.getenv("AI_MAX_VISION_PAGES","24")),48))
+    except ValueError:
+        return 24
+
+
+def _vision_unit_count(image_paths):
+    total=0
     for raw_path in image_paths or []:
         path=Path(raw_path)
-        if not path.is_file() or len(parts)>=limit:
+        if not path.is_file():
             continue
-        images=[]
+        if path.suffix.lower()=='.pdf':
+            try:
+                import fitz
+                with fitz.open(str(path)) as document:
+                    total += len(document)
+            except Exception:
+                continue
+        else:
+            total += 1
+    return min(total,_max_vision_pages())
+
+
+def _vision_parts(image_paths, offset=0, limit=None):
+    """Create one low-memory visual batch from PDF pages and image files."""
+    limit=max(1,int(limit or _vision_batch_size()))
+    parts=[]
+    unit_index=0
+    for raw_path in image_paths or []:
+        path=Path(raw_path)
+        if not path.is_file() or len(parts)>=limit or unit_index>=_max_vision_pages():
+            continue
         try:
             if path.suffix.lower()=='.pdf':
                 import fitz
                 from PIL import Image
                 with fitz.open(str(path)) as document:
                     for page in document:
-                        if len(parts)+len(images)>=limit: break
-                        zoom=min(1.6,1600/max(page.rect.width,page.rect.height))
+                        if unit_index>=_max_vision_pages() or len(parts)>=limit: break
+                        current=unit_index; unit_index += 1
+                        if current<offset: continue
+                        zoom=min(1.4,1400/max(page.rect.width,page.rect.height))
                         pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),colorspace=fitz.csRGB,alpha=False)
                         image=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
                         del pix
-                        images.append(image)
+                        try:
+                            image.thumbnail((1400,1400))
+                            buffer=BytesIO()
+                            image.save(buffer,format='JPEG',quality=76,optimize=True)
+                            encoded=base64.b64encode(buffer.getvalue()).decode('ascii')
+                            parts.append({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+encoded}})
+                        finally:
+                            image.close()
             else:
                 from PIL import Image, ImageOps
-                with Image.open(path) as original:
-                    images.append(ImageOps.exif_transpose(original).convert('RGB').copy())
-            for image in images:
-                try:
-                    image.thumbnail((1600,1600))
-                    buffer=BytesIO()
-                    image.save(buffer,format='JPEG',quality=82,optimize=True)
-                    encoded=base64.b64encode(buffer.getvalue()).decode('ascii')
-                    parts.append({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+encoded}})
-                finally:
-                    image.close()
-                if len(parts)>=limit: break
+                current=unit_index; unit_index += 1
+                if current>=offset:
+                    with Image.open(path) as original:
+                        image=ImageOps.exif_transpose(original).convert('RGB').copy()
+                    try:
+                        image.thumbnail((1400,1400))
+                        buffer=BytesIO()
+                        image.save(buffer,format='JPEG',quality=76,optimize=True)
+                        encoded=base64.b64encode(buffer.getvalue()).decode('ascii')
+                        parts.append({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+encoded}})
+                    finally:
+                        image.close()
         except Exception as exc:
             LOGGER.warning("Could not prepare one supplier attachment for vision: %s", type(exc).__name__)
     return parts
+
+
+def _row_identity(row):
+    if not isinstance(row,dict): return ''
+    for keys in (
+        ('ticket_number',),('flight_number','dep_date','dep_time'),('day',),
+        ('hotel_name','dates'),('name','seat'),('name',),('label','amount'),
+        ('description','total'),('reservation_id',),
+    ):
+        values=[str(row.get(key) or '').strip().lower() for key in keys]
+        if values and all(values): return '|'.join(keys)+':'+('|'.join(values))
+    return ''
+
+
+def _merge_fragments(first, second):
+    """Combine page-batch JSON without adding or calculating supplier facts."""
+    if not isinstance(first,dict): return deepcopy(second or {})
+    result=deepcopy(first)
+    for key,value in (second or {}).items():
+        current=result.get(key)
+        if isinstance(value,dict):
+            result[key]=_merge_fragments(current if isinstance(current,dict) else {},value)
+        elif isinstance(value,list):
+            existing=list(current) if isinstance(current,list) else []
+            identities={_row_identity(row):i for i,row in enumerate(existing) if _row_identity(row)}
+            for row in value:
+                identity=_row_identity(row)
+                if identity and identity in identities and isinstance(row,dict):
+                    index=identities[identity]
+                    existing[index]=_merge_fragments(existing[index],row)
+                elif row not in existing:
+                    existing.append(deepcopy(row))
+                    if identity: identities[identity]=len(existing)-1
+            result[key]=existing
+        elif current in (None,'',0) and value not in (None,'',0):
+            result[key]=value
+    return result
 
 
 def _json_from_content(content):
@@ -229,12 +304,12 @@ def _validate(value, schema):
     return value
 
 
-def _request(provider, system_prompt, user_text, schema, max_tokens, vision=False, correction="", image_paths=None):
+def _request(provider, system_prompt, user_text, schema, max_tokens, vision=False, correction="", image_paths=None, vision_offset=0, vision_limit=None):
     base_url, key, model = _provider_config(provider, vision)
     schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
     user_content=str(user_text or "")[:_max_input_chars()]
     if vision:
-        visual=_vision_parts(image_paths)
+        visual=_vision_parts(image_paths,offset=vision_offset,limit=vision_limit)
         if visual:
             user_content=visual+[{"type":"text","text":user_content}]
     messages = [
@@ -272,21 +347,37 @@ def complete_json(system_prompt, user_text, schema, *, purpose="extraction", max
         return None
     errors = []
     vision=bool(image_paths)
+    visual_count=_vision_unit_count(image_paths) if vision else 0
+    batch_size=_vision_batch_size()
+    offsets=list(range(0,visual_count,batch_size)) or [0]
     for provider in _provider_order():
-        correction = ""
-        for attempt in range(2):
-            try:
-                value, model = _request(
-                    provider, system_prompt, user_text, deepcopy(schema), max_tokens,
-                    vision=vision, correction=correction, image_paths=image_paths,
-                )
-                LOGGER.info("AI %s completed via %s/%s", purpose, provider, model)
-                return value
-            except (AIProviderError, httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-                correction = str(exc)[:300]
-                errors.append(f"{provider}: {correction}")
-                LOGGER.warning("AI %s attempt %s failed via %s: %s", purpose, attempt + 1, provider, correction)
-                if attempt == 0 and "validation" not in correction and "JSON" not in correction and "required" not in correction:
+        combined=None; failed=False; model=''
+        for batch_index,offset in enumerate(offsets):
+            correction = ""; value=None
+            batch_text=str(user_text or '') if batch_index==0 else (
+                f"Continue the same {purpose}. These are additional supplier pages "
+                f"{offset+1}-{min(offset+batch_size,visual_count)}. Extract only facts visible on these pages; "
+                "return blank/zero values for facts not present on this batch."
+            )
+            for attempt in range(2):
+                try:
+                    value, model = _request(
+                        provider, system_prompt, batch_text, deepcopy(schema), max_tokens,
+                        vision=vision, correction=correction, image_paths=image_paths,
+                        vision_offset=offset,vision_limit=batch_size,
+                    )
                     break
+                except (AIProviderError, httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                    correction = str(exc)[:300]
+                    errors.append(f"{provider}: {correction}")
+                    LOGGER.warning("AI %s batch %s attempt %s failed via %s: %s",purpose,batch_index+1,attempt+1,provider,correction)
+                    if attempt == 0 and "validation" not in correction and "JSON" not in correction and "required" not in correction:
+                        break
+            if value is None:
+                failed=True; break
+            combined=_merge_fragments(combined,value)
+        if not failed and combined is not None:
+            LOGGER.info("AI %s completed via %s/%s in %s batch(es)",purpose,provider,model,len(offsets))
+            return _validate(combined,deepcopy(schema))
     LOGGER.warning("AI %s unavailable; local result retained (%s)", purpose, "; ".join(errors[-4:]))
     return None

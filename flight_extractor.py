@@ -4,7 +4,7 @@ from functools import wraps
 import copy
 from pathlib import Path
 from ai_provider import complete_json
-from performance_utils import collect_local_document_text
+from performance_utils import collect_local_document_text, collect_complete_supplier_text
 
 _layout_cache = ContextVar('air_layout_cache', default=None)
 
@@ -2201,6 +2201,39 @@ def _merge_ai_into_local(local,ai):
     return local
 
 
+def _merge_local_fallback_into_ai(ai, local):
+    """Use Qwen rows/scalars as primary and backfill only its blank values."""
+    data=dict(ai or {}); local=local or _local_blank_air_data()
+    scalar_keys=('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary','special_ancillary_summary')
+    for key in scalar_keys:
+        if not str(data.get(key) or '').strip() and str(local.get(key) or '').strip(): data[key]=local[key]
+    for array_key,fields in (
+        ('passengers',('name','title','ticket_number','type','dob','baggage','special_ancillary')),
+        ('segments',('flight','flight_number','aircraft','cabin','fare_type','dep_time','dep_city','dep_code','dep_date','dep_airport','dep_terminal','arr_time','arr_city','arr_code','arr_date','arr_airport','arr_terminal','duration','stops','layover')),
+    ):
+        rows=list(data.get(array_key) or []); fallback=list(local.get(array_key) or [])
+        if not rows:
+            data[array_key]=fallback; continue
+        for index,row in enumerate(rows):
+            if not isinstance(row,dict): continue
+            source=fallback[index] if index<len(fallback) else {}
+            if array_key=='segments' and row.get('flight_number'):
+                matched=next((item for item in fallback if str(item.get('flight_number') or '').replace(' ','').upper()==str(row.get('flight_number') or '').replace(' ','').upper()),None)
+                source=matched or source
+            for key in fields:
+                if not str(row.get(key) or '').strip() and str((source or {}).get(key) or '').strip(): row[key]=source[key]
+        data[array_key]=rows
+    if not data.get('payment_items') and local.get('payment_items'): data['payment_items']=local['payment_items']
+    for key in ('base_fare','taxes','gross_total'):
+        try: current=float(data.get(key) or 0)
+        except Exception: current=0
+        try: fallback=float(local.get(key) or 0)
+        except Exception: fallback=0
+        if current<=0 and fallback>0: data[key]=fallback
+    data['_ai_primary_used']=True
+    return data
+
+
 AIR_LIGHT_PROMPT="""Extract only booking facts needed for an airline itinerary. SOURCE PRESENT = COPY, SOURCE ABSENT = BLANK. Do not infer airports, terminals, dates, baggage or fares.
 
 PASSENGERS ARE A STRICT TRANSCRIPTION TASK:
@@ -2219,21 +2252,16 @@ Return every flight sector separately; never merge connections. Preserve PNR/tic
 
 @_layout_session
 def extract_flight_ticket(file_parts, source_text, api_key, model):
-    """Local-first Air Print with one repair request for missing core fields."""
-    raw_source_text=_plain_source_text(file_parts,source_text)
+    """Qwen-first Air Print with deterministic validation and local outage fallback."""
+    raw_source_text=collect_complete_supplier_text(file_parts,source_text)
     original_paths=[Path(item.get('path') or '') for item in (file_parts or []) if item.get('path')]
-    data=_local_first_air_extract(raw_source_text,original_paths)
-    used_ai=False
-    # Ask a remote model only when the bounded local pass is incomplete. Any
-    # provider/quota/timeout failure returns None and printing continues locally.
-    if _local_air_needs_ai(data):
-        remote=complete_json(
-            AIR_LIGHT_PROMPT,raw_source_text,SCHEMA,
-            purpose='air extraction recovery',max_tokens=6500,image_paths=original_paths,
-        )
-        if remote:
-            data=_merge_ai_into_local(data,remote)
-            used_ai=True
+    remote=complete_json(
+        AIR_LIGHT_PROMPT,raw_source_text,SCHEMA,
+        purpose='air primary extraction',max_tokens=7500,image_paths=original_paths,
+    )
+    local=_local_first_air_extract(raw_source_text,original_paths)
+    data=_merge_local_fallback_into_ai(remote,local) if remote else local
+    used_ai=bool(remote)
     data=_recover_source_only_fields(data,raw_source_text)
     data=_normalize_flight_segments(data)
     data=_sanitize_ticket_numbers(data)
@@ -2270,6 +2298,6 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         try: gross=float(data.get('base_fare') or 0)+float(data.get('taxes') or 0)
         except Exception: gross=0
     data['gross_total']=gross
-    data['_local_first']=True
-    data['_ai_fallback_used']=used_ai
+    data['_local_fallback_available']=True
+    data['_ai_primary_used']=used_ai
     return data

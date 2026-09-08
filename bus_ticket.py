@@ -6,7 +6,7 @@ from pdf_render import write_pdf
 
 from ai_provider import complete_json
 from print_settings import apply_css_settings
-from performance_utils import extract_pdf_text, collect_local_document_text
+from performance_utils import extract_pdf_text, collect_local_document_text, collect_complete_supplier_text
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 SCHEMA={"type":"object","properties":{
@@ -151,23 +151,21 @@ def _extract_bus_local(text):
     return data
 
 def extract_bus_ticket(file_parts, source_text, api_key, model):
-    text=collect_local_document_text(file_parts,source_text,max_chars=40000)
-    data=_extract_bus_local(text)
-    needs_ai=not data.get('passengers') or not all(str(data.get(key) or '').strip() for key in ('operator','dep_city','arr_city','dep_time'))
-    if needs_ai:
-        remote=complete_json(
-            PROMPT,text,SCHEMA,purpose='bus extraction recovery',max_tokens=4000,
-            image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
-        )
-        if remote:
-            for key,value in remote.items():
-                if key=='passengers':
-                    if not data.get(key) and value: data[key]=value
-                elif key in ('base_fare','taxes'):
-                    if not float(data.get(key) or 0) and float(value or 0): data[key]=value
-                elif not str(data.get(key) or '').strip() and str(value or '').strip():
-                    data[key]=value
-            data['_ai_fallback_used']=True
+    text=collect_complete_supplier_text(file_parts,source_text)
+    remote=complete_json(
+        PROMPT,text,SCHEMA,purpose='bus primary extraction',max_tokens=5000,
+        image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
+    )
+    local=_extract_bus_local(text)
+    data=dict(remote or local)
+    if remote:
+        for key,value in local.items():
+            if key=='passengers':
+                if not data.get(key) and value: data[key]=value
+            elif key in ('base_fare','taxes'):
+                if not float(data.get(key) or 0) and float(value or 0): data[key]=value
+            elif not str(data.get(key) or '').strip() and str(value or '').strip(): data[key]=value
+        data['_ai_primary_used']=True
     return data
 
 def distribute_fare(updated_total, original_base, original_tax):

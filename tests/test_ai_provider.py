@@ -45,6 +45,21 @@ class AIProviderTests(unittest.TestCase):
         }
         self.assertEqual(ai_provider._validate({"name": 123, "count": "2"}, schema), {"name": "123", "count": 2})
 
+    @patch.dict(os.environ, {
+        "AI_PROVIDER":"xkiro","XKIRO_API_KEY":"test-key",
+        "AI_VISION_BATCH_PAGES":"6","AI_MAX_VISION_PAGES":"24",
+    }, clear=False)
+    def test_visual_document_is_processed_in_page_batches(self):
+        schema={"type":"object","properties":{"rows":{"type":"array"}},"required":["rows"]}
+        calls=[]
+        def fake_request(provider,*args,**kwargs):
+            calls.append(kwargs.get('vision_offset'))
+            return ({"rows":[{"name":f"P{kwargs.get('vision_offset')}"}]},"qwen-test")
+        with patch("ai_provider._vision_unit_count",return_value=13), patch("ai_provider._request",side_effect=fake_request):
+            result=ai_provider.complete_json("system","complete text",schema,image_paths=["supplier.pdf"])
+        self.assertEqual(calls,[0,6,12])
+        self.assertEqual([row['name'] for row in result['rows']],["P0","P6","P12"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,6 +67,33 @@ Taxes: INR 1800""",None,None)
         self.assertEqual(hotel["reservation_id"],"HTL123")
         self.assertEqual(hotel["hotel_name"],"Test Residency")
 
+    @patch.dict(os.environ,{"AI_PROVIDER":"xkiro","XKIRO_API_KEY":"test-key"},clear=False)
+    def test_complete_local_bus_still_calls_qwen_primary(self):
+        supplier="""Booking ID: BUS123
+Bus PNR: BP123
+Status: Confirmed
+Operator: Test Travels
+Journey Date: 10 Oct 2026
+From: Delhi
+To: Jaipur
+Departure Time: 10:00 PM
+Arrival Time: 04:00 AM
+Boarding Point: ISBT
+Dropping Point: Sindhi Camp
+1. Mr Amit Sharma Adult Seat 12A"""
+        remote={
+            'booking_id':'BUS123','booking_date':'','pnr':'BP123','status':'Confirmed','mobile':'',
+            'operator':'Test Travels','bus_number':'','bus_type':'','dep_time':'10:00 PM','dep_city':'Delhi',
+            'dep_date':'10 Oct 2026','boarding_point':'ISBT','arr_time':'04:00 AM','arr_city':'Jaipur',
+            'arr_date':'','drop_point':'Sindhi Camp','duration':'','passengers':[
+                {'name':'Amit Sharma','title':'Mr.','seat':'12A','type':'Adult','dob':'','boarding':'ISBT'}],
+            'base_fare':0,'taxes':0,
+        }
+        with patch('bus_ticket.complete_json',return_value=remote) as model:
+            result=extract_bus_ticket([],supplier,None,None)
+        model.assert_called_once()
+        self.assertTrue(result['_ai_primary_used'])
+
 
 if __name__ == "__main__":
     unittest.main()

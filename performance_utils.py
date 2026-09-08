@@ -202,6 +202,50 @@ def _collect_local_document_text(file_parts,source_text='',max_chars=60000):
         raise LocalExtractionError('No supplier text found. Upload the supplier file or paste its booking details.')
     return result
 
+
+def collect_complete_supplier_text(file_parts, source_text='', max_chars=1000000):
+    """Read every selectable supplier page without OCR or booking-field parsing.
+
+    This is the lightweight preparation path for the remote document model.  It
+    deliberately does not stop after a locally detected booking and does not run
+    RapidOCR/Tesseract.  Scanned pages are represented by page markers and are
+    supplied separately to the vision model by ``ai_provider``.
+    """
+    limit=max(4000,min(int(max_chars or MAX_SUPPLIER_CHARS),MAX_SUPPLIER_CHARS))
+    chunks=[]
+    if str(source_text or '').strip():
+        chunks.append(str(source_text).strip())
+    for item in file_parts or []:
+        path=Path(item.get('path') or '')
+        if not path.is_file():
+            raise LocalExtractionError('A supplier attachment is missing. Please upload it again.')
+        suffix=path.suffix.lower()
+        if suffix=='.pdf':
+            try:
+                import fitz
+                with fitz.open(str(path)) as document:
+                    if document.needs_pass:
+                        raise LocalExtractionError('Supplier PDF is password protected. Send an unlocked copy.')
+                    for index,page in enumerate(document):
+                        value=page.get_text('text',sort=True) or ''
+                        chunks.append(f'--- FILE {path.name} / PAGE {index+1} ---\n{value}'.rstrip())
+            except LocalExtractionError:
+                raise
+            except Exception as exc:
+                raise LocalExtractionError('Could not read supplier PDF. Check that it is valid and unlocked.') from exc
+        else:
+            # The vision request receives the original image.  Avoid local OCR.
+            chunks.append(f'--- IMAGE ATTACHMENT: {path.name} ---')
+        if len('\n\n'.join(chunks))>limit:
+            raise LocalExtractionError(
+                'Combined supplier text exceeds the document-model safety limit. '
+                'Split unrelated bookings into separate uploads.'
+            )
+    result='\n\n'.join(chunks).strip()
+    if not result and not (file_parts or []):
+        raise LocalExtractionError('No supplier material found. Upload the supplier file or paste its booking details.')
+    return result
+
 try:
     from pypdf import PdfReader
 except Exception:

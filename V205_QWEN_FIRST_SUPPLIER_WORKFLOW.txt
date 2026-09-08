@@ -1,11 +1,12 @@
-MyTourBazar V204 — xKiro Qwen Across All Workflows
+MyTourBazar V205 — Qwen-First Complete Supplier Workflow
 
-- Free Qwen is the preferred xKiro model for text and PDF/image recovery.
-- Tour, Air, Bus and Hotel keep their fast local extraction and printing paths.
-- xKiro repairs incomplete extraction without replacing valid supplier data.
+- Free Qwen through xKiro is the primary supplier-document extraction and structuring model.
+- Complete selectable supplier text is retained; PDF/image pages are sent in low-memory visual batches.
+- Tour, Air, Bus and Hotel use local rules only for source validation, calculations and outage fallback.
 - The private assistant can classify requests, plan workflows and answer bot questions.
 - Smart edits use schema-limited patch operations and preserve unrelated booking fields.
 - Northflank startup logs show the active provider and model without exposing keys.
+- Telegram progress remains responsive while Qwen processes multiple page batches.
 - AI timeouts, invalid JSON and provider outages fall back safely to local behavior.
 - No API keys or Telegram tokens are stored in GitHub.
 

@@ -3420,7 +3420,7 @@ async def process_hotel_voucher(update: Update, context: ContextTypes.DEFAULT_TY
         for f in files:
             mime="application/pdf" if f.lower().endswith(".pdf") else "image/jpeg"
             parts.append({"path":f,"mime_type":mime})
-        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_hotel_voucher, parts, source_text, AI_API_KEY, AI_MODEL), ['🏨 Reading hotel confirmation locally...','🔍 Extracting guest, reservation, rooms and stay details locally...'], 25, 92)
+        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_hotel_voucher, parts, source_text, AI_API_KEY, AI_MODEL), ['🏨 Reading the complete hotel confirmation...','🧠 Qwen is structuring guest, reservation, rooms and stay details...'], 25, 92)
         # The extraction is complete and structured data is now self-contained. Clear the
         # source list before fare/costing actions so a delayed callback can never try to
         # reopen a deleted incoming voucher file.
@@ -4577,21 +4577,21 @@ async def continue_tour_preprint_options(message, context, data):
     return True
 
 async def _run_with_progress(status, chat_message, work, labels, start_pct=30, end_pct=58):
-    """Run bounded local supplier work while keeping Telegram responsive."""
+    """Run bounded supplier/Qwen work while keeping Telegram responsive."""
     task = asyncio.create_task(work())
     started_at = time.monotonic()
-    max_seconds = max(45, int(os.getenv('EXTRACTION_TIMEOUT_SECONDS', '120')))
+    max_seconds = max(60, int(os.getenv('EXTRACTION_TIMEOUT_SECONDS', '300')))
     tick = 0
     try:
         while not task.done():
             if time.monotonic() - started_at >= max_seconds:
                 task.cancel()
-                raise RuntimeError(f"Local extraction stopped after {max_seconds} seconds. Send fewer pages together or a clearer scan.")
+                raise RuntimeError(f"Document extraction stopped after {max_seconds} seconds. Please retry the supplier file.")
             pct = min(end_pct - 1, start_pct + tick * 3)
             filled = min(16, round(pct / 100 * 16))
             bar = '█' * filled + '░' * (16 - filled)
             label = labels[tick % len(labels)]
-            await safe_status_edit(status, chat_message, f"⚙️ *Processing your supplier material locally...*\n\n{bar} {pct}%\n\n{label}", parse_mode='Markdown')
+            await safe_status_edit(status, chat_message, f"⚙️ *Processing your supplier material with Qwen...*\n\n{bar} {pct}%\n\n{label}", parse_mode='Markdown')
             tick += 1
             await asyncio.sleep(1.5)
         return await task

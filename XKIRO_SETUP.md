@@ -13,8 +13,10 @@ The bot remains local-first. xKiro improves Tour writing and repairs incomplete 
 AI_PROVIDER=xkiro
 AI_FALLBACK_PROVIDER=none
 AI_TIMEOUT_SECONDS=80
-AI_MAX_INPUT_CHARS=60000
-AI_MAX_VISION_PAGES=3
+EXTRACTION_TIMEOUT_SECONDS=300
+AI_MAX_INPUT_CHARS=1000000
+AI_MAX_VISION_PAGES=24
+AI_VISION_BATCH_PAGES=6
 XKIRO_API_KEY=YOUR_XKIRO_KEY
 XKIRO_TEXT_MODEL=qwen/qwen3.5-plus:free
 XKIRO_VISION_MODEL=qwen/qwen3.5-plus:free
@@ -47,8 +49,9 @@ AI_PROVIDER=local
 ## Safety and performance
 
 - Supplier PDF/image text is extracted locally first.
-- AI recovery renders at most `AI_MAX_VISION_PAGES` pages; raw PDFs are not sent as unsupported PDF input.
-- Remote input is capped by `AI_MAX_INPUT_CHARS`.
+- Complete selectable supplier text is sent to Qwen first. PDF/image pages are rendered in low-memory batches of `AI_VISION_BATCH_PAGES`; `AI_MAX_VISION_PAGES` is the deployment safety ceiling for scanned pages.
+- Remote text input is capped by `AI_MAX_INPUT_CHARS` (up to 1,000,000 characters). Split unrelated bookings rather than combining them into one request.
+- Air, Bus, Hotel and Tour use Qwen as the primary structuring engine. Local rules remain only for validation, calculations, rendering and provider-outage fallback.
 - Requests are capped below xKiro's blocking-request limit.
 - JSON is validated and malformed output is retried once.
 - xKiro quota, permission, timeout, or provider errors fall back safely.
