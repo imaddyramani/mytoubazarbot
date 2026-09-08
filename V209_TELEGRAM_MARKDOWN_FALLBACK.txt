@@ -1,0 +1,7 @@
+MyTourBazar Bot V209
+
+- Tour extraction and itinerary generation are unchanged.
+- If supplier-derived draft text breaks Telegram Markdown entity parsing, the
+  bot automatically resends the same complete draft as plain text.
+- Tour draft action buttons are then sent normally, so the workflow continues
+  instead of reporting itinerary preparation failed.

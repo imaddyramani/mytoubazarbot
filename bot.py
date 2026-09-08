@@ -6259,6 +6259,19 @@ async def reply_text_chunked(message, text, **kwargs):
     return sent
 
 
+async def _reply_markdown_with_plain_fallback(message,text,**kwargs):
+    """Retry supplier-derived Telegram text without formatting on entity errors."""
+    try:
+        return await message.reply_text(text,**kwargs)
+    except BadRequest as exc:
+        if "can't parse entities" not in str(exc).lower():
+            raise
+        plain_kwargs=dict(kwargs)
+        plain_kwargs.pop('parse_mode',None)
+        logger.warning('Telegram rejected supplier Markdown; resending the complete draft as plain text')
+        return await message.reply_text(text,**plain_kwargs)
+
+
 def build_confirmation(d):
     def val(key, fallback="Not found"):
         v = d.get(key, "")
@@ -6425,7 +6438,8 @@ async def _send_draft_review(message, context, data, prefix=None):
         if current.strip(): chunks.append(current.rstrip())
     sent=[]
     for i, chunk in enumerate(chunks):
-        sent.append(await message.reply_text(chunk, parse_mode='Markdown' if len(chunks)==1 else None))
+        kwargs={'parse_mode':'Markdown'} if len(chunks)==1 else {}
+        sent.append(await _reply_markdown_with_plain_fallback(message,chunk,**kwargs))
     # Put the live draft actions on a fresh dynamic message. This prevents stale
     # inline buttons from earlier workflow stages from remaining attached to the draft.
     sent.append(await message.reply_text('🧭 *Tour draft actions*\n\n• Modify & Regenerate the draft\n• Basic / Detailed WhatsApp\n• Basic / Detailed PDF → Quotation / Voucher', parse_mode='Markdown', reply_markup=draft_review_keyboard()))
