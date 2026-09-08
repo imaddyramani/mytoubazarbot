@@ -21,19 +21,18 @@ AI_VISION_BATCH_PAGES=6
 XKIRO_API_KEY=YOUR_XKIRO_KEY
 XKIRO_TEXT_MODEL=qwen/qwen3.5-plus:free
 XKIRO_VISION_MODEL=qwen/qwen3.5-plus:free
-LOCAL_WHISPER_MODEL=tiny
-WHISPER_CACHE_DIR=/app/.cache/whisper
-WHISPER_CPU_THREADS=2
+GROQ_API_KEY=YOUR_GROQ_KEY
+GROQ_STT_MODEL=whisper-large-v3-turbo
+VOICE_TIMEOUT_SECONDS=45
 ```
 
 Keep your existing `BOT_TOKEN` and `ADMIN_USER_IDS` variables unchanged.
 
 The two Qwen values lock both text and image/PDF recovery to xKiro's free Qwen model. If xKiro renames or removes that model, remove both model variables temporarily; the bot will then read xKiro's live catalogue and select a suitable free model.
 
-Optional GROQ fallback:
+Optional GROQ document fallback (voice does not require this fallback):
 
 ```env
-GROQ_API_KEY=YOUR_GROQ_KEY
 GROQ_MODEL=YOUR_CURRENT_GROQ_TEXT_MODEL_ID
 GROQ_VISION_MODEL=YOUR_CURRENT_GROQ_VISION_MODEL_ID
 ```
@@ -57,7 +56,7 @@ AI_PROVIDER=local
 - Remote text input is capped by `AI_MAX_INPUT_CHARS` (up to 1,000,000 characters). Split unrelated bookings rather than combining them into one request.
 - Air, Bus, Hotel and Tour use Qwen as the primary structuring engine. Local rules remain only for validation, calculations, rendering and provider-outage fallback.
 - Text-rich PDF pages are not resent as duplicate images. The first page and scanned pages retain visual processing, reducing Qwen calls without changing the workflow.
-- The multilingual Whisper model is downloaded during the Docker build. Voice notes therefore do not perform a large runtime model download.
+- Voice notes alone use Groq's multilingual Whisper endpoint. Supplier extraction, edits, itinerary planning and assistant responses remain on xKiro because `AI_PROVIDER=xkiro` and `AI_FALLBACK_PROVIDER=none`.
 - Requests are capped below xKiro's blocking-request limit.
 - JSON is validated and malformed output is retried once.
 - xKiro quota, permission, timeout, or provider errors fall back safely.

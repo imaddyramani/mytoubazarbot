@@ -1,0 +1,8 @@
+MyTourBazar Bot V207
+
+- Hotel reply costing now supports short input such as "room 4000 eb 1500".
+- Room, night and EB quantities are taken from the saved booking details.
+- "Extra Persons" on a supplier voucher is recognized as the chargeable EB count.
+- Tour guest-name edits update both the top guest field and greeting salutation.
+- Voice transcription uses Groq Whisper only; all other AI remains on xKiro.
+- Removed the local Whisper model dependency and Docker download.

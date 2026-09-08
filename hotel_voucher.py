@@ -279,7 +279,7 @@ def _extract_hotel_local(text):
         match=re.search(r'(?i)\b(\d+)\s*Rooms?\b',' '.join((room_type,occupancy)))
         room_count=int(match.group(1)) if match else 0
     if extra_count<=0:
-        match=re.search(r'(?i)\b(\d+)\s*(?:Extra\s*(?:Beds?|Mattresses?)|EB)\b',' '.join((room_type,occupancy,raw)))
+        match=re.search(r'(?i)\b(?:Includes?\s*)?(\d+)\s*(?:Extra\s*(?:Beds?|Mattresses?|Persons?|Pax)|EB)\b',' '.join((room_type,occupancy,raw)))
         extra_count=int(match.group(1)) if match else 0
     hotel_name=_infer_hotel_name(raw,_hotel_local_value(raw,[r'Hotel\s*Name',r'Hotel(?=\s*(?::|$))',r'Property\s*Name',r'Property(?=\s*(?::|$))']))
     hotel_address=_infer_hotel_address(raw,hotel_name,_hotel_multiline_value(raw,[r'Hotel\s*Address',r'Property\s*Address',r'Address']))

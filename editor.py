@@ -251,6 +251,7 @@ otherwise return "false" and fare 0. If the request is unclear, return no operat
 
 def apply_edit(doc_type, current_data, instruction, api_key=None, model=None, current_fare=None):
     data=copy.deepcopy(current_data or {}); raw=str(instruction or '').strip()
+    old_client_name=str(data.get('client_name') or '').strip() if doc_type=='package' else ''
     if not raw: raise ValueError('Write the field or Day number you want to change.')
     if doc_type=='package':
         changed=_edit_package(data,raw); fare=current_fare
@@ -260,4 +261,17 @@ def apply_edit(doc_type, current_data, instruction, api_key=None, model=None, cu
         changed,fare=_edit_with_ai(doc_type,data,raw,current_fare)
     if not changed:
         raise ValueError('I could not identify a supported field. Example: “change Day 1 to …”, “set hotel name to …” or “change fare to 15000”.')
+    # A package guest-name edit must update both the top guest field and the
+    # salutation. Preserve the existing greeting text and replace only its name.
+    if doc_type=='package':
+        new_client_name=str(data.get('client_name') or '').strip()
+        if new_client_name and new_client_name != old_client_name:
+            greeting=str(data.get('greeting') or '')
+            if old_client_name and old_client_name in greeting:
+                greeting=greeting.replace(old_client_name,new_client_name)
+            elif re.search(r'(?i)^\s*Dear\s+[^,\n]+,',greeting):
+                greeting=re.sub(r'(?i)^(\s*Dear\s+)[^,\n]+,',rf'\g<1>{new_client_name},',greeting,count=1)
+            elif greeting:
+                greeting=f'Dear {new_client_name},\n\n{greeting}'
+            data['greeting']=greeting
     return data,fare

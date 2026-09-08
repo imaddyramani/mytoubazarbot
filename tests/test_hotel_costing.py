@@ -26,6 +26,22 @@ class HotelCostingTests(unittest.TestCase):
         self.assertEqual(cost['extra_beds'],1)
         self.assertEqual(cost['total'],14100)
 
+    def test_short_room_and_eb_rates_use_booking_quantities(self):
+        self.hotel['extra_bed_count']=2
+        cost=_parse_hotel_cost_input('room 4000 eb 1500',0,self.hotel)
+        self.assertEqual(cost['rooms'],2)
+        self.assertEqual(cost['nights'],3)
+        self.assertEqual(cost['extra_beds'],2)
+        self.assertEqual(cost['room_total'],24000)
+        self.assertEqual(cost['eb_total'],9000)
+        self.assertEqual(cost['total'],33000)
+
+    def test_extra_person_wording_is_chargeable_eb_count(self):
+        self.hotel['occupancy_summary']='2 Rooms / 6 Pax (Includes 02 Extra Persons)'
+        cost=_parse_hotel_cost_input('room 4000 eb 1500',0,self.hotel)
+        self.assertEqual(cost['extra_beds'],2)
+        self.assertEqual(cost['total'],33000)
+
 
 if __name__=='__main__':
     unittest.main()

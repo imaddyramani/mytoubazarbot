@@ -971,7 +971,10 @@ def _hotel_extra_bed_count(data, explicit=None):
         if n>=0 and n>0: return n
     except Exception: pass
     raw=' '.join(str((data or {}).get(k) or '') for k in ('room_type','occupancy_summary'))
-    m=re.search(r'(?i)\b(\d+)\s*(?:extra\s*(?:bed|mattress)|eb)\b',raw)
+    # Supplier vouchers often call occupants above the normal room capacity
+    # "extra persons" instead of explicitly writing "extra beds".  For hotel
+    # customer costing those are the chargeable EB units.
+    m=re.search(r'(?i)\b(?:includes?\s*)?(\d+)\s*(?:extra\s*(?:beds?|mattresses?|persons?|pax)|eb)\b',raw)
     return int(m.group(1)) if m else 0
 
 
@@ -990,7 +993,13 @@ def _parse_hotel_cost_input(value, supplier_total=0, data=None):
 
     explicit_nights=amount([r'\b(\d+)\s*nights?\b'])
     explicit_rooms=amount([r'\b(\d+)\s*rooms?\b'])
-    explicit_eb_count=amount([r'\b(\d+)\s*(?:eb|extra\s*(?:bed|beds|mattress|mattresses))\b'])
+    # Keep EB quantity separate from its rate. In "room 4000 eb 1500",
+    # 4000 is the room rate—not 4000 extra beds.
+    explicit_eb_count=amount([
+        r'\b(?:eb|extra\s*(?:bed|beds|mattress|mattresses))\s*(?:count|qty|quantity)\b[^0-9]{0,8}(\d+)',
+        r'\b(\d+)\s*extra\s*(?:beds|mattresses)\b',
+        r'\b(\d+)\s*ebs?\s*(?:@|x)\b',
+    ])
 
     nights=_hotel_night_count(data,explicit_nights)
     rooms=_hotel_room_count(data,explicit_rooms)
