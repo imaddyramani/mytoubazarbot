@@ -11,16 +11,27 @@ def transcribe_voice_note(path, api_key=None, model=None, mime_type='audio/ogg')
     if not key:
         raise RuntimeError('GROQ_API_KEY is required for voice notes.')
     stt_model=os.getenv('GROQ_STT_MODEL','whisper-large-v3-turbo').strip() or 'whisper-large-v3-turbo'
+    # Groq accepts ISO-639-1 language hints.  English is the right default for
+    # the owner's Indian-English travel instructions; set VOICE_LANGUAGE=auto
+    # in Northflank only when a particular deployment is primarily Hindi.
+    language=os.getenv('VOICE_LANGUAGE','en').strip().lower()
+    if language in ('', 'auto', 'detect', 'none'):
+        language=''
     timeout=max(15.0,min(float(os.getenv('VOICE_TIMEOUT_SECONDS','45')),90.0))
     prompt=(
-        'Travel agency instruction. Preserve Indian guest and hotel names, dates, '
-        'PNR, room, EB, fare, baggage, itinerary, Hindi and Hinglish wording.'
+        'Indian English travel-agency instruction. Preserve Indian guest, city, hotel '
+        'and airline names exactly. Keep dates, PNR, room, CWB, CNB, EB, fare, '
+        'baggage and itinerary terms. Understand common Indian English and Hinglish; '
+        'write English words in English and transliterate Hindi only when spoken.'
     )
+    data={'model':stt_model,'response_format':'json','temperature':'0','prompt':prompt}
+    if language:
+        data['language']=language
     with source.open('rb') as audio, httpx.Client(timeout=timeout) as client:
         response=client.post(
             'https://api.groq.com/openai/v1/audio/transcriptions',
             headers={'Authorization':f'Bearer {key}'},
-            data={'model':stt_model,'response_format':'json','temperature':'0','prompt':prompt},
+            data=data,
             files={'file':(source.name,audio,mime_type or 'audio/ogg')},
         )
     if response.status_code>=400:

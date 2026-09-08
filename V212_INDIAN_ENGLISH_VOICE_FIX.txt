@@ -1,0 +1,7 @@
+MYTOURBAZAR V212 - INDIAN ENGLISH VOICE NOTES
+
+- Groq voice transcription now defaults to English (`VOICE_LANGUAGE=en`).
+- Adds a focused Indian travel-agency prompt for names, PNR, hotel, fare,
+  CWB/CNB/EB, baggage and itinerary wording.
+- Set `VOICE_LANGUAGE=auto` in Northflank only for primarily Hindi voice notes.
+- No change to Tour, Air, Bus, Hotel or xKiro extraction workflow.
