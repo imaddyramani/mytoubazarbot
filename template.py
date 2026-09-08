@@ -487,8 +487,9 @@ def generate_pdf(data, output_path, logo_path=None, page_size="A4", text_scale_o
         # Convert a model-generated first-line greeting into a clean paragraph while preserving text.
         greeting_html = esc(greeting).replace("\n", "<br>")
     else:
+        greeting_name=esc(data.get('client_name') or 'Guest')
         greeting_html = (
-            f"<b>Dear {esc(data.get('client_name'))},</b><br>"
+            f"<b>Dear {greeting_name},</b><br>"
             f"Greetings from <b>MyTourBazar</b>! We are pleased to present your customized travel proposal."
         )
 

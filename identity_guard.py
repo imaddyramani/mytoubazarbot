@@ -5,7 +5,7 @@ import copy
 import re
 
 _TITLE=re.compile(r'(?i)^(?:mr|mrs|ms|miss|master|mstr|dr|prof|child|infant)\.?\s+')
-_BLOCKED=re.compile(r'(?i)\b(?:passenger|travell?er|ticket|pnr|booking|flight|baggage|fare|tax|total|seat|hotel|support)\b')
+_BLOCKED=re.compile(r'(?i)\b(?:passenger|travell?er|ticket|pnr|booking|flight|baggage|fare|tax|total|seat|hotel|support|selectable|pdf|file|page)\b')
 
 
 def clean_person_name(value):

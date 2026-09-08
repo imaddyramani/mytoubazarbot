@@ -294,9 +294,14 @@ def prepare_supplier_for_ai(file_paths, source_text="", max_chars=120000, preser
             t=extract_pdf_text(p,max_chars=max_chars)
             if len(re.sub(r"\s+"," ",t).strip()) >= 450:
                 local_pdf_count += 1
-                text += f"\n\nLOCAL SELECTABLE PDF TEXT ({p.name}):\n{t}"
                 if preserve_pdf_layout:
+                    # ``collect_complete_supplier_text`` reads this attachment once
+                    # with PyMuPDF's layout-preserving extraction.  Appending the
+                    # same PDF text here used to duplicate every Tour day and also
+                    # exposed the transport wrapper as possible customer data.
                     parts.append({"path":str(p),"mime_type":"application/pdf"})
+                else:
+                    text += f"\n\n{t}"
             else:
                 visual_count += 1
                 parts.append({"path":str(p),"mime_type":"application/pdf"})

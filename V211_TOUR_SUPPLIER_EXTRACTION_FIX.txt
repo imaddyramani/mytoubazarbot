@@ -1,0 +1,19 @@
+MYTOURBAZAR V211 - TOUR SUPPLIER EXTRACTION AND PRINT FIX
+
+- Prevents selectable Tour PDFs from being appended and extracted twice.
+- Prevents blank guest labels from consuming a PDF filename/page marker.
+- Recovers travel start/end dates and transport from supplier quotations.
+- Recovers multi-row hotel tables including destination, hotel, room category,
+  nights, meal plan and room count.
+- Calculates each hotel date range from the supplied start date and nights.
+- Splits day headings into day number, date, destination/title and description.
+- Stops the final day before the next page/section and removes duplicate days.
+- Recovers side-by-side supplier inclusion and exclusion tables.
+- Recovers flight routes, dates, timings and via points from Tour quotations.
+- Recovers package totals such as "INR 71,000 per couple" with option notes.
+- Keeps complete local hotel rows when the document model returns a partial set.
+- Uses "Dear Guest" instead of printing an empty greeting when no guest is supplied.
+
+Regression verified against:
+  02 COUPLE KERALA PACKAGE 03 OCT FINAL.pdf
+  Kerala_6N7D_LOCAL_Basic_Quotation.pdf

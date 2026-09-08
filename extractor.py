@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from ai_provider import complete_json
 from identity_guard import best_source_name
@@ -555,14 +556,28 @@ def _extract_supplier_package_costs(source_text):
                 for (_,key),num in zip(ordered,nums):
                     fields.setdefault(key,_money_value(num))
 
+    # Common quotation line: ``Total Package Cost (Deluxe) INR 71,000/-
+    # PER COUPLE ...``.  The older strict line matcher rejected the optional
+    # package name and the explanatory suffix.
+    total_line=re.search(
+        r'(?im)^\s*(?:grand\s+total|total\s+package\s+cost|package\s+(?:total|cost|price)|net\s+payable)'
+        r'\s*(?:\(([^)]+)\))?\s*(?:[:=|\-])?\s*(?:INR|Rs\.?|₹)\s*'
+        r'([0-9]{1,3}(?:,[0-9]{2,3})+|[0-9]{3,8})(?:\.\d{1,2})?\s*(?:/-)?\s*([^\n]*)$',text)
+    option='Package'; notes='Recovered from supplier costing table'
+    if total_line:
+        fields['total_cost']=_money_value(total_line.group(2))
+        option=(total_line.group(1) or 'Package').strip()
+        suffix=re.sub(r'\s+',' ',total_line.group(3) or '').strip()
+        if suffix: notes=suffix
+
     if not fields:
         return []
     total=fields.get('total_cost','')
     return [{
-        'option':'Package','per_adult':fields.get('per_adult',''),
+        'option':option,'per_adult':fields.get('per_adult',''),
         'per_child':fields.get('per_child',''),'per_child_cwb':fields.get('per_child_cwb',''),
         'per_child_cnb':fields.get('per_child_cnb',''),'per_extra_bed':fields.get('per_extra_bed',''),
-        'total_cost':total,'currency':'INR','notes':'Recovered from supplier costing table',
+        'total_cost':total,'currency':'INR','notes':notes,
         'supplier_total':total,'markup_total':'','final_total':''
     }]
 
@@ -586,14 +601,30 @@ def extract_transit_from_parts(file_parts, source_text, api_key, model):
 def _source_days(text):
     """Keep complete explicit supplier days outside the AI token budget."""
     pattern=r'(?im)^[ \t]*Day[ \t]+(\d{1,3})[ \t]*[:.\-–]?[ \t]*([^\n]*)'
-    matches=list(re.finditer(pattern,text)); days=[]; compact=[]; previous=0
+    matches=list(re.finditer(pattern,text)); days=[]; compact=[]; previous=0; seen=set()
     for i,match in enumerate(matches):
+        number=str(int(match.group(1)))
+        if number in seen:
+            continue
+        seen.add(number)
         end=matches[i+1].start() if i+1<len(matches) else len(text)
         block=text[match.end():end]
-        boundary=re.search(r'(?im)^\s*(?:inclusions|exclusions|package\s+cost|terms\s+and\s+conditions|hotel\s+details)\s*[:\-]?\s*$',block)
+        boundary=re.search(
+            r'(?im)^\s*(?:---\s*FILE\b.*|(?:package\s+)?inclusions?\b.*|(?:package\s+)?exclusions?\b.*|'
+            r'flight\s+details\b.*|package\s+cost\b.*|terms\s+and\s+conditions\b.*|hotel\s+details\b.*|notes?\s*[:-].*)$',block)
         if boundary: end=match.end()+boundary.start()
-        days.append({'day':match.group(1),'title':match.group(2).strip(),
-                     'description':text[match.end():end].strip()})
+        heading=re.sub(r'\s+',' ',match.group(2)).strip()
+        date_match=re.search(r'\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\b',heading)
+        date=date_match.group(1) if date_match else ''
+        if date_match:
+            title=heading[:date_match.start()].strip(' :-–—')
+            opening=heading[date_match.end():].strip(' :-–—')
+        else:
+            title=heading; opening=''
+        description=' '.join(x for x in (opening,text[match.end():end].strip()) if x)
+        description=re.sub(r'\s+',' ',description).strip()
+        days.append({'day':number,'date':date,'title':title,
+                     'description':description})
         compact.append(text[previous:match.start()])
         compact.append(f"Day {match.group(1)}: {match.group(2)}\n[Full day description preserved locally]\n")
         # Keep accommodation, meals, transfer and cost evidence for structuring.
@@ -610,7 +641,8 @@ def _local_day_itinerary(source_days):
     days=[]
     for item in source_days:
         day=dict(item)
-        day.update({'date':'','stay':'','meal_plan':'','optional_activities':[]})
+        day.setdefault('date','')
+        day.update({'stay':'','meal_plan':'','optional_activities':[]})
         days.append(day)
     return {
         'client_name':'','tour_title':'','destination':'','travel_dates':'',
@@ -626,8 +658,30 @@ def _local_day_itinerary(source_days):
 
 def _label_value(text, labels, max_len=120):
     joined='|'.join(labels)
-    match=re.search(r'(?im)^\s*(?:'+joined+r')\s*[:\-]\s*([^\n]{1,'+str(max_len)+r'})\s*$',str(text or ''))
-    return re.sub(r'\s+',' ',match.group(1)).strip() if match else ''
+    # Horizontal whitespace is intentional. ``\s`` crossed into the next line
+    # when an explicit label was blank, making a PDF page marker the guest name.
+    match=re.search(r'(?im)^[ \t]*(?:'+joined+r')[ \t]*[:\-][ \t]*([^\n]{1,'+str(max_len)+r'})[ \t]*$',str(text or ''))
+    value=re.sub(r'\s+',' ',match.group(1)).strip() if match else ''
+    if re.search(r'(?i)(?:LOCAL SELECTABLE PDF TEXT|---\s*FILE\b|\.pdf\s*/\s*PAGE)',value):
+        return ''
+    return value
+
+
+def _dated_label_value(text,label):
+    match=re.search(r'(?im)^[ \t]*'+label+r'[ \t]*:[ \t]*(\d{1,2}(?:/|-|\s)[A-Za-z]{3,9}(?:/|-|\s)\d{4})\b',str(text or ''))
+    return match.group(1).strip() if match else ''
+
+
+def _parse_supplier_date(value):
+    value=str(value or '').strip()
+    for fmt in ('%d/%b/%Y','%d %b %Y','%d-%b-%Y','%d/%m/%Y','%d-%m-%Y'):
+        try: return datetime.strptime(value,fmt)
+        except ValueError: pass
+    return None
+
+
+def _split_layout_columns(line):
+    return [x.strip() for x in re.split(r'\s{2,}',str(line or '').strip()) if x.strip()]
 
 
 def _local_hotels(text,days):
@@ -644,23 +698,131 @@ def _local_hotels(text,days):
             'hotel_category':_label_value(window,(r'hotel\s+category',r'star\s+category')),
             'rooms':_label_value(window,(r'total\s+rooms?',r'rooms?',r'rooming')),'room_type':room,
             'meal_plan':_label_value(window,(r'meal\s+plan',r'meals?',r'plan')),'option':'Option 1'})
+    # Recover the very common supplier table layout:
+    # Destination | Hotel | Room Category | Nights | Meal Plan | No of Rooms.
+    # Work from the layout-preserved raw lines; a label-only parser cannot read it.
+    if not rows:
+        raw_lines=str(text or '').splitlines()
+        header_index=next((i for i,line in enumerate(raw_lines)
+                           if re.search(r'(?i)\bdestination\b',line)
+                           and re.search(r'(?i)\bhotels?\b',line)
+                           and re.search(r'(?i)\broom\s+category\b',line)),None)
+        start=_dated_label_value(text,r'(?:tour\s+)?start(?:ing)?\s+date')
+        cursor=_parse_supplier_date(start)
+        if header_index is not None:
+            for line in raw_lines[header_index+1:]:
+                if re.search(r'(?i)^\s*(?:transportation|vehicle|total\s+package|detailed\s+tour)',line): break
+                cells=_split_layout_columns(line)
+                if len(cells)<6 or not re.fullmatch(r'\d{1,2}',cells[-3]): continue
+                destination,hotel,room,nights,meal,room_count=cells[0],cells[1],cells[-4],cells[-3],cells[-2],cells[-1]
+                if not (destination and hotel): continue
+                night_count=int(nights)
+                dates=''
+                if cursor:
+                    checkout=cursor+timedelta(days=night_count)
+                    dates=f"{cursor.strftime('%d %b %Y')} – {checkout.strftime('%d %b %Y')}"
+                    cursor=checkout
+                rows.append({'dates':dates,'destination':destination,'hotel_name':hotel,
+                    'room_category':room,'hotel_category':'','rooms':f'{room_count} Rooms',
+                    'room_type':room,'meal_plan':meal.title(),'option':'Option 1','nights':str(night_count)})
     if not rows:
         for stay in dict.fromkeys(str(x.get('stay') or '').strip() for x in days):
             if stay: rows.append({'dates':'','destination':stay,'hotel_name':'','room_category':'','hotel_category':'','rooms':'','room_type':'','meal_plan':'','option':'Option 1'})
     return rows
 
 
-def _local_tour_result(text,source_days):
+def _numbered_items(lines):
+    items=[]; current=''
+    for raw in lines:
+        value=re.sub(r'\s+',' ',str(raw or '')).strip()
+        if not value: continue
+        match=re.match(r'^\d+[.)]\s*(.*)$',value)
+        if match:
+            if current: items.append(current.strip())
+            current=match.group(1).strip()
+        elif current:
+            current+=' '+value
+    if current: items.append(current.strip())
+    return [x for x in items if len(x)>2]
+
+
+def _pdf_table_facts(file_parts):
+    """Extract semantic table columns from selectable supplier PDFs.
+
+    This supplements (not replaces) normal text parsing and remains optional when
+    a PDF has no ruled/detectable table.
+    """
+    facts={'hotels':[],'inclusions':[],'exclusions':[]}
+    try:
+        import fitz
+    except Exception:
+        return facts
+    for item in file_parts or []:
+        path=Path(item.get('path') or '')
+        if path.suffix.lower()!='.pdf' or not path.is_file(): continue
+        try:
+            with fitz.open(str(path)) as doc:
+                for page in doc:
+                    finder=getattr(page,'find_tables',None)
+                    if not finder: continue
+                    for table in finder().tables:
+                        grid=table.extract() or []
+                        if not grid: continue
+                        normalized=[[re.sub(r'\s+',' ',str(c or '')).strip() for c in row] for row in grid]
+                        header=normalized[0]
+                        header_text=' | '.join(header).lower()
+                        if 'inclusions' in header_text and 'exclusions' in header_text:
+                            inc_index=next(i for i,c in enumerate(header) if 'inclusion' in c.lower())
+                            exc_index=next(i for i,c in enumerate(header) if 'exclusion' in c.lower())
+                            left=[' '.join(c for c in row[inc_index:exc_index] if c) for row in normalized[1:]]
+                            right=[' '.join(c for c in row[exc_index:] if c) for row in normalized[1:]]
+                            facts['inclusions'].extend(_numbered_items(left))
+                            facts['exclusions'].extend(_numbered_items(right))
+        except Exception as exc:
+            LOGGER.warning('Optional PDF table recovery failed for %s: %s',path.name,exc)
+    return facts
+
+
+def _local_transit(text):
+    rows=[]
+    def clean_time(value):
+        value=str(value or '').replace('.',':').strip()
+        match=re.fullmatch(r'(\d{1,2}):(\d{2})(AM|PM)',value,re.I)
+        if match and int(match.group(1))>12:
+            return f'{int(match.group(1)):02d}:{match.group(2)}'
+        return value
+    pattern=(r'(?im)^\s*\d+[.)]\s*([A-Za-z]{3,30}|[A-Z]{3})\s+TO\s+([A-Za-z]{3,30}|[A-Z]{3})\s+'
+             r'(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\s+([A-Za-z][A-Za-z ]{1,20})\s+'
+             r'(\d{1,2}[.:]\d{2}\s*(?:AM|PM)?)\s*[-–]\s*(\d{1,2}[.:]\d{2}\s*(?:AM|PM)?)(?:\s+VIA\s+([^\n]+))?')
+    for match in re.finditer(pattern,str(text or '')):
+        origin,destination,date,carrier,departure,arrival,via=(x.strip() if x else '' for x in match.groups())
+        route=f'{origin} → {destination}' + (f' via {via}' if via else '')
+        rows.append({'date':date,'segment_mode':'Flight','journey_type':'Flight','carrier':carrier.title(),
+            'flight_number':'','route':route,'from':origin,'to':destination,'departure':clean_time(departure),
+            'arrival':clean_time(arrival),'from_airport':'','to_airport':'','departure_terminal':'',
+            'arrival_terminal':'','aircraft':'','pnr':''})
+    return rows
+
+
+def _local_tour_result(text,source_days,file_parts=None):
     result=_local_day_itinerary(source_days)
     result['client_name']=_label_value(text,(r'authoritative\s+guest\s*/\s*client\s+name',r'guest\s+name',r'client\s+name',r'lead\s+guest'))
     destination,key=infer_destination(text); result['destination']=destination
     result['tour_title']=attractive_title(destination,key)
     result['travel_dates']=_label_value(text,(r'travel\s+dates?',r'tour\s+dates?',r'dates?'))
+    if not result['travel_dates']:
+        start=_dated_label_value(text,r'(?:tour\s+)?start(?:ing)?\s+date')
+        end_match=re.search(r'(?i)\b(?:tour\s+)?end(?:ing)?\s+date\s*:\s*(\d{1,2}(?:/|-|\s)[A-Za-z]{3,9}(?:/|-|\s)\d{4})\b',str(text or ''))
+        end=end_match.group(1).strip() if end_match else ''
+        if start and end: result['travel_dates']=f'{start} – {end}'
     result['duration']=_label_value(text,(r'duration',r'tour\s+duration'))
     if not result['duration']:
         match=re.search(r'(?i)\b(\d{1,2})\s*nights?\s*(?:and|&|/)?\s*(\d{1,2})\s*days?\b',text)
         result['duration']=f'{match.group(1)} Nights and {match.group(2)} Days' if match else (f'{len(source_days)} Days' if source_days else '')
-    result['vehicle']=_label_value(text,(r'vehicle(?:\s+type)?',r'transport'))
+    result['vehicle']=_label_value(text,(r'vehicle(?:\s+type)?',r'transport(?:ation)?'))
+    if not result['vehicle']:
+        vehicle_match=re.search(r'(?im)^[ \t]*(?:transportation|vehicle(?:\s+type)?)[ \t]{2,}([^\n]{2,80})$',str(text or ''))
+        if vehicle_match: result['vehicle']=re.sub(r'\s+',' ',vehicle_match.group(1)).strip()
     result['pickup']=_label_value(text,(r'pick[ -]?up(?:\s+point|\s+hub)?',)); result['drop']=_label_value(text,(r'drop(?:\s+point|\s+hub)?',))
     patterns={'adult_count':r'(\d+)\s*(?:adults?|adt)\b','child_cwb_count':r'(\d+)\s*(?:cwb|child(?:ren)?\s+with\s+bed)\b','child_cnb_count':r'(\d+)\s*(?:cnb|child(?:ren)?\s+(?:without|no)\s+bed)\b','extra_bed_count':r'(\d+)\s*(?:extra\s+bed|eb)\b'}
     for field,pattern in patterns.items():
@@ -674,8 +836,22 @@ def _local_tour_result(text,source_days):
         if stay: day['stay']=stay.group(1).strip()
         if meal: day['meal_plan']=meal.group(1).strip()
     result['hotels']=_local_hotels(text,result['days'])
+    for day in result['days']:
+        title=str(day.get('title') or '').lower()
+        hotel=next((h for h in result['hotels'] if str(h.get('destination') or '').lower() in title),None)
+        if hotel and 'airport' not in title:
+            day['stay']=hotel.get('destination') or ''
+            day['meal_plan']=hotel.get('meal_plan') or day.get('meal_plan') or ''
+        elif not day.get('meal_plan') and re.search(r'(?i)\bafter\s+breakfast\b',str(day.get('description') or '')):
+            day['meal_plan']='Breakfast'
+    result['transit']=_local_transit(text)
     result['package_costs']=_extract_supplier_package_costs(text)
     result.update(_extract_supplier_inclusion_exclusion_lists(text))
+    table_facts=_pdf_table_facts(file_parts)
+    if table_facts.get('inclusions'): result['inclusions']=table_facts['inclusions']
+    if table_facts.get('exclusions'): result['exclusions']=table_facts['exclusions']
+    note=re.search(r'(?is)\bNOTE\s*[:-]\s*(.*?)(?:Hope all of above|\Z)',str(text or ''))
+    if note: result['policies']=re.sub(r'\s+',' ',note.group(1)).strip()
     return _ensure_generated_inclusion_exclusion_lists(result)
 
 
@@ -692,14 +868,39 @@ def _merge_local_fallback_into_ai_package(remote, local, source_text=''):
         if not result.get(key) and local.get(key): result[key]=local[key]
     for key in ('days','hotels'):
         remote_rows=list(result.get(key) or []); local_rows=list(local.get(key) or [])
+        if key=='hotels' and any(str(x.get('hotel_name') or '').strip() for x in local_rows):
+            # A locally recovered supplier table is authoritative and complete;
+            # do not let a partial model response collapse four hotel rows to one.
+            result[key]=local_rows
+            continue
         if not remote_rows:
             result[key]=local_rows; continue
+        local_by_day={str(x.get('day') or '').strip():x for x in local_rows if isinstance(x,dict)} if key=='days' else {}
         for index,row in enumerate(remote_rows):
-            fallback=local_rows[index] if index<len(local_rows) else {}
+            fallback=(local_by_day.get(str((row or {}).get('day') or '').strip()) if key=='days' else None) or (local_rows[index] if index<len(local_rows) else {})
             if not isinstance(row,dict): continue
             for field,value in (fallback or {}).items():
                 if row.get(field) in ('',None,0,[]) and value not in ('',None,0,[]): row[field]=value
         result[key]=remote_rows
+        if key=='days':
+            present={str((x or {}).get('day') or '').strip() for x in remote_rows}
+            result[key].extend(x for x in local_rows if str((x or {}).get('day') or '').strip() not in present)
+    # A document model may repeat pages or rows.  Keep the first complete instance
+    # of each numbered day and each accommodation identity.
+    unique_days=[]; seen_days=set()
+    for row in result.get('days') or []:
+        number=str((row or {}).get('day') or '').strip()
+        if number and number in seen_days: continue
+        if number: seen_days.add(number)
+        unique_days.append(row)
+    result['days']=unique_days
+    unique_hotels=[]; seen_hotels=set()
+    for row in result.get('hotels') or []:
+        key=(str((row or {}).get('destination') or '').strip().lower(),str((row or {}).get('hotel_name') or '').strip().lower())
+        if key!=('','') and key in seen_hotels: continue
+        if key!=('',''): seen_hotels.add(key)
+        unique_hotels.append(row)
+    result['hotels']=unique_hotels
     result['_ai_primary_used']=True
     return _ensure_generated_inclusion_exclusion_lists(result)
 
@@ -718,7 +919,7 @@ def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
         SCHEMA,purpose='tour supplier extraction',max_tokens=9000,
         image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
     )
-    local=_local_tour_result(source_text,source_days)
+    local=_local_tour_result(source_text,source_days,file_parts)
     if remote:
         return _merge_local_fallback_into_ai_package(remote,local,source_text)
     return local
