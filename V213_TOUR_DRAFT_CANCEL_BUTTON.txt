@@ -1,0 +1,7 @@
+MYTOURBAZAR V213 - TOUR DRAFT CANCEL BUTTON
+
+- Adds a full-width Cancel & Start New button below Basic WhatsApp, Detailed
+  WhatsApp, Basic PDF and Detailed PDF.
+- Available in both current Tour draft output menus.
+- Clears the active draft, supplier files and pending workflow state, then opens
+  the normal new-request menu.

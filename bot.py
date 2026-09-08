@@ -1,8257 +1,2192 @@
-import os
-import logging
-import asyncio
-from pathlib import Path
-from datetime import datetime
-import time
-import shutil
-import copy
-import gc
-import re
-import types
-from urllib.parse import quote
-
-from dotenv import load_dotenv
-from pypdf import PdfReader, PdfWriter
-from telegram import (
-    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-    InlineKeyboardButton, InlineKeyboardMarkup
-)
-from telegram.error import BadRequest, NetworkError
-from telegram.request import HTTPXRequest
-from telegram.ext import (
-    Application, ApplicationHandlerStop, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, ContextTypes, filters
-)
-
-from extractor import extract_itinerary_from_parts, extract_transit_from_parts
-from template import generate_pdf
-from hotel_voucher import extract_hotel_voucher, generate_hotel_voucher
-from flight_extractor import extract_flight_ticket
-from flight_print import generate_flight_ticket
-from watermark_overlay import add_watermark_to_pdf
-from bus_ticket import extract_bus_ticket, generate_bus_ticket
-from editor import apply_edit
-from smart_assistant import classify as ai_classify, chat as ai_chat, enhance_package_itinerary, agent_plan, generate_package_from_brief
-from reference_manager import create_reference, save_record, load_record, list_records, update_record, import_existing_pdfs
-from footer_overlay import add_footer_to_pdf
-from footer_bar_overlay import add_contact_bar_to_pdf
-from footer2_overlay import add_footer2_to_pdf
-from print_settings import load_settings, save_settings, set_font, adjust_text_scale, adjust_logo_scale, get_logo_scale, toggle_button, reset_settings, FONT_OPTIONS, button_enabled, set_default_terms, set_default_footer, get_default_footer, set_tour_last_page, get_tour_last_page
-from performance_utils import prepare_supplier_for_ai, parse_transit_files_local, apply_missing_accommodation_locally
-from voice_edit import transcribe_voice_note
-from ai_provider import configuration_summary
-
-# V55: LOCAL FOOTER SOURCE
-# The footer can ONLY come from this bot's own assets folder.
-BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-ASSETS_DIR = os.path.join(BOT_DIR, "assets")
-FOOTER_IMAGE = os.path.join(ASSETS_DIR, "mytourbazar_footer.png")
-
-def get_local_footer_path():
-    path = os.path.normpath(FOOTER_IMAGE)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            "Footer artwork not found. Expected exactly: " + path
-        )
-    return path
-
-# --- MTB AIRLINE LOGO INLINE ENHANCEMENT ---
-from pathlib import Path as _MTBPath
-import re as _MTBre
-
-_MTB_AIRLINE_LOGO_DIR = _MTBPath(__file__).resolve().parent / "assets" / "airline_logos"
-
-def _mtb_airline_logo_candidates(airline_text):
-    s = (airline_text or "").strip().lower()
-    s = _MTBre.sub(r"[^a-z0-9]+", "_", s).strip("_")
-    aliases = {
-        "6e": ["indigo", "6e", "indigo_air"],
-        "indigo": ["indigo", "6e", "indigo_air"],
-        "ai": ["air_india", "airindia", "ai"],
-        "air_india": ["air_india", "airindia", "ai"],
-        "ix": ["air_india_express", "airindiaexpress", "ix"],
-        "air_india_express": ["air_india_express", "airindiaexpress", "ix"],
-        "sg": ["spicejet", "sg"],
-        "spicejet": ["spicejet", "sg"],
-        "qp": ["akasa_air", "akasa", "qp"],
-        "akasa": ["akasa_air", "akasa", "qp"],
-        "uk": ["vistara", "uk"],
-        "vistara": ["vistara", "uk"],
-        "ek": ["emirates", "ek"],
-        "emirates": ["emirates", "ek"],
-        "qr": ["qatar_airways", "qatar", "qr"],
-        "qatar": ["qatar_airways", "qatar", "qr"],
-        "sq": ["singapore_airlines", "singapore", "sq"],
-        "ai_exp": ["air_india_express", "airindiaexpress", "ix"],
-    }
-    vals = aliases.get(s, []) + [s]
-    out = []
-    for v in vals:
-        for ext in (".png", ".webp", ".jpg", ".jpeg"):
-            out.append(v + ext)
-    return list(dict.fromkeys(out))
-
-def mtb_find_airline_logo(airline_text):
-    """Find the best local airline logo by airline name or flight code."""
-    if not _MTB_AIRLINE_LOGO_DIR.exists():
-        return None
-    candidates = _mtb_airline_logo_candidates(airline_text)
-    files = {p.name.lower(): p for p in _MTB_AIRLINE_LOGO_DIR.iterdir() if p.is_file()}
-    for name in candidates:
-        if name.lower() in files:
-            return str(files[name.lower()])
-    # Flexible fallback: compare normalized names.
-    normalized = _MTBre.sub(r"[^a-z0-9]", "", (airline_text or "").lower())
-    if normalized:
-        for p in files.values():
-            stem = _MTBre.sub(r"[^a-z0-9]", "", p.stem.lower())
-            if stem and (stem in normalized or normalized in stem):
-                return str(p)
-    return None
-
-def mtb_airline_logo_html(airline_text, alt=None):
-    """Return a larger, vertically centered inline logo for EVERY flight row."""
-    path = mtb_find_airline_logo(airline_text)
-    if not path:
-        return ""
-    import base64 as _MTBbase64
-    ext = _MTBPath(path).suffix.lower()
-    mime = "image/png" if ext == ".png" else ("image/webp" if ext == ".webp" else "image/jpeg")
-    data = _MTBbase64.b64encode(_MTBPath(path).read_bytes()).decode("ascii")
-    label = alt or airline_text or "Airline"
-    # Larger than the previous version and centered in the flight-detail cell.
-    return (
-        f'<div class="mtb-airline-logo-wrap">'
-        f'<img class="mtb-airline-logo" src="data:{mime};base64,{data}" '
-        f'alt="{label}" title="{label}">'
-        f'</div>'
-    )
-# --- END MTB AIRLINE LOGO INLINE ENHANCEMENT ---
-
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-# Compatibility arguments retained by the workflow functions. Provider routing
-# itself lives in ai_provider.py and remains local when AI_PROVIDER=local.
-AI_API_KEY = os.getenv("XKIRO_API_KEY", "").strip() or os.getenv("GROQ_API_KEY", "").strip() or None
-AI_MODEL = os.getenv("XKIRO_TEXT_MODEL", "").strip() or os.getenv("GROQ_MODEL", "").strip() or "auto"
-
-ADMIN_USER_IDS = {
-    int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
-    if x.strip().isdigit()
-}
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-GENERATED_DIR = DATA_DIR / "generated"
-TEMP_DIR = DATA_DIR / "incoming"
-DATA_DIR.mkdir(exist_ok=True)
-GENERATED_DIR.mkdir(exist_ok=True)
-TEMP_DIR.mkdir(exist_ok=True)
-# Default MyTourBazar logo supplied with the bot.
-# A logo uploaded later through üñºÔ∏è Set Logo overrides this for the current run.
-LOGO_PATH = DATA_DIR / "logo_default.png"
-USER_LOGO_PATH = DATA_DIR / "logo.png"
-ASSETS_DIR = BASE_DIR / "assets"
-ASSETS_DIR.mkdir(exist_ok=True)
-TERMS2_PDF_PATH = DATA_DIR / "TERMS_CONDITIONS.pdf"
-B2B_TERMS_PDF_PATH = DATA_DIR / "B2B.pdf"
-TOUR_WITHOUT_FOOTER_PDF_PATH = DATA_DIR / "without_footer.pdf"
-TOUR_NON_GOOGLE_TERMS_PDF_PATH = DATA_DIR / "T&C NON GOOGLE.pdf"
-import_existing_pdfs(GENERATED_DIR)
-
-
-def append_pdf_pages(base_pdf, appendix_pdf, output_pdf):
-    """Merge the generated package itinerary followed by the supplied appendix PDF."""
-    writer = PdfWriter()
-    for source in (base_pdf, appendix_pdf):
-        reader = PdfReader(str(source))
-        for page in reader.pages:
-            writer.add_page(page)
-    with open(output_pdf, "wb") as fh:
-        writer.write(fh)
-
-
-_B2B_BRAND_PATTERN = re.compile(
-    r"(?i)(?:sales@mytourbazar\.com|www\.mytourbazar\.com|mytourbazar\.com|@mytourbazar|my\s*tour\s*bazar|mytourbazar)"
-)
-
-
-def _smart_requested_b2b(text):
-    """True only when the owner explicitly asks for a B2B / white-label Tour output."""
-    low = str(text or "").lower()
-    return bool(re.search(
-        r"\b(?:b\s*2\s*b|business\s*[- ]?to\s*[- ]?business|white\s*[- ]?label|agency\s*[- ]?neutral|unbranded)\b",
-        low,
-        re.I,
-    ))
-
-
-def _is_b2b_tour(data=None, context=None, record=None):
-    data = data or {}
-    record = record or {}
-    if bool(data.get("b2b") or data.get("brand_neutral")):
-        return True
-    if bool(record.get("b2b")):
-        return True
-    if context is not None and bool(context.user_data.get("pending_b2b")):
-        return True
-    return False
-
-
-def _b2b_replace_text(value):
-    """Remove every MyTourBazar brand reference from B2B-visible text."""
-    text = str(value or "")
-    # Contact-style brand strings must not become malformed e-mails/domains.
-    text = re.sub(r"(?i)\bsales@mytourbazar\.com\b", "our company", text)
-    text = re.sub(r"(?i)\b(?:www\.)?mytourbazar\.com\b", "our company", text)
-    text = re.sub(r"(?i)@mytourbazar\b", "our company", text)
-    text = re.sub(r"(?i)\bmy\s*tour\s*bazar\b", "our company", text)
-    text = re.sub(r"(?i)\bmytourbazar\b", "our company", text)
-    return text
-
-
-def _b2b_neutralize_data(data, mode=None):
-    """Deep-copy Tour data and make every customer-visible string B2B white-label."""
-    def scrub(obj):
-        if isinstance(obj, dict):
-            return {k: scrub(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [scrub(v) for v in obj]
-        if isinstance(obj, tuple):
-            return tuple(scrub(v) for v in obj)
-        if isinstance(obj, str):
-            return _b2b_replace_text(obj)
-        return obj
-
-    d = scrub(copy.deepcopy(data or {}))
-    d["b2b"] = True
-    d["brand_neutral"] = True
-    d["agency_removed"] = True
-    if mode:
-        d["document_mode"] = str(mode).lower()
-    return d
-
-
-def _b2b_greeting(data, mode):
-    guest = str((data or {}).get("client_name") or "Guest").strip()
-    mode = str(mode or "itinerary").lower()
-    if mode == "quotation":
-        return (
-            f"Dear {guest},\n\nGreetings from our company! We are delighted to present this official "
-            "tour quotation prepared especially for your travel requirements. The following proposal "
-            "summarizes the planned destinations, accommodation, transportation, sightseeing experiences, "
-            "inclusions and exclusions for your consideration. We look forward to arranging a comfortable "
-            "and memorable journey for you and your family.\n\nPlease review the itinerary and package "
-            "details carefully, and feel free to contact our company for any clarification or amendment before confirmation."
-        )
-    if mode == "voucher":
-        return (
-            f"Dear {guest},\n\nGreetings from our company! Thank you for choosing our company for your journey. "
-            "Please find below your official tour voucher containing the confirmed travel plan, accommodation "
-            "schedule, services and day-wise arrangements. Kindly keep this voucher available during your "
-            "journey and review the included services and travel instructions before departure.\n\n"
-            "Our company wishes you a smooth, comfortable and memorable trip."
-        )
-    return (
-        f"Dear {guest},\n\nGreetings from our company! Please find below your carefully planned day-wise "
-        "travel itinerary, including accommodation, transportation, sightseeing experiences, inclusions and "
-        "exclusions for a smooth and comfortable journey."
-    )
-
-
-def _sanitize_b2b_terms_pdf(source_pdf, output_pdf):
-    """Create a temporary B2B terms PDF with no MyTourBazar text.
-
-    This is fail-closed: if a visible/extractable MyTourBazar reference remains,
-    the B2B print is stopped instead of leaking the brand into a white-label PDF.
-    """
-    source_pdf = Path(source_pdf)
-    output_pdf = Path(output_pdf)
-    try:
-        import fitz  # PyMuPDF is already used by the MyTourBazar bot stack.
-    except Exception as exc:
-        raise RuntimeError(
-            "B2B terms sanitizing needs PyMuPDF. Refusing to append an unsanitized B2B terms page."
-        ) from exc
-
-    doc = fitz.open(str(source_pdf))
-    # Long/contact forms first, then brand-name variants.
-    replacements = [
-        ("sales@mytourbazar.com", "our company"),
-        ("www.mytourbazar.com", "our company"),
-        ("mytourbazar.com", "our company"),
-        ("@mytourbazar", "our company"),
-        ("MY TOUR BAZAR", "our company"),
-        ("My Tour Bazar", "our company"),
-        ("MYTOURBAZAR", "our company"),
-        ("MyTourBazar", "our company"),
-        ("mytourbazar", "our company"),
-    ]
-
-    for page in doc:
-        found = []
-        occupied = []
-        for needle, replacement in replacements:
-            for rect in page.search_for(needle):
-                # Avoid overlapping replacement rectangles when one long token
-                # also contains a shorter brand token.
-                if any(rect.intersects(prev) for prev in occupied):
-                    continue
-                occupied.append(rect)
-                found.append((rect, replacement))
-                page.add_redact_annot(rect, fill=(1, 1, 1))
-        if found:
-            page.apply_redactions()
-            for rect, replacement in found:
-                fontsize = max(6.0, min(11.0, rect.height * 0.72))
-                page.insert_textbox(
-                    rect,
-                    replacement,
-                    fontsize=fontsize,
-                    fontname="helv",
-                    color=(0, 0, 0),
-                    align=0,
-                )
-
-    doc.save(str(output_pdf), garbage=4, deflate=True)
-    doc.close()
-
-    verify = fitz.open(str(output_pdf))
-    extracted = "\n".join(page.get_text("text") for page in verify)
-    verify.close()
-    if _B2B_BRAND_PATTERN.search(extracted):
-        output_pdf.unlink(missing_ok=True)
-        raise RuntimeError(
-            "B2B terms still contain a MyTourBazar reference after sanitizing. "
-            "The PDF was stopped to protect white-label branding."
-        )
-    return output_pdf
-
-
-def terms_pdf_path(choice=None):
-    choice = choice or get_tour_last_page()
-    return {
-        'without_footer': TOUR_WITHOUT_FOOTER_PDF_PATH,
-        'tc_non_google': TOUR_NON_GOOGLE_TERMS_PDF_PATH,
-    }.get(choice, TOUR_NON_GOOGLE_TERMS_PDF_PATH)
-
-def terms_label(choice=None):
-    return {
-        'without_footer': 'Without Footer',
-        'tc_non_google': 'T&C NON GOOGLE',
-        'b2b': 'B2B',
-    }.get(choice or get_tour_last_page(), 'T&C NON GOOGLE')
-
-def tour_terms_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton('üìú Use T&C NON GOOGLE', callback_data='tour_terms:non_google')]])
-
-def append_selected_terms(base_pdf, terms_choice=None, output_pdf=None):
-    if output_pdf is None:
-        output_pdf = terms_choice
-    choice = terms_choice or get_tour_last_page()
-    temporary_b2b_terms = None
-    if choice == 'b2b':
-        terms_path = B2B_TERMS_PDF_PATH
-    else:
-        terms_path = terms_pdf_path(choice)
-    if not terms_path.exists():
-        raise FileNotFoundError(f'Tour last-page file not found: {terms_path}')
-    try:
-        if choice == 'b2b':
-            temporary_b2b_terms = GENERATED_DIR / f"_b2b_terms_clean_{int(time.time()*1000)}.pdf"
-            terms_path = _sanitize_b2b_terms_pdf(terms_path, temporary_b2b_terms)
-        append_pdf_pages(base_pdf, terms_path, output_pdf)
-        return Path(output_pdf)
-    finally:
-        if temporary_b2b_terms is not None:
-            temporary_b2b_terms.unlink(missing_ok=True)
-
-
-def _apply_footer_mode(input_pdf, output_pdf, mode):
-    if mode == 'bar':
-        add_contact_bar_to_pdf(input_pdf, output_pdf)
-    elif mode == 'design':
-        add_footer_to_pdf(input_pdf, output_pdf)
-    elif mode == 'footer2':
-        add_footer2_to_pdf(input_pdf, output_pdf)
-    else:
-        shutil.copyfile(input_pdf, output_pdf)
-
-
-WAITING_GUEST_NAME = 1
-WAITING_SOURCE = 2
-WAITING_EXTRA_INCLUSION = 3
-WAITING_EXTRA_EXCLUSION = 4
-WAITING_FLIGHT_IMAGE = 5
-HOTEL_VOUCHER_INPUT = 10
-FLIGHT_TICKET_INPUT = 20
-FLIGHT_FARE_INPUT = 21
-BUS_TICKET_INPUT = 30
-BUS_FARE_INPUT = 31
-EDIT_REF_INPUT = 40
-EDIT_INSTRUCTION = 41
-SMART_INPUT = 50
-AUTO_PRINT_SECONDS = 5
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("mytourbazar_bot")
-
-
-class ReplyActionFilter(filters.MessageFilter):
-    """Route replies to bot messages through the edit/command router first.
-
-    If the replied-to message contains an MTB reference it becomes a document edit.
-    If it is a fare prompt it becomes fare input. Otherwise the normal ConversationHandler
-    still receives the message, so replying to workflow prompts remains fully usable.
-    """
-    name = "ReplyActionFilter"
-
-    def filter(self, message):
-        replied = getattr(message, "reply_to_message", None)
-        if not replied:
-            return False
-        sender = getattr(replied, "from_user", None)
-        return bool(sender and getattr(sender, "is_bot", False))
-
-
-REPLY_ACTION_FILTER = ReplyActionFilter()
-
-
-async def safe_callback_edit(query, text, **kwargs):
-    """Safely update a callback's originating message.
-
-    Callback buttons can be attached to photo/document/media messages.
-    Telegram's editMessageText only edits text messages, so fall back to a
-    fresh reply when the originating message has no text/caption.
-    """
-    message = getattr(query, "message", None)
-    if message is None:
-        return None
-    text = str(text or "Processing...")
-    existing_text = getattr(message, "text", None)
-    existing_caption = getattr(message, "caption", None)
-    if not existing_text and not existing_caption:
-        return await message.reply_text(text, **kwargs)
-    try:
-        return await message.edit_text(text, **kwargs)
-    except BadRequest as exc:
-        reason = str(exc).lower()
-        if any(x in reason for x in (
-            "there is no text in the message to edit",
-            "message can't be edited",
-            "message to edit not found",
-            "message is not modified",
-        )):
-            return await message.reply_text(text, **kwargs)
-        logger.warning("Callback message edit failed: %s", exc)
-        return await message.reply_text(text, **kwargs)
-    except Exception as exc:
-        logger.warning("Unexpected callback message edit failure: %s", exc)
-        try:
-            return await message.reply_text(text, **kwargs)
-        except Exception:
-            logger.exception("Could not send callback fallback message")
-            return None
-
-
-async def safe_status_edit(status_message, chat_message, text, **kwargs):
-    """Edit ONE bot-owned status message in place. Never create a fallback message.
-
-    This is deliberately strict for workflow progress: a failed edit must not create
-    a second progress message, otherwise the chat becomes a stream of duplicate
-    status messages. Telegram permits editing messages sent by the bot itself.
-    """
-    text = str(text or "Processing...")
-    if status_message is None:
-        return None
-
-    # Always address the original bot message by chat_id/message_id. This avoids
-    # accidentally editing the user's uploaded document or a stale Message object.
-    chat_id = getattr(status_message, "chat_id", None) or getattr(chat_message, "chat_id", None)
-    message_id = getattr(status_message, "message_id", None)
-    if chat_id is None or message_id is None:
-        logger.warning("Status message has no chat/message id; progress update skipped")
-        return status_message
-
-    try:
-        await chat_message.get_bot().edit_message_text(
-            chat_id=chat_id, message_id=message_id, text=text, **kwargs
-        )
-    except BadRequest as exc:
-        reason = str(exc).lower()
-        if "message is not modified" not in reason:
-            logger.warning("Could not edit single status message %s/%s: %s", chat_id, message_id, exc)
-    except Exception as exc:
-        logger.warning("Unexpected single status edit failure %s/%s: %s", chat_id, message_id, exc)
-    return status_message
-
-
-def _safe_filename_part(value, fallback="Document"):
-    value = str(value or "").strip()
-    value = value.replace("/", "-").replace("\\", "-")
-    value = "".join(c if c.isalnum() or c in " ._-&()" else "_" for c in value)
-    value = "_".join(value.split())
-    value = value.strip("._- _")
-    return value or fallback
-
-
-def _ddmm(value, fallback="0000"):
-    import re
-    text = str(value or "")
-    months={m.lower():i for i,m in enumerate(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"],1)}
-    patterns=[
-        r"\b(\d{1,2})[\s/-]+([A-Za-z]{3,9})[\s,/-]+(\d{2,4})\b",
-        r"\b(\d{1,2})[\s/-]+(\d{1,2})[\s/-]+(\d{2,4})\b",
-        r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b",
-    ]
-    for pat in patterns:
-        m=re.search(pat,text,re.I)
-        if not m: continue
-        try:
-            if m.group(2).isalpha():
-                day=int(m.group(1)); month=months[m.group(2)[:3].lower()]
-            elif len(m.group(1))==4:
-                month=int(m.group(2)); day=int(m.group(3))
-            else:
-                day=int(m.group(1)); month=int(m.group(2))
-            return f"{day:02d}{month:02d}"
-        except Exception: pass
-    return fallback
-
-
-def _airport_code(value):
-    import re
-    text=str(value or "")
-    m=re.search(r"\(([A-Za-z]{3})\)",text)
-    if m: return m.group(1).upper()
-    codes=re.findall(r"\b[A-Za-z]{3}\b",text)
-    return codes[-1].upper() if codes else "XXX"
-
-
-def _dd_mm(value, fallback="Date"):
-    """Short document date for filenames: DD_MM."""
-    compact=_ddmm(value, "")
-    if compact and len(compact)==4 and compact.isdigit():
-        return compact[:2] + "_" + compact[2:]
-    return fallback
-
-
-def _normal_title(value):
-    raw=str(value or "").strip().replace(".","")
-    low=raw.lower()
-    mapping={
-        "mr":"Mr","mrs":"Mrs","ms":"Ms","miss":"Miss",
-        "master":"Master","mstr":"Mstr","mst":"Mstr",
-        "dr":"Dr","prof":"Prof",
-    }
-    return mapping.get(low, raw)
-
-
-def _split_title_first_name(value, explicit_title=""):
-    """Return a short filename identity such as Mr-Amit / Mrs-Neha / Pravin."""
-    raw=re.sub(r"\s+"," ",str(value or "").strip())
-    title=_normal_title(explicit_title)
-    name=raw
-
-    # Remove one or more repeated leading honorifics from the name.
-    honorific_re=r"^(Mr|Mrs|Ms|Miss|Master|Mstr|Mst|Dr|Prof)\.?\s+"
-    while True:
-        m=re.match(honorific_re,name,re.I)
-        if not m:
-            break
-        if not title:
-            title=_normal_title(m.group(1))
-        name=re.sub(honorific_re,"",name,count=1,flags=re.I).strip()
-
-    # First useful personal name only.
-    # "Amit Sharma" -> Amit
-    # "Amit & Family" -> Amit
-    first=""
-    for token in re.split(r"[\s,/&+]+",name):
-        token=token.strip(" ._-")
-        if token:
-            first=token
-            break
-    first=_safe_filename_part(first or "Guest","Guest")
-
-    if title:
-        return f"{_safe_filename_part(title)}-{first}"
-    return first
-
-
-def _filename_person_short(person):
-    person=person or {}
-    return _split_title_first_name(
-        person.get("name") or person.get("full_name") or "Guest",
-        person.get("title") or person.get("passenger_title") or "",
-    )
-
-
-def _tour_client_short(data):
-    return _split_title_first_name(
-        (data or {}).get("client_name") or (data or {}).get("guest_name") or "Guest",
-        (data or {}).get("client_title") or (data or {}).get("guest_title") or "",
-    )
-
-
-def _tour_duration_short(data):
-    """Normalize Tour duration to 4N5D style without making the filename long."""
-    data=data or {}
-    candidates=[
-        data.get("duration"),
-        data.get("tour_title"),
-        data.get("travel_dates"),
-    ]
-    text=" | ".join(str(x or "") for x in candidates)
-
-    # 4N5D / 4 nights 5 days / 5 days 4 nights.
-    patterns=[
-        r"\b(\d+)\s*(?:n|night|nights)\s*[/+\-& ]*\s*(\d+)\s*(?:d|day|days)\b",
-        r"\b(\d+)\s*(?:d|day|days)\s*[/+\-& ]*\s*(\d+)\s*(?:n|night|nights)\b",
-    ]
-    m=re.search(patterns[0],text,re.I)
-    if m:
-        return f"{int(m.group(1))}N{int(m.group(2))}D"
-    m=re.search(patterns[1],text,re.I)
-    if m:
-        return f"{int(m.group(2))}N{int(m.group(1))}D"
-
-    # If only nights/days is provided, use the standard tour relation.
-    mn=re.search(r"\b(\d+)\s*(?:n|night|nights)\b",text,re.I)
-    md=re.search(r"\b(\d+)\s*(?:d|day|days)\b",text,re.I)
-    if mn and md:
-        return f"{int(mn.group(1))}N{int(md.group(1))}D"
-    if mn:
-        n=int(mn.group(1))
-        return f"{n}N{n+1}D"
-    if md:
-        d=int(md.group(1))
-        return f"{max(0,d-1)}N{d}D"
-
-    return "Tour"
-
-
-def _tour_document_type(data):
-    mode=str((data or {}).get("document_mode") or "itinerary").strip().lower()
-    if "quot" in mode:
-        return "Quotation"
-    if "vouch" in mode:
-        return "Voucher"
-    return "Itinerary"
-
-
-def _tour_detail_type(data):
-    detail=str((data or {}).get("detail_level") or "basic").strip().lower()
-    return "Detailed" if detail=="detailed" else "Basic"
-
-
-def _package_filename(data):
-    """Destination_4N5D_Mr-Amit_Detailed_Quotation.pdf"""
-    destination=_safe_filename_part(
-        (data or {}).get("destination") or (data or {}).get("tour_title") or "Tour",
-        "Tour",
-    )
-    duration=_tour_duration_short(data)
-    client=_tour_client_short(data)
-    detail=_tour_detail_type(data)
-    doc_type=_tour_document_type(data)
-    return f"{destination}_{duration}_{client}_{detail}_{doc_type}.pdf"
-
-
-def _title_for_person(person):
-    person = person or {}
-    title = str(person.get("title") or person.get("passenger_title") or "").strip()
-    if title:
-        return title.replace(".", "")
-    name = str(person.get("name") or person.get("full_name") or "").strip()
-    m = re.match(r"^(Mr|Mrs|Ms|Miss|Master|Mstr|Child|Infant)\.?\s+", name, re.I)
-    return m.group(1) if m else ""
-
-def _full_name_without_title(person):
-    person = person or {}
-    name = str(person.get("name") or person.get("full_name") or "").strip()
-    honorific = r"^(?:Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof|Child|Infant)\.?\s+"
-    while re.match(honorific, name, flags=re.I):
-        name = re.sub(honorific, "", name, count=1, flags=re.I).strip()
-    return name or "Guest"
-
-def _filename_person(person):
-    # Kept for compatibility with any older internal calls.
-    return _filename_person_short(person)
-
-
-def _first_data_value(data, keys):
-    data=data or {}
-    for key in keys:
-        value=data.get(key)
-        if value is not None and str(value).strip():
-            return value
-    return ""
-
-
-def _nested_first(data, container_keys):
-    data=data or {}
-    for key in container_keys:
-        items=data.get(key)
-        if isinstance(items,list) and items and isinstance(items[0],dict):
-            return items[0]
-        if isinstance(items,dict):
-            return items
-    return {}
-
-
-def _document_date(data, keys, nested_keys=()):
-    value=_first_data_value(data,keys)
-    if value:
-        return _dd_mm(value)
-    nested=_nested_first(data,nested_keys)
-    value=_first_data_value(nested,keys)
-    return _dd_mm(value)
-
-
-def _flight_route_filename_part(data):
-    segs=(data or {}).get("segments") or []
-    if not segs:
-        return "DEP-ARR"
-
-    def code(seg, dep=True):
-        if dep:
-            raw=seg.get("dep_code") or seg.get("departure_code")
-            airport=seg.get("dep_airport") or seg.get("departure_airport") or seg.get("dep_city")
-        else:
-            raw=seg.get("arr_code") or seg.get("arrival_code")
-            airport=seg.get("arr_airport") or seg.get("arrival_airport") or seg.get("arr_city")
-        raw=str(raw or "").strip().upper()
-        if re.fullmatch(r"[A-Z]{3}",raw):
-            return raw
-        return _airport_code(airport)
-
-    origin=code(segs[0],True)
-    final=code(segs[-1],False)
-
-    # Round trip: show actual destination rather than an unhelpful RPR-RPR.
-    if final==origin and len(segs)>=2:
-        route=[origin] + [code(s,False) for s in segs]
-        # Mid-point is normally the turnaround destination for direct/connecting RT.
-        destination=route[len(route)//2] if len(route)>=3 else code(segs[0],False)
-        if destination and destination!=origin:
-            return f"{origin}-{destination}_RT"
-
-    return f"{origin}-{final}"
-
-
-def _flight_filename(data):
-    passengers=(data or {}).get("passengers") or []
-    person=passengers[0] if passengers else {
-        "name":(data or {}).get("guest_name") or "Guest",
-        "title":(data or {}).get("guest_title") or "",
-    }
-    guest=_filename_person_short(person)
-    route=_flight_route_filename_part(data)
-    segs=(data or {}).get("segments") or []
-    first_seg=segs[0] if segs else {}
-    date=_dd_mm(
-        first_seg.get("dep_date")
-        or first_seg.get("departure_date")
-        or (data or {}).get("travel_date")
-        or (data or {}).get("journey_date")
-        or (data or {}).get("date")
-    )
-    return f"{route}_{guest}_{date}_Itinerary.pdf"
-
-
-def _bus_filename(data):
-    data=data or {}
-    passengers=data.get("passengers") or []
-    person=passengers[0] if passengers else {
-        "name":data.get("guest_name") or data.get("passenger_name") or "Guest",
-        "title":data.get("guest_title") or data.get("passenger_title") or "",
-    }
-    guest=_filename_person_short(person)
-
-    nested=_nested_first(data,("segments","journeys","trips"))
-    dep=_first_data_value(data,(
-        "dep_city","departure_city","from_city","origin_city","boarding_city","from","origin"
-    )) or _first_data_value(nested,(
-        "dep_city","departure_city","from_city","origin_city","boarding_city","from","origin"
-    ))
-    arr=_first_data_value(data,(
-        "arr_city","arrival_city","to_city","destination_city","dropping_city","to","destination"
-    )) or _first_data_value(nested,(
-        "arr_city","arrival_city","to_city","destination_city","dropping_city","to","destination"
-    ))
-
-    dep=_safe_filename_part(dep or "Departure","Departure")
-    arr=_safe_filename_part(arr or "Arrival","Arrival")
-
-    date=_document_date(
-        data,
-        ("journey_date","travel_date","departure_date","dep_date","boarding_date","bus_date","date"),
-        ("segments","journeys","trips"),
-    )
-    return f"{dep}-{arr}_{guest}_{date}_Itinerary.pdf"
-
-
-def _hotel_filename(data):
-    data=data or {}
-    guest_obj={
-        "name":data.get("guest_name") or data.get("passenger_name") or "Guest",
-        "title":data.get("guest_title") or data.get("title") or data.get("passenger_title") or "",
-    }
-    guest=_filename_person_short(guest_obj)
-    city=_safe_filename_part(data.get("hotel_city") or data.get("city") or "City","City")
-    date=_dd_mm(
-        data.get("check_in")
-        or data.get("checkin")
-        or data.get("check_in_date")
-        or data.get("arrival_date")
-        or data.get("date")
-    )
-    return f"{city}_{guest}_{date}_Voucher.pdf"
-
-
-def is_allowed(update: Update) -> bool:
-    return not ADMIN_USER_IDS or update.effective_user.id in ADMIN_USER_IDS
-
-
-def main_keyboard():
-    rows=[]
-    if button_enabled("main_tour") or button_enabled("main_air"):
-        row=[]
-        if button_enabled("main_tour"): row.append("üó∫Ô∏è Tour Guide")
-        if button_enabled("main_air"): row.append("‚úàÔ∏è Air Print")
-        rows.append(row)
-    if button_enabled("main_bus") or button_enabled("main_hotel"):
-        row=[]
-        if button_enabled("main_bus"): row.append("üöå Bus Print")
-        if button_enabled("main_hotel"): row.append("üè® Hotel Print")
-        rows.append(row)
-    rows.append(["ü§ñ Auto Creation"])
-    if button_enabled("main_ai"):
-        rows.append(["ü§ñ AI Assistant / New Request"])
-    # V160: saved-reference browsing is intentionally hidden. Generated documents
-    # are edited only from their own Modify & Regenerate / Voice-Text Edit buttons.
-    if button_enabled("main_settings"):
-        rows.append(["‚öôÔ∏è Settings"])
-    rows.append(["‚ùå Cancel"])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-
-def generated_document_keyboard(reference, kind=None):
-    rows = []
-    if kind == 'package':
-        # V156: restore the proven Tour print controls directly under the PDF.
-        # Changes are staged through the existing mod_* callbacks and applied by Done.
-        if button_enabled('page_size_controls'):
-            rows.append([
-                InlineKeyboardButton('üìê Page Size', callback_data=f'mod_size:{reference}'),
-                InlineKeyboardButton('üßæ Footer', callback_data=f'mod_footer_menu:{reference}')
-            ])
-        rows.append([InlineKeyboardButton('‚ö° Auto Size', callback_data=f'autofit:{reference}')])
-        rows.append([InlineKeyboardButton('üè¢ B2B', callback_data=f'mod_b2b:{reference}')])
-        rows.append([InlineKeyboardButton('‚úÖ Done ‚Ä¢ Make Again', callback_data=f'mod_done:{reference}')])
-        rows.append([InlineKeyboardButton('üõ†Ô∏è Modify & Regenerate', callback_data=f'modify:{reference}')])
-    elif kind in ('flight', 'bus', 'hotel'):
-        if button_enabled('make_changes'):
-            rows.append([InlineKeyboardButton('üéôÔ∏è Voice / Text Edit', callback_data=f'voice_edit:{reference}')])
-        rows.append([InlineKeyboardButton('‚ö° Quick Auto Fit', callback_data=f'autofit:{reference}')])
-        rows.append([InlineKeyboardButton('üõ†Ô∏è Modify & Regenerate', callback_data=f'modify:{reference}')])
-    else:
-        if button_enabled('make_changes'):
-            rows.append([InlineKeyboardButton('ü§ñ Smart Make Changes', callback_data=f'edit_generated:{reference}')])
-        rows.append([InlineKeyboardButton('üõ†Ô∏è Modify & Regenerate', callback_data=f'modify:{reference}')])
-    return InlineKeyboardMarkup(rows)
-
-def ready_keyboard():
-    return main_keyboard()
-
-
-
-def _display_filename(name, max_len=42):
-    name = str(name or "Document")
-    if len(name) <= max_len:
-        return name
-    return name[:max_len-3] + "..."
-
-
-def _record_caption(reference, prefix, extra=""):
-    # V160: reference IDs stay internal. The owner edits the document from the
-    # buttons attached to that PDF, so there is no need to expose MTBxx in chat.
-    text = str(prefix or "")
-    if extra:
-        text += f"\n{extra}"
-    return text
-
-
-# ------------------------------------------------------------
-# Adaptive print/edit controls
-# ------------------------------------------------------------
-PAGE_SIZE_OPTIONS = ("A5", "A4", "Letter", "Legal", "A3")
-
-def _normalize_page_size(value):
-    raw = re.sub(r"[^a-z0-9]", "", str(value or "").lower())
-    aliases = {
-        "a5":"A5", "a4":"A4", "a3":"A3",
-        "letter":"Letter", "usletter":"Letter",
-        "legal":"Legal", "uslegal":"Legal",
-        "auto":"auto", "automatic":"auto",
-    }
-    return aliases.get(raw, "")
-
-def _hotel_date_value(value):
-    raw=re.sub(r'(?i)(\d)(st|nd|rd|th)\b',r'\1',str(value or ''))
-    raw=re.sub(r'[,|]',' ',raw)
-    raw=re.sub(r'\s+',' ',raw).strip()
-    formats=(
-        '%d %b %Y','%d %B %Y','%Y-%m-%d','%d-%m-%Y','%d/%m/%Y',
-        '%d %b %y','%d %B %y','%d-%b-%Y','%d-%B-%Y'
-    )
-    # Extract a date token from labels/times around it.
-    candidates=[raw]
-    m=re.search(r'(?i)\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})\b',raw)
-    if m: candidates.insert(0,m.group(1))
-    m=re.search(r'\b(\d{4}-\d{1,2}-\d{1,2})\b',raw)
-    if m: candidates.insert(0,m.group(1))
-    m=re.search(r'\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b',raw)
-    if m: candidates.insert(0,m.group(1))
-    for cand in candidates:
-        for fmt in formats:
-            try: return datetime.strptime(cand,fmt)
-            except Exception: pass
-    return None
-
-
-def _hotel_night_count(data, explicit=None):
-    if explicit:
-        try:
-            n=int(float(explicit))
-            if n>0: return n
-        except Exception: pass
-    raw=str((data or {}).get('nights') or '')
-    m=re.search(r'(\d+)',raw)
-    if m and int(m.group(1))>0:
-        return int(m.group(1))
-    ci=_hotel_date_value((data or {}).get('check_in'))
-    co=_hotel_date_value((data or {}).get('check_out'))
-    if ci and co:
-        days=(co-ci).days
-        if days>0: return days
-    return 0
-
-
-def _hotel_room_count(data, explicit=None):
-    if explicit:
-        try:
-            n=int(float(explicit))
-            if n>0: return n
-        except Exception: pass
-    try:
-        n=int(float((data or {}).get('room_count') or 0))
-        if n>0: return n
-    except Exception: pass
-    raw=' '.join(str((data or {}).get(k) or '') for k in ('room_type','occupancy_summary'))
-    m=re.search(r'(?i)\b(\d+)\s*(?:room|rooms)\b',raw)
-    return int(m.group(1)) if m else 1
-
-
-def _hotel_extra_bed_count(data, explicit=None):
-    if explicit is not None:
-        try:
-            n=int(float(explicit))
-            if n>=0: return n
-        except Exception: pass
-    try:
-        n=int(float((data or {}).get('extra_bed_count') or 0))
-        if n>=0 and n>0: return n
-    except Exception: pass
-    raw=' '.join(str((data or {}).get(k) or '') for k in ('room_type','occupancy_summary'))
-    # Supplier vouchers often call occupants above the normal room capacity
-    # "extra persons" instead of explicitly writing "extra beds".  For hotel
-    # customer costing those are the chargeable EB units.
-    m=re.search(r'(?i)\b(?:includes?\s*)?(\d+)\s*(?:extra\s*(?:beds?|mattresses?|persons?|pax)|eb)\b',raw)
-    return int(m.group(1)) if m else 0
-
-
-def _parse_hotel_cost_input(value, supplier_total=0, data=None):
-    """Natural Hotel costing with room/night and EB/night calculation."""
-    raw=str(value or '').strip().replace('‚Çπ',' ').replace(',','')
-    low=re.sub(r'\s+',' ',raw.lower()).strip()
-    if not low:
-        raise ValueError('Write the room/night rate, EB/night rate, or final hotel total naturally.')
-
-    def amount(patterns):
-        for pat in patterns:
-            m=re.search(pat,low,re.I)
-            if m: return float(m.group(1))
-        return None
-
-    explicit_nights=amount([r'\b(\d+)\s*nights?\b'])
-    explicit_rooms=amount([r'\b(\d+)\s*rooms?\b'])
-    # Keep EB quantity separate from its rate. In "room 4000 eb 1500",
-    # 4000 is the room rate‚Äînot 4000 extra beds.
-    explicit_eb_count=amount([
-        r'\b(?:eb|extra\s*(?:bed|beds|mattress|mattresses))\s*(?:count|qty|quantity)\b[^0-9]{0,8}(\d+)',
-        r'\b(\d+)\s*extra\s*(?:beds|mattresses)\b',
-        r'\b(\d+)\s*ebs?\s*(?:@|x)\b',
-    ])
-
-    nights=_hotel_night_count(data,explicit_nights)
-    rooms=_hotel_room_count(data,explicit_rooms)
-    extra_beds=_hotel_extra_bed_count(data,explicit_eb_count)
-
-    final_total=amount([
-        r'\b(?:make\s+(?:it\s+)?total|set\s+(?:the\s+)?total|final\s*(?:hotel\s*)?(?:cost|total|amount)|grand\s*total|total\s*(?:hotel\s*)?(?:cost|amount)?)\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
-        r'([0-9]+(?:\.[0-9]+)?)\s*(?:final|grand\s*total|total)\b',
-    ])
-
-    # Markup language is detected before direct rate parsing.
-    markup_word=bool(re.search(r'(?i)^\s*[+-]|\b(?:add|markup|mark\s*up|increase|plus|reduce|less|minus|deduct)\b',low))
-    markup_amount=amount([r'(?i)(?:^\s*[+-]\s*|\b(?:add|markup|mark\s*up|increase|plus|reduce|less|minus|deduct)\b[^0-9]{0,15})([0-9]+(?:\.[0-9]+)?)'])
-    minus=bool(re.search(r'(?i)^\s*-|\b(?:reduce|less|minus|deduct)\b',low))
-    per_room_night=bool(re.search(r'(?i)\b(?:per\s*room\s*(?:per|/)?\s*night|room\s*/\s*night|per\s*night\s*per\s*room)\b',low))
-
-    existing=(data or {}).get('customer_hotel_cost') or {}
-
-    rate_scope='room'
-    if markup_word and markup_amount is not None:
-        if per_room_night:
-            if nights<=0:
-                raise ValueError('I could not determine the number of nights from check-in/check-out. Include the nights or enter a final total.')
-            base_rate=float(existing.get('room_rate_per_night') or existing.get('per_room') or 0)
-            if base_rate<=0 and float(supplier_total or 0)>0:
-                base_rate=float(supplier_total)/(max(1,rooms)*nights)
-            if base_rate<=0:
-                raise ValueError('Per-room/night markup needs an existing supplier/customer base. Enter the new room rate directly instead.')
-            room_rate=base_rate-markup_amount if minus else base_rate+markup_amount
-            eb_rate=float(existing.get('eb_rate_per_night') or existing.get('eb') or 0)
-        else:
-            base=float(existing.get('total') or supplier_total or 0)
-            if base<=0:
-                raise ValueError('A hotel markup needs an existing total. Enter the final total directly.')
-            total=base-markup_amount if minus else base+markup_amount
-            return {
-                'per_room':None,'eb':None,'room_rate_per_night':None,'eb_rate_per_night':None,
-                'rooms':rooms,'nights':nights,'extra_beds':extra_beds,
-                'room_total':None,'eb_total':None,'total':total,'currency':'INR','mode':'direct_total'
-            }
-    else:
-        room_rate=amount([
-            r'\b(?:room\s*(?:rate|cost|price)?|per\s*room)\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
-            r'([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*)?room(?:\s*(?:per|/)\s*night)?\b',
-            r'([0-9]+(?:\.[0-9]+)?)\s*(?:room\s*/\s*night)\b',
-        ])
-        # A plain nightly amount means the complete hotel booking per night. It
-        # is multiplied by nights only; an explicit "per room" rate continues
-        # to multiply by rooms as before.
-        if room_rate is None:
-            room_rate=amount([
-                r'([0-9]+(?:\.[0-9]+)?)\s*(?:/|per|for)\s*night\b',
-                r'\b(?:for|per)\s*(?:each\s*)?night\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
-                r'\bnight(?:ly)?\s*(?:rate|cost|amount|price)?\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
-            ])
-            if room_rate is not None: rate_scope='hotel'
-        eb_rate=amount([
-            r'\b(?:eb|extra\s*(?:bed|mattress))(?:\s*(?:rate|cost|price))?\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
-            r'([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*)?(?:eb|extra\s*(?:bed|mattress))(?:\s*(?:per|/)\s*night)?\b',
-        ])
-
-    # An explicit final total wins when no per-night rate is being supplied.
-    if final_total is not None and room_rate is None and eb_rate is None and not markup_word:
-        return {
-            'per_room':None,'eb':None,'room_rate_per_night':None,'eb_rate_per_night':None,
-            'rooms':rooms,'nights':nights,'extra_beds':extra_beds,
-            'room_total':None,'eb_total':None,'total':final_total,'currency':'INR','mode':'direct_total'
-        }
-
-    # Plain number = final total, keeping the old easy behavior.
-    if room_rate is None and eb_rate is None:
-        nums=re.findall(r'([0-9]+(?:\.[0-9]+)?)',low)
-        if len(nums)==1 and not re.search(r'(?i)\b(?:room|night|eb|extra\s*bed)\b',low):
-            total=float(nums[0])
-            return {
-                'per_room':None,'eb':None,'room_rate_per_night':None,'eb_rate_per_night':None,
-                'rooms':rooms,'nights':nights,'extra_beds':extra_beds,
-                'room_total':None,'eb_total':None,'total':total,'currency':'INR','mode':'direct_total'
-            }
-        raise ValueError('I could not understand the hotel rate. Example: 3500 per room per night, EB 1200 per night, or total 25000.')
-
-    if nights<=0:
-        raise ValueError('I could not determine nights from the hotel check-in/check-out. Add the number of nights or enter a final total.')
-    rooms=max(1,rooms)
-    if eb_rate is not None and extra_beds<=0:
-        extra_beds=1
-
-    billed_rooms=1 if rate_scope=='hotel' else rooms
-    room_total=(float(room_rate or 0)*billed_rooms*nights)
-    eb_total=(float(eb_rate or 0)*extra_beds*nights)
-    total=room_total+eb_total
-    return {
-        'per_room':room_rate,'eb':eb_rate,
-        'room_rate_per_night':room_rate,'eb_rate_per_night':eb_rate,
-        'rooms':billed_rooms,'source_rooms':rooms,'nights':nights,'extra_beds':extra_beds,
-        'room_total':room_total,'eb_total':eb_total,'total':total,
-        'currency':'INR','mode':'calculated','rate_scope':rate_scope
-    }
-
-
-def _hotel_cost_confirmation(cost):
-    c=cost or {}
-    total=float(c.get('total') or 0)
-    if c.get('mode')=='direct_total' or c.get('room_rate_per_night') is None:
-        return f"‚úÖ *Hotel cost understood:* Final Total Hotel Cost ‚Üí *INR {total:,.0f}*"
-    rooms=int(c.get('rooms') or 1); nights=int(c.get('nights') or 0)
-    room_rate=float(c.get('room_rate_per_night') or 0); room_total=float(c.get('room_total') or 0)
-    rate_label='Hotel / Night' if c.get('rate_scope')=='hotel' else 'Room'
-    lines=[
-        "‚úÖ *Hotel cost understood:*",
-        (f"{rate_label}: INR {room_rate:,.0f} √ó {nights} night(s) = *INR {room_total:,.0f}*"
-         if c.get('rate_scope')=='hotel' else
-         f"{rate_label}: INR {room_rate:,.0f} √ó {rooms} room(s) √ó {nights} night(s) = *INR {room_total:,.0f}*"),
-    ]
-    if float(c.get('eb_rate_per_night') or 0)>0:
-        eb_rate=float(c.get('eb_rate_per_night') or 0); eb_count=int(c.get('extra_beds') or 0); eb_total=float(c.get('eb_total') or 0)
-        lines.append(f"Extra Bed: INR {eb_rate:,.0f} √ó {eb_count} EB √ó {nights} night(s) = *INR {eb_total:,.0f}*")
-    lines.append(f"*Total Hotel Cost: INR {total:,.0f}*")
-    return "\\n".join(lines)
-
-
-async def _apply_pending_fare_input(message, context, kind, instruction):
-    """Apply one Air/Bus/Hotel Add Cost reply from either text or voice."""
-    if kind not in ('flight','bus','hotel'):
-        return False
-    _cancel_auto_print(context)
-    data_key=f'pending_{kind}_data'
-    if not context.user_data.get(data_key):
-        context.user_data.pop('pending_fare_kind',None)
-        await message.reply_text(
-            f'‚ùå The {kind.title()} cost session expired. Open {kind.title()} Print and send the supplier file again.',
-            reply_markup=main_keyboard(),
-        )
-        return True
-    supplier_total=float(context.user_data.get('pending_fare_supplier_total',0) or 0)
-    try:
-        if kind=='hotel':
-            hdata=copy.deepcopy(context.user_data.get('pending_hotel_data') or {})
-            hotel_cost=_parse_hotel_cost_input(instruction,supplier_total,hdata)
-            hdata['customer_hotel_cost']=hotel_cost
-            context.user_data['pending_hotel_data']=hdata
-            fare=float(hotel_cost.get('total') or 0) or None
-        else:
-            source_data=context.user_data.get(data_key) or {}
-            include_infants=_fare_include_infants(instruction)
-            pax_count=_fare_pax_count(source_data,include_infants=include_infants)
-            fare=_parse_markup_input(instruction,supplier_total,pax_count)
-    except ValueError as exc:
-        context.user_data['pending_fare_kind']=kind
-        hint=('`3500 per night`, `room 4200 and EB 1200 per night`, or `total 25000`'
-              if kind=='hotel' else '`7615 pp`, `+403 pp`, or `68535 total`')
-        await message.reply_text(f'‚ùå {exc}\n\nExamples: {hint}',parse_mode='Markdown')
-        return True
-
-    context.user_data.pop('pending_fare_kind',None)
-    context.user_data[f'pending_{kind}_fare']=fare
-    if kind in ('flight','bus'):
-        await message.reply_text(_fare_cost_confirmation(instruction,supplier_total,fare,pax_count),parse_mode='Markdown')
-    else:
-        await message.reply_text(_hotel_cost_confirmation(hotel_cost),parse_mode='Markdown')
-    try:
-        await ask_footer_choice(message,context,kind)
-    except Exception as exc:
-        logger.exception('PDF generation from Add Cost failed')
-        await message.reply_text(
-            f'‚ùå PDF generation failed.\n\nReason: `{str(exc)[:800]}`',
-            parse_mode='Markdown',reply_markup=main_keyboard(),
-        )
-    return True
-
-
-
-def _parse_markup_input(value, supplier_total=0, pax_count=1):
-    """Natural Air/Bus customer-fare parser.
-
-    OWNER RULE FOR PER-PAX INPUT:
-      Supplier PP = supplier total / eligible pax
-
-      `7615 pp` / `7615 per pax` / `7615 per person` / `7615 each`
-          -> desired SELLING fare per pax when the amount is at/above supplier PP
-          -> final total = selling PP √ó eligible pax
-
-      `403 pp` with no prefix, when 403 is below supplier PP
-          -> smart interpretation = markup INR 403 per eligible pax
-
-      `+403 pp` / `markup 403 pp` / `add 403 per pax`
-          -> explicit markup per eligible pax
-
-      `-200 pp` / `reduce 200 per pax`
-          -> explicit reduction per eligible pax
-
-      `68535 total` / plain `68535`
-          -> final booking total
-    """
-    raw = str(value or "").strip().replace(",", "")
-    low = raw.lower().replace("‚Çπ", " ")
-    low = re.sub(r"(?i)\b(?:inr|rs\.?)\b", " ", low)
-    if not low.strip():
-        raise ValueError("Write the final total or per-pax selling fare naturally.")
-
-    numbers = re.findall(r"(?<![A-Za-z])([0-9]+(?:\.[0-9]+)?)", low)
-    if not numbers:
-        raise ValueError("I could not find an amount in that reply.")
-    amount = float(numbers[0])
-
-    pax_count = max(1, int(pax_count or 1))
-    per_person = bool(re.search(r"(?i)(?:\bper\s*(?:person|pax|passenger)\b|\beach\b|(?<![A-Za-z])pp\b)", low))
-    minus = bool(re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b", low))
-    plus = bool(re.search(r"(?i)^\s*\+|\b(?:add|plus|increase|markup|mark\s*up)\b", low))
-    explicit_selling = bool(re.search(
-        r"(?i)\b(?:sell(?:ing)?|customer\s*(?:fare|rate|price)|"
-        r"final\s*(?:fare|rate|price)|make\s+(?:it\s+)?|set\s+(?:it\s+)?(?:to\s+)?)\b",
-        low,
-    ))
-    final_hint = bool(re.search(
-        r"(?i)\b(?:final\s*(?:fare|total|amount)|customer\s*(?:fare|total|amount)|"
-        r"make\s+(?:it\s+)?total|set\s+(?:the\s+)?total|direct\s+total|total\s+amount|total\s+fare)\b",
-        low,
-    ))
-
-    base = float(supplier_total or 0)
-
-    if per_person:
-        if base <= 0:
-            return float(amount * pax_count)
-
-        supplier_pp = base / pax_count
-
-        if plus or minus:
-            # Explicit markup/reduction always wins.
-            delta = amount * pax_count
-            fare = base - delta if minus else base + delta
-        elif explicit_selling:
-            # Explicitly requested customer/selling PP.
-            fare = amount * pax_count
-        elif amount >= supplier_pp:
-            # Plain 7615 pp when supplier PP is 7212:
-            # owner is giving the desired customer selling PP.
-            fare = amount * pax_count
-        else:
-            # Smart shorthand: a plain amount materially below supplier PP is
-            # treated as markup per pax. Example supplier PP 7212, reply `403 pp`.
-            fare = base + (amount * pax_count)
-
-    elif plus or minus:
-        if base <= 0:
-            raise ValueError("A markup needs an original supplier fare. Otherwise enter the final total directly.")
-        fare = base - amount if minus else base + amount
-
-    elif final_hint or re.fullmatch(
-        r"\s*(?:‚Çπ|inr|rs\.?)?\s*[0-9]+(?:\.[0-9]+)?\s*(?:total|final)?\s*",
-        raw,
-        re.I,
-    ):
-        fare = amount
-
-    else:
-        # Plain amount without per-pax/markup wording = final booking total.
-        fare = amount
-
-    if fare < 0:
-        raise ValueError("Updated fare cannot be negative.")
-    return float(fare)
-
-
-def _fare_pp_mode(value, supplier_total, pax_count):
-    """Describe how a per-pax reply is interpreted for confirmation text."""
-    raw=str(value or "").strip().replace(",","")
-    low=raw.lower().replace("‚Çπ"," ")
-    low=re.sub(r"(?i)\b(?:inr|rs\.?)\b"," ",low)
-    nums=re.findall(r"(?<![A-Za-z])([0-9]+(?:\.[0-9]+)?)",low)
-    amount=float(nums[0]) if nums else 0.0
-    pax_count=max(1,int(pax_count or 1))
-    supplier_total=float(supplier_total or 0)
-    supplier_pp=(supplier_total/pax_count) if supplier_total>0 else 0.0
-    minus=bool(re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b",low))
-    plus=bool(re.search(r"(?i)^\s*\+|\b(?:add|plus|increase|markup|mark\s*up)\b",low))
-    explicit_selling=bool(re.search(
-        r"(?i)\b(?:sell(?:ing)?|customer\s*(?:fare|rate|price)|"
-        r"final\s*(?:fare|rate|price)|make\s+(?:it\s+)?|set\s+(?:it\s+)?(?:to\s+)?)\b",
-        low,
-    ))
-    if minus:
-        return "reduce",amount,supplier_pp
-    if plus:
-        return "markup",amount,supplier_pp
-    if explicit_selling or amount >= supplier_pp:
-        return "selling_pp",amount,supplier_pp
-    return "smart_markup",amount,supplier_pp
-
-
-def _fare_num(value):
-    value=float(value or 0)
-    if abs(value-round(value)) < 0.005:
-        return f"{round(value):,.0f}"
-    return f"{value:,.2f}"
-
-def _is_infant_passenger(p):
-    raw=" ".join(str((p or {}).get(k) or "") for k in ("type","title","name")).lower()
-    return bool(re.search(r"\b(?:infant|inf|baby)\b", raw))
-
-
-def _fare_pax_count(data, include_infants=False):
-    """Count chargeable pax for per-person fares/markups.
-
-    By default Infant/INF passengers are excluded. They are included only when
-    the owner's cost reply explicitly asks to include infants.
-    """
-    data=data or {}
-    passengers=data.get("passengers") or []
-    source_total=int(data.get('_source_passenger_count') or 0)
-    source_chargeable=int(data.get('_source_chargeable_passenger_count') or 0)
-    if not passengers:
-        return max(1,source_total if include_infants else source_chargeable)
-    if include_infants:
-        return max(1,len(passengers),source_total)
-    eligible=[p for p in passengers if not _is_infant_passenger(p)]
-    return max(1,len(eligible),source_chargeable)
-
-
-def _fare_include_infants(text):
-    low=str(text or "").lower()
-    return bool(re.search(
-        r"\b(?:include|including|add|with)\s+(?:the\s+)?(?:infant|infants|inf)\b|"
-        r"\b(?:infant|infants|inf)\s+(?:also|included)\b",
-        low,
-        re.I,
-    ))
-
-
-def _fare_cost_confirmation(value, supplier_total, final_fare, pax_count):
-    raw=str(value or "").strip()
-    low=raw.lower()
-    nums=re.findall(r"([0-9]+(?:\.[0-9]+)?)",raw.replace(",",""))
-    amount=float(nums[0]) if nums else 0
-    pax_count=max(1,int(pax_count or 1))
-    supplier_total=float(supplier_total or 0)
-    per_person=bool(re.search(r"(?i)(?:\bper\s*(?:person|pax|passenger)\b|\beach\b|(?<![A-Za-z])pp\b)",low))
-    markup=bool(re.search(r"(?i)^\s*[+-]|\b(?:add|plus|increase|markup|mark\s*up|reduce|less|minus|deduct|discount)\b",low))
-
-    if per_person and not supplier_total:
-        return (
-            f"‚úÖ *Cost understood:*\n"
-            f"Selling Fare PP: *INR {_fare_num(amount)}*\n"
-            f"Eligible Pax: *{pax_count}*\n"
-            f"Final Customer Total: *INR {_fare_num(final_fare)}*\n\n"
-            f"The Air Print will distribute this total into Base Fare and Taxes & Fees.\n"
-            f"Infant: *Excluded by default*"
-        )
-
-    if per_person and supplier_total:
-        mode,entered,supplier_pp=_fare_pp_mode(raw,supplier_total,pax_count)
-
-        if mode in ("selling_pp","smart_markup","markup","reduce"):
-            if mode=="selling_pp":
-                selling_pp=entered
-                markup_pp=selling_pp-supplier_pp
-                interpretation="Selling fare per pax"
-            elif mode=="reduce":
-                markup_pp=-entered
-                selling_pp=supplier_pp-entered
-                interpretation="Per-pax reduction"
-            else:
-                markup_pp=entered
-                selling_pp=supplier_pp+entered
-                interpretation=(
-                    "Per-pax markup"
-                    if mode=="markup"
-                    else "Smart per-pax markup"
-                )
-
-            return (
-                f"‚úÖ *Cost understood:*\n"
-                f"Supplier Total: *INR {_fare_num(supplier_total)}*\n"
-                f"Eligible Pax: *{pax_count}*\n"
-                f"Supplier Fare PP: *INR {_fare_num(supplier_pp)}*\n\n"
-                f"Interpretation: *{interpretation}*\n"
-                f"Your Selling Fare PP: *INR {_fare_num(selling_pp)}*\n"
-                f"Markup PP: *INR {_fare_num(markup_pp)}*\n\n"
-                f"Final Customer Total: *INR {_fare_num(final_fare)}*\n"
-                f"Infant: *Excluded by default*"
-            )
-
-    sign="‚àí" if re.search(r"(?i)^\s*-|\b(?:reduce|less|minus|deduct|discount)\b",low) else "+"
-    if markup and supplier_total:
-        return (
-            f"‚úÖ *Cost understood:* Supplier INR {_fare_num(supplier_total)} {sign} "
-            f"INR {_fare_num(amount)} ‚Üí *Final INR {_fare_num(final_fare)}*"
-        )
-    return f"‚úÖ *Cost understood:* Final customer fare ‚Üí *INR {_fare_num(final_fare)}*"
-
-def _is_payment_total_label(label):
-    """True for summary rows that must not be counted again as charge components."""
-    text=re.sub(r"\s+"," ",str(label or "")).strip().lower()
-    if not text:
-        return False
-    return bool(re.fullmatch(
-        r"(?:grand\s+total|gross\s+total|total\s+fare|total\s+amount|"
-        r"booking\s+total|net\s+(?:amount|payable)|amount\s+(?:paid|payable)|"
-        r"final\s+(?:fare|amount|total)|total\s+price|payable\s+amount)",
-        text,
-        re.I,
-    ))
-
-
-def _supplier_component_total(data):
-    """Sum distinct non-negative supplier charge rows, excluding summary totals."""
-    total=0.0
-    found=False
-    for item in ((data or {}).get("payment_items") or []):
-        if not isinstance(item,dict):
-            continue
-        label=str(item.get("label") or "").strip()
-        if not label or _is_payment_total_label(label):
-            continue
-        try:
-            amount=float(item.get("amount") or 0)
-        except Exception:
-            continue
-        if amount < 0:
-            continue
-        total += amount
-        found=True
-    return total if found else 0.0
-
-
-def _supplier_total(data):
-    """Reconcile the supplier payable total before owner markup is applied.
-
-    Priority:
-    - A valid gross/payable total is used when it agrees with the charge rows.
-    - If charge rows are materially HIGHER than gross_total, gross_total is treated
-      as a bad extraction because genuine non-negative charge rows cannot add up to
-      more than the payable amount. The component sum wins.
-    - If gross_total is higher than the known component sum, gross_total can still
-      be valid because an omitted supplier charge may exist.
-    """
-    data=data or {}
-    try:
-        gross=float(data.get("gross_total",0) or 0)
-    except Exception:
-        gross=0.0
-
-    components=_supplier_component_total(data)
-
-    # If line items exceed gross by more than a tiny extraction/rounding tolerance,
-    # the gross field is inconsistent. Use the complete charge-line sum.
-    if components > 0 and gross > 0:
-        tolerance=max(2.0, gross*0.01)
-        if components > gross + tolerance:
-            return components
-        return gross
-
-    if gross > 0:
-        return gross
-    if components > 0:
-        return components
-
-    try:
-        base=float(data.get("base_fare",0) or 0)
-        taxes=float(data.get("taxes",0) or 0)
-        return max(0.0,base+taxes)
-    except Exception:
-        return 0.0
-
-def _parse_reply_controls(instruction, current_fare, data, current_footer=False, current_logo=True, current_page_size="auto"):
-    """Parse deterministic document commands before field-specific local edits."""
-    original = str(instruction or "").strip()
-    text = original
-    lower = text.lower()
-    changed = False
-    controls = {
-        "fare": current_fare,
-        "footer": current_footer,
-        "footer_mode": "design" if current_footer else "none",
-        "logo": current_logo,
-        "page_size": current_page_size or "auto",
-    }
-
-    # Footer 2 commands: use the supplied Travel Contact Card artwork.
-    if (re.fullmatch(r"\s*(footer\s*2|footer2|use footer 2|use footer2|contact card)\s*", lower)
-            or re.search(r"\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+(?:footer\s*2|footer2|contact card)\b", lower)):
-        controls["footer"] = True; controls["footer_mode"] = "footer2"; changed = True
-        text = re.sub(r"(?i)\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+(?:footer\s*2|footer2|contact card)\b", "", text)
-        text = re.sub(r"(?i)^\s*(footer\s*2|footer2|use footer 2|use footer2|contact card)\s*$", "", text)
-
-    # Smart footer/design commands. These intentionally work as natural-language shortcuts
-    # on any Air/Bus/Hotel reference: "design" switches to the full footer design, while
-    # "contact bar" switches to the compact contact bar.
-    if (re.fullmatch(r"\s*(footer\s*1|footer1|old design|use footer 1)\s*", lower)
-            or re.search(r"\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+(?:footer\s*1|footer1|old design)\b", lower)):
-        controls["footer"] = True; controls["footer_mode"] = "design"; changed = True
-        text = re.sub(r"(?i)\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+(?:footer\s*1|footer1|old design)\b", "", text)
-        text = re.sub(r"(?i)^\s*(footer\s*1|footer1|old design|use footer 1)\s*$", "", text)
-    elif (re.fullmatch(r"\s*(footer\s*2|footer2|new design|use footer 2)\s*", lower)
-            or re.search(r"\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+(?:footer\s*2|footer2|new design)\b", lower)):
-        controls["footer"] = True; controls["footer_mode"] = "footer2"; changed = True
-        text = re.sub(r"(?i)\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+(?:footer\s*2|footer2|new design)\b", "", text)
-        text = re.sub(r"(?i)^\s*(footer\s*2|footer2|new design|use footer 2)\s*$", "", text)
-    elif (re.fullmatch(r"\s*(design|use design|footer design)\s*", lower)
-            or re.search(r"\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+design\b", lower)):
-        controls["footer"] = True; controls["footer_mode"] = "design"; changed = True
-        text = re.sub(r"(?i)\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+design\b", "", text)
-        text = re.sub(r"(?i)^\s*(design|use design|footer design)\s*$", "", text)
-    elif (re.fullmatch(r"\s*(contact bar|footer bar|use contact bar|use footer bar)\s*", lower)
-          or re.search(r"\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+(?:contact|footer)\s+bar\b", lower)):
-        controls["footer"] = True; controls["footer_mode"] = "bar"; changed = True
-        text = re.sub(r"(?i)\b(?:switch|change|replace|use|make)\s+(?:it|the footer)\s+(?:to|as|with)\s+(?:contact|footer)\s+bar\b", "", text)
-        text = re.sub(r"(?i)^\s*(contact bar|footer bar|use contact bar|use footer bar)\s*$", "", text)
-
-    # Footer controls.  Supported edit commands:
-    #   add footer bar / add contact bar
-    #   add footer design
-    #   remove footer / without footer
-    if re.search(r"\b(?:remove|delete|without|no)\s+(?:the\s+)?footer\b", lower) or re.search(r"\bfooter\s+(?:remove|off)\b", lower):
-        controls["footer"] = False; controls["footer_mode"] = "none"; changed = True
-        text = re.sub(r"(?i)\b(?:remove|delete|without|no)\s+(?:the\s+)?footer\b", "", text)
-        text = re.sub(r"(?i)\bfooter\s+(?:remove|off)\b", "", text)
-    elif re.search(r"\b(?:add|include|with|put|use)\s+(?:the\s+)?(?:mytourbazar\s+)?(?:contact\s+)?footer\s+bar\b", lower) or re.search(r"\b(?:add|use)\s+contact\s+bar\b", lower):
-        controls["footer"] = True; controls["footer_mode"] = "bar"; changed = True
-        text = re.sub(r"(?i)\b(?:add|include|with|put|use)\s+(?:the\s+)?(?:mytourbazar\s+)?(?:contact\s+)?footer\s+bar\b", "", text)
-        text = re.sub(r"(?i)\b(?:add|use)\s+contact\s+bar\b", "", text)
-    elif re.search(r"\b(?:add|include|with|put|use)\s+(?:the\s+)?footer\s+design\b", lower):
-        controls["footer"] = True; controls["footer_mode"] = "design"; changed = True
-        text = re.sub(r"(?i)\b(?:add|include|with|put|use)\s+(?:the\s+)?footer\s+design\b", "", text)
-    elif re.search(r"\b(?:add|include|with|put|use)\s+(?:the\s+)?footer\b", lower) or re.search(r"\bfooter\s+(?:add|on)\b", lower):
-        controls["footer"] = True; controls["footer_mode"] = "design"; changed = True
-        text = re.sub(r"(?i)\b(?:add|include|with|put)\s+(?:the\s+)?footer\b", "", text)
-        text = re.sub(r"(?i)\bfooter\s+(?:add|on)\b", "", text)
-
-    # MyTourBazar logo controls. Airline logos are independent and are never disabled by this.
-    if re.search(r"\b(remove|delete|without|no)\s+(the\s+)?(mytourbazar\s+)?logo\b", lower) or re.search(r"\blogo\s+(remove|off)\b", lower):
-        controls["logo"] = False; changed = True
-        text = re.sub(r"(?i)\b(remove|delete|without|no)\s+(the\s+)?(mytourbazar\s+)?logo\b", "", text)
-        text = re.sub(r"(?i)\blogo\s+(remove|off)\b", "", text)
-    elif re.search(r"\b(add|include|with|put|use)\s+(the\s+)?(mytourbazar\s+)?logo\b", lower) or re.search(r"\blogo\s+(add|on)\b", lower):
-        controls["logo"] = True; changed = True
-        text = re.sub(r"(?i)\b(add|include|with|put|use)\s+(the\s+)?(mytourbazar\s+)?logo\b", "", text)
-        text = re.sub(r"(?i)\blogo\s+(add|on)\b", "", text)
-
-    # Page-size commands. Supports: "page size A3", "change page to legal", "A3", "auto page size".
-    size = ""
-    m = re.search(r"(?i)\b(?:page\s*size|paper\s*size|page|paper)\s*(?:to|=|:)??\s*(a5|a4|a3|letter|legal|auto|automatic)\b", text)
-    if m: size = _normalize_page_size(m.group(1))
-    elif re.fullmatch(r"(?i)\s*(a5|a4|a3|letter|legal|auto|automatic)\s*", text): size = _normalize_page_size(text)
-    if size:
-        controls["page_size"] = size; changed = True
-        text = re.sub(r"(?i)\b(?:page\s*size|paper\s*size|page|paper)\s*(?:to|=|:)??\s*(a5|a4|a3|letter|legal|auto|automatic)\b", "", text)
-        text = re.sub(r"(?i)^\s*(a5|a4|a3|letter|legal|auto|automatic)\s*$", "", text)
-
-    # Global print font controls are handled before content edits so a request such as
-    # "make the font Liberation Serif Bold" changes the actual print renderer, not the
-    # itinerary data.
-    font_match = None
-    low_for_font = text.lower()
-    for _font_name in FONT_OPTIONS:
-        if _font_name.lower() in low_for_font:
-            font_match = _font_name
-            break
-    if font_match:
-        set_font(font_match)
-        changed = True
-        text = re.sub(re.escape(font_match), '', text, flags=re.I)
-
-    # Global print text-size controls.
-    if re.search(r"(?i)\b(?:increase|enlarge|bigger|larger|up)\b.*\b(?:font|text|print)\s*size\b|\b(?:increase|enlarge|make)\s+(?:the\s+)?(?:font|text)\b", text):
-        adjust_text_scale(0.05); changed = True
-        text = re.sub(r"(?i)\b(?:increase|enlarge|bigger|larger|up)\b.*?(?:font|text)(?:\s*size)?\b", '', text)
-    elif re.search(r"(?i)\b(?:decrease|reduce|smaller|down)\b.*\b(?:font|text)\s*size\b|\b(?:decrease|reduce|make)\s+(?:the\s+)?(?:font|text)\b", text):
-        adjust_text_scale(-0.05); changed = True
-        text = re.sub(r"(?i)\b(?:decrease|reduce|smaller|down)\b.*?(?:font|text)(?:\s*size)?\b", '', text)
-
-    # Fare/cost controls.
-    if re.search(r"(?i)\b(remove|delete|without|no)\s+(the\s+)?(fare|cost)\b", text) or re.search(r"(?i)\b(fare|cost)\s+(remove|off)\b", text) or "print without fare" in lower:
-        controls["fare"] = None; changed = True
-        text = re.sub(r"(?i)\b(remove|delete|without|no)\s+(the\s+)?(fare|cost)\b", "", text)
-        text = re.sub(r"(?i)\b(fare|cost)\s+(remove|off)\b", "", text)
-        text = re.sub(r"(?i)print\s+without\s+fare", "", text)
-    else:
-        # Explicit final fare: "add cost 8500", "fare 8500", "update fare to 9000".
-        m = re.search(r"(?i)\b(?:add|set|update|change|replace)\s+(?:the\s+)?(?:cost|fare)\s*(?:to|=)?\s*‚Çπ?\s*([0-9][0-9,]*(?:\.\d+)?)\b", text)
-        if not m:
-            m = re.search(r"(?i)\b(?:cost|fare)\s*(?:to|=)\s*‚Çπ?\s*([0-9][0-9,]*(?:\.\d+)?)\b", text)
-        if m:
-            controls["fare"] = float(m.group(1).replace(",", "")); changed = True
-            text = text[:m.start()] + text[m.end():]
-        else:
-            # A bare +500/-500 is a markup adjustment. Base it on current printed fare,
-            # otherwise use the supplier fare.
-            m = re.fullmatch(r"\s*([+-])\s*‚Çπ?\s*([0-9][0-9,]*(?:\.\d+)?)\s*", text)
-            if m:
-                base = float(current_fare or 0) or _supplier_total(data)
-                amount = float(m.group(2).replace(",", ""))
-                controls["fare"] = base + amount if m.group(1) == "+" else base - amount
-                if controls["fare"] < 0: raise ValueError("Updated fare cannot be negative.")
-                changed = True; text = ""
-            else:
-                # Natural form: "add 500" / "increase fare by 500" / "decrease cost by 300".
-                m = re.search(r"(?i)\b(?:add|increase|decrease|reduce)\s+(?:the\s+)?(?:fare|cost)?\s*(?:by)?\s*‚Çπ?\s*([+-]?\d[\d,]*(?:\.\d+)?)\b", text)
-                if m and re.search(r"(?i)\b(?:add|increase|decrease|reduce)\b", m.group(0)):
-                    base = float(current_fare or 0) or _supplier_total(data)
-                    amount = float(m.group(1).replace(",", ""))
-                    verb = m.group(0).lower()
-                    controls["fare"] = base - amount if "decrease" in verb or "reduce" in verb else base + amount
-                    if controls["fare"] < 0: raise ValueError("Updated fare cannot be negative.")
-                    changed = True; text = text[:m.start()] + text[m.end():]
-
-    return controls, text.strip(" ,;\n"), changed
-
-
-def _generate_ticket_base(kind, data, fare, output_path, logo_path, page_size, text_scale_override=None, logo_scale_override=None):
-    if kind == "flight":
-        return generate_flight_ticket(data, fare, output_path, logo_path, page_size=page_size, text_scale_override=text_scale_override, logo_scale_override=logo_scale_override)
-    if kind == "bus":
-        return generate_bus_ticket(data, fare, output_path, logo_path, page_size=page_size, text_scale_override=text_scale_override, logo_scale_override=logo_scale_override)
-    if kind == "hotel":
-        return generate_hotel_voucher(data, output_path, logo_path, fare=fare, page_size=page_size, text_scale_override=text_scale_override, logo_scale_override=logo_scale_override)
-    raise RuntimeError(f"Unsupported document type: {kind}")
-
-
-def _generate_adaptive_ticket(kind, data, fare, output_path, logo_path=None, requested_size="auto", text_scale_override=None, logo_scale_override=None):
-    """Generate without shrinking the design to force a single page.
-
-    ``auto`` now means the normal A4 layout.  If the content is longer, the
-    renderer is allowed to flow naturally onto page 2+ so typography and
-    spacing remain professional.  A5/A4/Letter/Legal/A3 can still be selected
-    explicitly through the reply controls.
-    """
-    size = _normalize_page_size(requested_size) or "auto"
-    candidate = "A4" if size == "auto" else size
-    _generate_ticket_base(kind, data, fare, output_path, logo_path, candidate, text_scale_override=text_scale_override, logo_scale_override=logo_scale_override)
-    return candidate
-
-
-def files_list_keyboard(page=0, per_page=10):
-    records = list_records()
-    total_pages = max(1, (len(records) + per_page - 1) // per_page)
-    page = max(0, min(page, total_pages - 1))
-    start = page * per_page
-    rows = records[start:start + per_page]
-    buttons = []
-    for r in rows:
-        label = f"{r.get('reference','?')} ‚Ä¢ {r.get('type','document').title()} ‚Ä¢ {_display_filename(r.get('filename',''))}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"select_ref:{r.get('reference','')}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("‚¨ÖÔ∏è Previous", callback_data=f"files_page:{page-1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ‚û°Ô∏è", callback_data=f"files_page:{page+1}"))
-    if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton("‚úèÔ∏è Enter Reference Number", callback_data="enter_ref")])
-    return InlineKeyboardMarkup(buttons)
-
-
-async def show_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-    records = list_records()
-    if not records:
-        await update.message.reply_text(
-            "üìÇ *MyTourBazar Files*\n\nNo generated files have been saved yet.",
-            parse_mode="Markdown", reply_markup=main_keyboard()
-        )
-        return
-    await update.message.reply_text(
-        "üìÇ *MyTourBazar Files*\n\nSelect a reference to edit that document.\nLatest files are shown first.",
-        parse_mode="Markdown", reply_markup=files_list_keyboard(0)
-    )
-
-
-async def edit_by_ref_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-    context.user_data["awaiting_edit_ref"] = True
-    await update.message.reply_text(
-        "‚úèÔ∏è *Edit an Existing Document*\n\n"
-        "This old reference-edit shortcut has been removed.\n\nUse *Modify & Regenerate* on the generated PDF instead.",
-        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
-    )
-
-
-
-REF_RE = re.compile(r"(?:\bMTB[-_ ]?\d{1,}\b|\b\d{3,}\b)", re.I)
-
-def normalize_reference(value):
-    m = REF_RE.search(str(value or ""))
-    if not m: return ""
-    digits = re.sub(r"\D", "", m.group(0))
-    return f"MTB{int(digits):02d}" if digits else ""
-
-def _telegram_message_key(message):
-    if message is None:
-        return ""
-    chat = getattr(message, "chat", None)
-    chat_id = getattr(chat, "id", None) or getattr(message, "chat_id", None)
-    message_id = getattr(message, "message_id", None)
-    if chat_id is None or message_id is None:
-        return ""
-    return f"{chat_id}:{message_id}"
-
-
-def _register_reference_message(reference, message):
-    """Remember the exact Telegram output message for reliable Reply-to-edit routing.
-
-    The IDs stay internal in the local record; nothing is shown in the Telegram caption.
-    """
-    key = _telegram_message_key(message)
-    if not reference or not key:
-        return
-    record = load_record(reference)
-    if not record:
-        return
-    keys = [str(x) for x in (record.get("telegram_message_keys") or []) if str(x).strip()]
-    if key not in keys:
-        keys.append(key)
-    record["telegram_message_keys"] = keys[-40:]
-    update_record(reference, record)
-
-
-def find_reference_for_reply(replied):
-    message_key = _telegram_message_key(replied)
-    if message_key:
-        for r in list_records():
-            ref = r.get("reference")
-            rec = load_record(ref) or {}
-            if message_key in [str(x) for x in (rec.get("telegram_message_keys") or [])]:
-                return ref
-    source = " ".join(filter(None, [getattr(replied, "text", None), getattr(replied, "caption", None), getattr(getattr(replied, "document", None), "file_name", None)]))
-    ref = normalize_reference(source)
-    if ref and load_record(ref): return ref
-    filename = getattr(getattr(replied, "document", None), "file_name", None)
-    for r in list_records():
-        if filename and r.get("filename") == filename: return r.get("reference")
-    low = source.lower()
-    for r in list_records():
-        rec=load_record(r.get("reference")) or {}
-        data=rec.get("data") or {}
-        hay=" ".join(str(data.get(k,"")) for k in ("client_name","destination","tour_title","hotel_name","hotel_city","guest_name")) + " " + str(r.get("filename",""))
-        if low and low in hay.lower(): return r.get("reference")
-    return ""
-
-
-async def _direct_saved_b2b_print(message, context, reference, record, query=None):
-    """Directly white-label an already generated Tour or Air PDF.
-
-    No intermediate Basic/Detailed/Quotation/Voucher/footer selection is shown.
-    The existing document's detail level, document mode, fare, page size and content
-    are preserved; only agency branding is removed.
-    """
-    if not record:
-        await message.reply_text("‚ùå Saved document not found.", reply_markup=main_keyboard())
-        return
-
-    kind = record.get("type")
-    if kind not in ("package", "flight"):
-        await message.reply_text("‚ùå B2B direct print is currently available for Tour and Air PDFs.")
-        return
-
-    if query is not None:
-        await safe_callback_edit(
-            query,
-            "üè¢ *Generating B2B white-label PDF directly...*",
-            parse_mode="Markdown",
-        )
-    else:
-        await message.reply_text("üè¢ *Generating B2B white-label PDF directly...*", parse_mode="Markdown")
-
-    data = copy.deepcopy(record.get("data") or {})
-    fare = record.get("fare")
-    page_size = record.get("page_size") or "A4"
-    text_scale = float(record.get("text_scale") or load_settings().get("text_scale", 1.0))
-    logo_scale = float(record.get("logo_scale") or get_logo_scale(kind))
-    document_mode = record.get("document_mode") or data.get("document_mode") or "itinerary"
-
-    # Reuse the strict recursive brand scrubber for both Tour and Air.
-    data = _b2b_neutralize_data(data, document_mode if kind == "package" else None)
-    if kind == "package":
-        data = _apply_tour_document_mode_fields(data, document_mode, b2b=True)
-        data["greeting"] = _b2b_greeting(data, document_mode)
-
-    render_record = copy.deepcopy(record)
-    render_record["b2b"] = True
-    render_record["agency_removed"] = True
-    render_record["_clean_agency"] = True
-    render_record["footer"] = False
-    render_record["footer_mode"] = "none"
-    render_record["logo_enabled"] = False
-    if kind == "package":
-        render_record["terms_choice"] = "b2b"
-        render_record["document_mode"] = document_mode
-
-    final, selected_scale, filename = await _render_saved_pdf(
-        reference,
-        render_record,
-        data,
-        kind,
-        fare,
-        page_size,
-        "none",
-        False,
-        text_scale_override=text_scale,
-        logo_scale_override=logo_scale,
-        auto_fit=False,
-        last_page="b2b" if kind == "package" else None,
-    )
-
-    # Persist the white-label copy as the current saved version so later edits
-    # cannot accidentally reintroduce MyTourBazar branding.
-    record.update({
-        "filename": filename,
-        "data": data,
-        "page_size": page_size,
-        "text_scale": selected_scale,
-        "logo_scale": logo_scale,
-        "logo_enabled": False,
-        "footer": False,
-        "footer_mode": "none",
-        "agency_removed": True,
-        "b2b": True,
-    })
-    if kind == "package":
-        record["terms_choice"] = "b2b"
-        record["document_mode"] = document_mode
-    update_record(reference, record)
-
-    caption = "üìÑ B2B Tour" if kind == "package" else "üìÑ B2B Air Itinerary"
-    with open(final, "rb") as fh:
-        sent_pdf = await message.reply_document(
-            document=fh,
-            filename=filename,
-            caption=_record_caption(reference, caption, "White-label ‚Ä¢ agency details removed"),
-            reply_markup=generated_document_keyboard(reference, kind),
-        )
-    _register_reference_message(reference, sent_pdf)
-
-
-async def reply_reference_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route owner replies. Fare-entry replies are handled first so Telegram's
-    reply-to-message feature cannot get swallowed by a ConversationHandler.
-    Otherwise, a reply to a generated MTB reference is treated as an AI edit."""
-    msg = update.message
-    if not msg:
-        return
-
-    # V167: replying to any currently displayed Tour draft behaves like Smart
-    # Modify & Regenerate for that draft. A normal (non-reply) message can still
-    # follow the existing final-submission workflow.
-    replied = getattr(msg, "reply_to_message", None)
-    if replied and context.user_data.get('itinerary'):
-        draft_ids = {int(x) for x in (context.user_data.get('tour_draft_message_ids') or []) if str(x).isdigit()}
-        replied_id = getattr(replied, 'message_id', None)
-        if replied_id in draft_ids:
-            instruction = (msg.text or '').strip()
-            if instruction:
-                variant = _tour_reply_variant_command(instruction)
-                if variant:
-                    await _reply_draft_tour_variant(msg, context, variant)
-                else:
-                    await perform_draft_edit(update, context, instruction)
-                raise ApplicationHandlerStop
-
-    # V154: the editable Tour draft is a one-shot final submission. This global
-    # router is registered before receive_extra_text, so it must explicitly hand the
-    # message to the Tour finalizer instead of swallowing a Telegram Reply.
-    if _tour_v2_active(context) and context.user_data.get('tour_v2_phase') == 'awaiting_edited_final':
-        instruction=(msg.text or '').strip()
-        if instruction:
-            await _tour_v2_process_edited_final(msg, context, instruction)
-            raise ApplicationHandlerStop
-
-    # Final Tour PDF name gate must also win over generic reply/edit routing.
-    # The global reply router sees every normal text message before receive_extra_text.
-    if context.user_data.get('awaiting_tour_print_name'):
-        text = (msg.text or '').strip()
-        if text == '‚ùå Cancel':
-            context.user_data.pop('awaiting_tour_print_name', None)
-            context.user_data.pop('pending_tour_pdf_request', None)
-            await msg.reply_text('‚ùå Tour PDF print cancelled. The draft is still available.', reply_markup=main_keyboard())
-            raise ApplicationHandlerStop
-        data = context.user_data.get('itinerary') or {}
-        if text == '‚è≠Ô∏è Print Without Name':
-            data['client_name'] = ''
-        elif text:
-            data['client_name'] = text
-            context.user_data['guest_name'] = text
-            await msg.reply_text(f'‚úÖ Guest name added: *{text}*', parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
-        else:
-            await msg.reply_text('Please enter the Guest / Client Name, or tap ‚è≠Ô∏è Print Without Name.', reply_markup=pending_tour_name_keyboard())
-            raise ApplicationHandlerStop
-        context.user_data['itinerary'] = data
-        context.user_data.pop('awaiting_tour_print_name', None)
-        await _finish_pending_tour_pdf(msg, context)
-        raise ApplicationHandlerStop
-
-    # V159: the legacy Tour markup session has been removed. Tour selling costs are
-    # changed only through Modify & Regenerate (text or voice) as direct customer rates.
-    for _legacy_key in (
-        'pending_tour_markup_print','pending_tour_markup_input','pending_tour_markup_mode',
-        'pending_tour_markup_snapshot','pending_tour_markup_candidate'
-    ):
-        context.user_data.pop(_legacy_key, None)
-
-    # Draft Smart Edit: once the owner taps Smart Edit Draft, a normal message or a
-    # Telegram reply is treated as an edit to the in-memory draft. Nothing is printed yet.
-    if context.user_data.get('editing_current_itinerary'):
-        instruction = (msg.text or '').strip()
-        if instruction:
-            await perform_draft_edit(update, context, instruction)
-            raise ApplicationHandlerStop
-        return
-
-    # IMPORTANT: The fare prompt is sent after the Air/Bus/Hotel ConversationHandler
-    # has ended. If the owner replies to that prompt, Telegram still supplies
-    # reply_to_message. Handle the pending fare before looking for an MTB reference.
-    pending_kind = context.user_data.get("pending_fare_kind")
-    if pending_kind in ("flight", "bus", "hotel"):
-        instruction = (msg.text or "").strip()
-        if instruction:
-            await _apply_pending_fare_input(msg,context,pending_kind,instruction)
-            raise ApplicationHandlerStop
-
-    # Smart Make Changes button: once a reference is selected, the next natural-language
-    # message is treated as the edit instruction even if the owner does not use Telegram's
-    # Reply action routes supported wording through the deterministic editor.
-    active_reference = context.user_data.get("editing_reference")
-    if active_reference:
-        # V160: once Modify & Regenerate/Voice-Text Edit is tapped, the next text
-        # belongs to that exact saved PDF. Never send it through old saved-file/ref-ID
-        # discovery and never let an active ConversationHandler reinterpret it.
-        instruction = (msg.text or "").strip()
-        if instruction == "‚ùå Cancel":
-            context.user_data.pop("editing_reference", None)
-            context.user_data.pop("voice_edit_reference", None)
-            await msg.reply_text("‚ùå Edit cancelled.", reply_markup=main_keyboard())
-            raise ApplicationHandlerStop
-        if instruction:
-            await perform_saved_edit(update, context, instruction)
-            raise ApplicationHandlerStop
-        return
-
-    if not msg.reply_to_message:
-        return
-    replied = msg.reply_to_message
-    reference = find_reference_for_reply(replied)
-    if not reference:
-        return
-    record = load_record(reference)
-    if not record:
-        await msg.reply_text(f"‚ùå I found {reference} in the replied message, but that reference is no longer available.", reply_markup=main_keyboard())
-        return
-    instruction = (msg.text or "").strip()
-    if not instruction:
-        await msg.reply_text(f"‚úèÔ∏è I found *{reference}*. Please tell me what you want changed.", parse_mode="Markdown")
-        return
-
-    # V188: a B2B / white-label reply on an already generated Tour or Air PDF is
-    # a DIRECT print conversion, not a generic edit and not another option menu.
-    if record.get("type") in ("package", "flight") and _smart_requested_b2b(instruction):
-        await _direct_saved_b2b_print(msg, context, reference, record)
-        raise ApplicationHandlerStop
-
-    # Lightweight reply actions for generated Tour PDFs. These are intentionally
-    # handled before the general Smart Edit path so a simple reply like +10000 or
-    # Start Date: 20/09/2026 does exactly the requested action.
-    if record.get("type") == "package":
-        # V170 Smart Reply: replying to a generated Tour PDF with only a
-        # detail/output request is an output conversion, not a generic content edit.
-        variant = _tour_reply_variant_command(instruction)
-        if variant:
-            await _reply_saved_tour_variant(msg, context, reference, record, variant)
-            raise ApplicationHandlerStop
-
-        data = dict(record.get("data") or {})
-        low = instruction.lower()
-        # Detect an explicit start-date reply before using the parsed match.
-        dm = re.search(r'(?i)\b(?:start\s*date|travel\s*date|date)\s*[:=-]\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b', instruction)
-        if dm:
-            new_date=dm.group(1)
-            data['start_date']=new_date
-            if not str(data.get('travel_dates') or '').strip():
-                data['travel_dates']=new_date
-            record['data']=data
-            save_record(reference, record)
-            context.user_data['itinerary']=data
-            await msg.reply_text(f"üìÖ Tour start date set to *{new_date}*. Regenerating the Tour PDF now.", parse_mode='Markdown')
-            context.user_data['pending_tour_pdf_detail']=data.get('detail_level') or 'basic'
-            context.user_data['pending_tour_pdf_no_cost']=False
-            context.user_data['pending_tour_document_mode']=data.get('document_mode') or 'itinerary'
-            await generate_tour_pdf_final(msg, context, data, data.get('detail_level') or 'basic', False, reference=reference)
-            raise ApplicationHandlerStop
-    context.user_data["editing_reference"] = reference
-    await perform_saved_edit(update, context, instruction)
-    raise ApplicationHandlerStop
-
-async def _begin_edit(update, context, reference):
-    raw = str(reference or "").strip()
-    reference = normalize_reference(raw) or raw.upper()
-    record = load_record(reference)
-    if not record:
-        low=raw.lower()
-        matches=[]
-        for r in list_records():
-            rec=load_record(r.get("reference")) or {}
-            data=rec.get("data") or {}
-            hay=" ".join([str(r.get("filename","")),str(data.get("client_name","")),str(data.get("guest_name","")),str(data.get("destination","")),str(data.get("tour_title","")),str(data.get("hotel_name","")),str(data.get("hotel_city",""))]).lower()
-            if low and low in hay: matches.append(r.get("reference"))
-        if len(matches)==1:
-            reference=matches[0]; record=load_record(reference)
-        elif matches:
-            await update.message.reply_text("üîé I found multiple matching references: " + ", ".join(matches[:10]) + "\nPlease send the exact reference number.", reply_markup=main_keyboard()); return
-    if not record:
-        await update.message.reply_text(
-            "‚ùå That saved document is no longer available. Please use *Modify & Regenerate* on the PDF you want to change.",
-            parse_mode="Markdown", reply_markup=main_keyboard()
-        )
-        return
-    context.user_data["editing_reference"] = reference
-    context.user_data["awaiting_edit_ref"] = False
-    await update.message.reply_text(
-        f"‚úèÔ∏è *Editing {reference}*\n\n"
-        f"Send one normal message or voice note describing the changes in your own words.\n\n"
-        f"Examples:\n"
-        f"‚Ä¢ `Adult cost 43700 and CWB 32000.`\n"
-        f"‚Ä¢ `Keep adult at 43700, child without bed 26000, and change Munnar room to Premium Valley View.`\n"
-        f"‚Ä¢ `Change Day 2 sightseeing to include Dwarkadhish Temple and Bet Dwarka.`\n"
-        f"‚Ä¢ `Raipur to Nagpur by Vande Bharat, Nagpur to Goa by flight, and Delhi to Raipur by bus.`\n"
-        f"‚Ä¢ `Change passenger name to Mr. Amit Sharma.`\n"
-        f"‚Ä¢ `Detailed itinerary` ‚Üí reply to a Tour PDF to get the detailed PDF directly.\n"
-        f"‚Ä¢ `Detailed WhatsApp` ‚Üí get only the detailed WhatsApp version.\n"
-        f"‚Ä¢ `Detailed draft` ‚Üí return to an editable detailed draft first.\n\n"
-        f"For Tour costing, tell me the final customer rate naturally - there is no separate markup system. "
-        f"The local Smart Edit will preserve unrelated data and regenerate the PDF.",
-        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
-    )
-
-
-def _package_edit_is_cost_only(instruction, parsed_rates=None):
-    """True when a Modify & Regenerate reply contains only customer costing.
-
-    Keep cost-only edits isolated so the editor cannot rebuild the tour and drop the
-    owner's Adult/CWB/CNB/EB selling rates before PDF rendering.
-    """
-    raw=str(instruction or '').strip()
-    rates=parsed_rates or {}
-    if not raw or not rates:
-        return False
-    cleaned=raw.replace('‚Çπ',' ')
-    aliases=(
-        'child without bed','child no bed','child with bed','extra bed',
-        'per adult','per child','adult','adults','adt','cwb','cnb','eb','child','children',
-        'rate','cost','price','fare','is','should be','will be','at','for','per','rs','inr'
-    )
-    for phrase in sorted(aliases,key=len,reverse=True):
-        cleaned=re.sub(rf'(?i)\b{re.escape(phrase)}\b',' ',cleaned)
-    cleaned=re.sub(r'[0-9][0-9,]*(?:\.[0-9]+)?',' ',cleaned)
-    cleaned=re.sub(r'[\s,;:/=+\-‚Äì‚Äî]+','',cleaned)
-    return cleaned == ''
-
-
-def _hotel_edit_is_cost_only(instruction, hotel_cost=None):
-    """True when a Hotel Voice/Text edit contains only customer room costing.
-
-    Explicit room/EB/total amounts are applied directly
-    to the structured Hotel cost box and regenerated reliably.
-    """
-    raw=str(instruction or '').strip()
-    if not raw or not hotel_cost:
-        return False
-    cleaned=raw.replace('‚Çπ',' ')
-    phrases=(
-        'extra mattress','extra bed','grand total','customer cost','customer rate',
-        'hotel cost','hotel rate','per room cost','per room','room cost','room rate',
-        'room','eb','total','cost','rate','price','fare','is','should be','will be',
-        'keep','make','set','change','add','at','for','rs','inr'
-    )
-    for phrase in sorted(phrases,key=len,reverse=True):
-        cleaned=re.sub(rf'(?i)\b{re.escape(phrase)}\b',' ',cleaned)
-    cleaned=re.sub(r'[0-9][0-9,]*(?:\.[0-9]+)?',' ',cleaned)
-    cleaned=re.sub(r'[\s,;:/=+\-‚Äì‚Äî]+','',cleaned)
-    return cleaned == ''
-
-
-async def perform_saved_edit(update, context, instruction):
-    reference = context.user_data.get("editing_reference")
-    record = load_record(reference) if reference else None
-    if not record:
-        context.user_data.pop("editing_reference", None)
-        await update.message.reply_text("‚ùå That saved document is no longer available. Please tap *Modify & Regenerate* on the PDF you want to change.", parse_mode="Markdown", reply_markup=main_keyboard())
-        return
-    status = await update.message.reply_text(
-        "‚úèÔ∏è *Updating your document...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\nüîç Understanding your requested changes...",
-        parse_mode="Markdown"
-    )
-    try:
-        doc_type = record.get("type", "package")
-        old_data = record.get("data")
-        old_fare = record.get("fare")
-        current_footer = bool(record.get("footer", False)) if doc_type != "package" else False
-        current_footer_mode = record.get("footer_mode", "design" if current_footer else "none") if doc_type != "package" else "none"
-        current_logo = bool(record.get("logo_enabled", True))
-        current_page_size = record.get("page_size", "auto") or "auto"
-        current_text_scale = float(record.get("text_scale") or load_settings().get("text_scale", 1.0))
-        current_logo_scale = float(record.get("logo_scale") or get_logo_scale(doc_type))
-
-        # Older PDFs created before the richer settings were stored are still editable.
-        if not old_data:
-            source_pdf = GENERATED_DIR / str(record.get("filename", ""))
-            if not source_pdf.exists():
-                raise RuntimeError("The saved PDF file is no longer present on this computer.")
-            temp_pdf = TEMP_DIR / f"legacy_{reference}.pdf"
-            shutil.copy2(source_pdf, temp_pdf)
-            part = [{"path": str(temp_pdf), "mime_type": "application/pdf"}]
-            if doc_type == "package":
-                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_itinerary_from_parts, part, "", AI_API_KEY, AI_MODEL), status=status)
-            elif doc_type == "flight":
-                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_flight_ticket, part, "", AI_API_KEY, AI_MODEL), status=status)
-            elif doc_type == "bus":
-                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_bus_ticket, part, "", AI_API_KEY, AI_MODEL), status=status)
-            elif doc_type == "hotel":
-                old_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(extract_hotel_voucher, part, "", AI_API_KEY, AI_MODEL), status=status)
-            else:
-                raise RuntimeError(f"Unsupported legacy document type: {doc_type}")
-            if old_fare is None and doc_type in ("flight", "bus", "hotel"):
-                source = _supplier_total(old_data)
-                # Legacy files do not know whether the old print intentionally hid fare. Preserve
-                # the old behavior by treating a real extracted fare as the current fare.
-                old_fare = source if source > 0 else None
-            record["data"] = old_data
-            record["fare"] = old_fare
-
-        package_rates = {}
-        ai_package_rates = {}
-        package_cost_only = False
-        hotel_cost_update = None
-        hotel_cost_only = False
-        if doc_type == 'hotel' and re.search(r'(?i)\b(?:per\s*room|per\s*night|room\s*(?:cost|rate|price)|hotel\s*(?:cost|rate|price)|customer\s*(?:cost|rate|price)|extra\s*(?:bed|mattress)|\beb\b|grand\s*total|total\s*(?:cost|price|fare)|markup|mark\s*up)\b', str(instruction or '')):
-            try:
-                hotel_cost_update = _parse_hotel_cost_input(instruction, _supplier_total(old_data), old_data)
-            except Exception:
-                hotel_cost_update = None
-            hotel_cost_only = _hotel_edit_is_cost_only(instruction, hotel_cost_update)
-        if doc_type == 'package':
-            try:
-                package_rates = _tour_v2_parse_costs(instruction)
-            except Exception:
-                package_rates = {}
-            package_cost_only = _package_edit_is_cost_only(instruction, package_rates)
-
-        controls, remaining, controls_changed = _parse_reply_controls(
-            instruction, old_fare, old_data, current_footer, current_logo, current_page_size
-        )
-        if not re.search(r"\b(?:footer|contact\s+card|contact\s+bar|design)\b", instruction, re.I):
-            controls["footer_mode"] = current_footer_mode if current_footer_mode in ("bar","design","footer2") else _default_footer_mode(doc_type)
-            controls["footer"] = True
-
-        new_data = old_data
-        new_fare = controls["fare"]
-        requested_detail = _itinerary_detail_command(instruction) if doc_type == "package" else None
-        package_whatsapp = bool(doc_type == "package" and re.search(r"\b(?:whatsapp|text itinerary|text version)\b", instruction, re.I))
-        package_pdf = bool(doc_type == "package" and re.search(r"\b(?:pdf|print)\b", instruction, re.I))
-
-        # Cost-only Hotel edits are deterministic/local. A direct room/EB/total
-        # change immediately updates the structured Hotel cost box.
-        if doc_type == 'hotel' and hotel_cost_only and hotel_cost_update:
-            new_data = copy.deepcopy(old_data or {})
-            new_data['customer_hotel_cost'] = hotel_cost_update
-            remaining = ''
-            controls_changed = True
-        # Cost-only Tour edits are deterministic/local. `Adult 43700` must never
-        # pass through the general AI editor, because that can recreate the tour
-        # object and lose package_costs/show_cost before rendering.
-        elif doc_type == 'package' and package_cost_only and package_rates:
-            new_data = _tour_v2_apply_costs(copy.deepcopy(old_data), package_rates)
-            new_data = _normalize_guest_counts(new_data)
-            new_data['show_cost'] = True
-            remaining = ''
-            controls_changed = True
-        elif requested_detail:
-            new_data = await _run_ai_with_retry_status(
-                update.message,
-                lambda: asyncio.to_thread(enhance_package_itinerary, old_data, AI_API_KEY, AI_MODEL, requested_detail),
-                status=status,
-            )
-            new_data["client_name"] = old_data.get("client_name", "")
-            new_data["detail_level"] = requested_detail
-            ai_fare = None
-        elif remaining:
-            new_data, ai_fare = await _run_ai_with_retry_status(
-                update.message,
-                lambda: asyncio.to_thread(apply_edit, doc_type, old_data, remaining, AI_API_KEY, AI_MODEL, old_fare),
-                status=status,
-            )
-            if ai_fare is not None:
-                new_fare = ai_fare
-        elif not controls_changed:
-            # No recognized control and no text left should never silently do nothing.
-            raise ValueError("I could not understand the edit. Try: 'add footer', 'remove logo', 'add cost +500', or 'page size A3'.")
-
-        if doc_type == 'hotel' and hotel_cost_update:
-            new_data = copy.deepcopy(new_data or old_data or {})
-            new_data['customer_hotel_cost'] = hotel_cost_update
-            # Hotel customer costing is a structured room calculation, not an Air/Bus fare box.
-            # Keep supplier fare data untouched; the Hotel renderer reads customer_hotel_cost.
-        if doc_type == 'package' and package_rates:
-            # Explicit numeric rates are owner-authored customer selling rates. Re-apply
-            # preserve them after an edit so mixed instructions cannot erase Adult/CWB/CNB/EB values.
-            new_data = _tour_v2_apply_costs(new_data, package_rates)
-            new_data['show_cost'] = True
-        elif doc_type == 'package':
-            # If the local cost parser did not understand the wording, preserve the editor's
-            # edit and reconcile only the rate fields that actually changed. This handles
-            # normal/Hinglish voice phrasing without introducing a markup workflow.
-            new_data, ai_package_rates = _tour_reconcile_ai_customer_costs(old_data,new_data,instruction)
-
-        if doc_type == 'package' and record.get('b2b'):
-            new_data = _apply_tour_document_mode_fields(
-                new_data,
-                record.get('document_mode') or new_data.get('document_mode') or 'itinerary',
-                b2b=True,
-            )
-
-        if doc_type == "package" and package_whatsapp and not package_pdf:
-            new_data["detail_level"] = requested_detail or new_data.get("detail_level") or "detailed"
-            record.update({"data": new_data, "detail_level": new_data["detail_level"]})
-            update_record(reference, record)
-            await reply_text_chunked(update.message, build_whatsapp_itinerary(new_data, new_data["detail_level"]), parse_mode="Markdown")
-            await update.message.reply_text("üì± WhatsApp itinerary ready. You can reply with `PDF itinerary`, `basic itinerary`, `detailed itinerary`, or another change.", parse_mode="Markdown", reply_markup=tour_output_keyboard())
-            context.user_data.pop("editing_reference", None)
-            return
-
-        if doc_type == "package":
-            filename = _package_filename(new_data)
-        elif doc_type == "flight":
-            filename = _flight_filename(new_data)
-        elif doc_type == "bus":
-            filename = _bus_filename(new_data)
-        elif doc_type == "hotel":
-            filename = _hotel_filename(new_data)
-        else:
-            filename = record.get("filename") or "document.pdf"
-        old_filename = record.get("filename")
-        pdf_path = GENERATED_DIR / filename
-
-        _effective_package_rates = package_rates or ai_package_rates
-        if doc_type == 'package' and _effective_package_rates:
-            _cost_labels={'per_adult':'Adult','per_child':'Child','per_child_cwb':'CWB','per_child_cnb':'CNB','per_extra_bed':'EB'}
-            _cost_note=', '.join(f"{_cost_labels.get(k,k)} ‚Çπ{float(v):,.0f}" for k,v in _effective_package_rates.items())
-            _regen_text=f"üí∞ *Customer costing understood:* {_cost_note}\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 55%\n\nüìÑ Regenerating Tour..."
-        else:
-            _regen_text=f"‚úèÔ∏è *Changes understood.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 55%\n\nüìÑ Regenerating {doc_type.replace('_',' ').title()}..."
-        await safe_status_edit(status, update.message, _regen_text, parse_mode="Markdown")
-
-        logo_path = LOGO_PATH if controls["logo"] and LOGO_PATH.exists() else None
-        chosen_size = _normalize_page_size(controls["page_size"]) or "auto"
-
-        if doc_type == "package":
-            edit_b2b = bool(record.get('b2b'))
-            if edit_b2b:
-                new_data = _apply_tour_document_mode_fields(new_data, record.get('document_mode') or new_data.get('document_mode') or 'itinerary', b2b=True)
-                logo_path = None
-                controls['footer_mode'] = 'none'
-                controls['footer'] = False
-                controls['logo'] = False
-            base_pdf = GENERATED_DIR / f"_edit_base_{reference}.pdf"
-            chosen_size = chosen_size if chosen_size != "auto" else "A4"
-            await asyncio.to_thread(generate_pdf, new_data, base_pdf, logo_path, chosen_size, text_scale_override=current_text_scale, logo_scale_override=current_logo_scale)
-            combined_pdf = GENERATED_DIR / f"_edit_combined_{reference}.pdf"
-            terms_choice = 'b2b' if edit_b2b else (record.get('terms_choice') or get_tour_last_page())
-            await asyncio.to_thread(append_selected_terms, base_pdf, terms_choice, combined_pdf)
-            base_pdf.unlink(missing_ok=True)
-            base_pdf = combined_pdf
-            wm_path = GENERATED_DIR / f"_edit_wm_{reference}.pdf"
-            ws = load_settings()
-            await asyncio.to_thread(add_watermark_to_pdf, base_pdf, wm_path, ws['buttons'].get('watermark', True) and not edit_b2b, ws.get('watermark_opacity', 0.04), ws.get('watermark_scale', 1.0))
-            base_pdf.unlink(missing_ok=True)
-            if edit_b2b:
-                shutil.copyfile(wm_path, pdf_path)
-            else:
-                await asyncio.to_thread(_apply_footer_mode, wm_path, pdf_path, controls.get('footer_mode') or _default_footer_mode('package'))
-            wm_path.unlink(missing_ok=True)
-        else:
-            base_pdf = GENERATED_DIR / f"_edit_base_{reference}.pdf"
-            chosen_size = await asyncio.to_thread(
-                _generate_adaptive_ticket, doc_type, new_data, new_fare, base_pdf, logo_path, chosen_size, text_scale_override=current_text_scale, logo_scale_override=current_logo_scale
-            )
-            wm_path = GENERATED_DIR / f"_edit_wm_{reference}.pdf"
-            ws = load_settings()
-            await asyncio.to_thread(add_watermark_to_pdf, base_pdf, wm_path, ws['buttons'].get('watermark', True), ws.get('watermark_opacity', 0.04), ws.get('watermark_scale', 1.0))
-            base_pdf.unlink(missing_ok=True); base_pdf = wm_path
-            if controls["footer_mode"] == "bar":
-                await asyncio.to_thread(add_contact_bar_to_pdf, base_pdf, pdf_path)
-            elif controls["footer_mode"] == "footer2":
-                await asyncio.to_thread(add_footer2_to_pdf, base_pdf, pdf_path)
-            elif controls["footer"]:
-                await asyncio.to_thread(add_footer_to_pdf, base_pdf, pdf_path)
-            else:
-                shutil.copyfile(base_pdf, pdf_path)
-            base_pdf.unlink(missing_ok=True)
-
-        record.update({
-            "filename": pdf_path.name,
-            "data": new_data,
-            "fare": new_fare,
-            "footer": True,
-            "footer_mode": controls.get("footer_mode") or _default_footer_mode(doc_type),
-            "logo_enabled": bool(controls["logo"]),
-            "page_size": chosen_size,
-            "text_scale": current_text_scale,
-            "logo_scale": current_logo_scale,
-            "terms_choice": record.get("terms_choice") if doc_type == "package" else record.get("terms_choice"),
-            "legacy": False,
-        })
-        update_record(reference, record)
-        if old_filename and old_filename != pdf_path.name:
-            old_path = GENERATED_DIR / old_filename
-            if old_path.exists(): old_path.unlink(missing_ok=True)
-
-        await safe_status_edit(status, update.message,
-            f"‚úÖ *Document updated successfully.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\nüìê Page size: {chosen_size}\nüñºÔ∏è Logo: {'ON' if controls['logo'] else 'OFF'}" + (f"\nüìå Footer: {'ON' if controls['footer'] else 'OFF'}" if doc_type != 'package' else ""),
-            parse_mode="Markdown"
-        )
-        # Always tell the owner what the AI actually changed. This is especially useful
-        # when the edit was made by replying directly to a Telegram message.
-        if doc_type == 'package':
-            notes = _draft_change_notes(old_data, new_data)
-        else:
-            notes = [f"‚Ä¢ Updated {doc_type.replace('_',' ')} according to your instruction: {_value_preview(instruction, 180)}"]
-        await update.message.reply_text('üìù *Noted ‚Äî changes made:*\n' + '\n'.join(notes), parse_mode='Markdown')
-        with open(pdf_path, "rb") as fh:
-            sent_pdf = await update.message.reply_document(
-                document=fh,
-                filename=pdf_path.name,
-                caption=_record_caption(reference, (f"üìÑ Updated B2B {doc_type.replace('package','tour').replace('_',' ').title()}" if doc_type == 'package' and record.get('b2b') else f"üìÑ Updated MyTourBazar {doc_type.replace('package','tour').replace('_',' ').title()}"), f"Page size: {chosen_size}"),
-                reply_markup=generated_document_keyboard(reference, doc_type),
-            )
-        _register_reference_message(reference, sent_pdf)
-        if doc_type == "package" and requested_detail and package_whatsapp:
-            await update.message.reply_text(build_whatsapp_itinerary(new_data, requested_detail), parse_mode="Markdown")
-        context.user_data.pop("editing_reference", None)
-    except Exception as exc:
-        logger.exception("Saved document edit failed")
-        await safe_status_edit(status, update.message, f"‚ùå *Update failed*\n\nReason: `{str(exc)[:900]}`", parse_mode="Markdown")
-
-async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Natural voice-note editing for saved documents, especially Tour PDFs.
-
-    A selected saved-document edit ALWAYS wins over Auto Creation intake. This is
-    important after an Auto-Created Tour is printed: tapping Modify & Regenerate
-    must route the next voice note to that saved PDF, never back into batch intake.
-    """
-    msg=update.message
-    if not msg or not msg.voice:
-        return
-
-    # V167: Telegram Reply itself is an edit selector. Replying with a voice note
-    # to a generated PDF edits that exact saved document; replying to a Tour draft
-    # edits the current draft. No Modify button is required first.
-    replied=getattr(msg,'reply_to_message',None)
-    reply_reference=find_reference_for_reply(replied) if replied else ''
-    draft_ids={int(x) for x in (context.user_data.get('tour_draft_message_ids') or []) if str(x).isdigit()}
-    reply_is_draft=bool(replied and getattr(replied,'message_id',None) in draft_ids and context.user_data.get('itinerary'))
-
-    if reply_is_draft or context.user_data.get('editing_current_itinerary'):
-        tg_file=await context.bot.get_file(msg.voice.file_id)
-        path=TEMP_DIR/f"voice_draft_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.ogg"
-        status=await msg.reply_text('üéôÔ∏è *Listening to your draft changes...*', parse_mode='Markdown')
-        try:
-            await tg_file.download_to_drive(path)
-            transcript=await _run_ai_with_retry_status(
-                msg,
-                lambda: asyncio.to_thread(transcribe_voice_note, path, AI_API_KEY, AI_MODEL, msg.voice.mime_type or 'audio/ogg'),
-                status=status,
-            )
-            await safe_status_edit(status,msg,'‚úÖ *Voice note understood.* Applying it to this draft...',parse_mode='Markdown')
-            await msg.reply_text('üéôÔ∏è *I understood:*\n' + transcript, parse_mode='Markdown')
-            variant = _tour_reply_variant_command(transcript)
-            if variant:
-                await _reply_draft_tour_variant(msg, context, variant)
-            else:
-                await perform_draft_edit(update, context, transcript)
-        except Exception as exc:
-            logger.exception('Voice draft reply edit failed')
-            await safe_status_edit(status,msg,f'‚ö†Ô∏è Voice draft edit could not be completed. Resend it or type the same change.\n\nReason: {str(exc)[:500]}')
-        finally:
-            try: path.unlink(missing_ok=True)
-            except Exception: pass
-        return
-
-    # Add Cost accepts voice exactly like typed input for Air, Bus and Hotel.
-    pending_kind=context.user_data.get('pending_fare_kind')
-    if pending_kind in ('flight','bus','hotel'):
-        tg_file=await context.bot.get_file(msg.voice.file_id)
-        path=TEMP_DIR/f"voice_cost_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.ogg"
-        status=await msg.reply_text('üéôÔ∏è *Listening to your costing...*',parse_mode='Markdown')
-        try:
-            await tg_file.download_to_drive(path)
-            transcript=await asyncio.to_thread(
-                transcribe_voice_note,path,AI_API_KEY,AI_MODEL,msg.voice.mime_type or 'audio/ogg')
-            await safe_status_edit(status,msg,'‚úÖ *Voice costing understood.*',parse_mode='Markdown')
-            await msg.reply_text('üéôÔ∏è *I understood:*\n'+transcript,parse_mode='Markdown')
-            await _apply_pending_fare_input(msg,context,pending_kind,transcript)
-        except Exception as exc:
-            logger.exception('Voice Add Cost failed')
-            await safe_status_edit(status,msg,f'‚ö†Ô∏è Voice costing could not be completed.\n\nReason: {str(exc)[:500]}')
-        finally:
-            try: path.unlink(missing_ok=True)
-            except Exception: pass
-        return
-
-    # Highest-priority route: an explicit Modify/Voice-Text edit target, or a
-    # Telegram Reply to a previously generated PDF.
-    reference=reply_reference or context.user_data.get('editing_reference') or context.user_data.get('voice_edit_reference')
-    if reference and load_record(reference):
-        tg_file=await context.bot.get_file(msg.voice.file_id)
-        path=TEMP_DIR/f"voice_edit_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.ogg"
-        status=await msg.reply_text('üéôÔ∏è *Listening to your changes...*\n\nI will turn this voice note into the edit instruction and regenerate the same PDF.', parse_mode='Markdown')
-        try:
-            await tg_file.download_to_drive(path)
-            transcript=await _run_ai_with_retry_status(
-                msg,
-                lambda: asyncio.to_thread(transcribe_voice_note, path, AI_API_KEY, AI_MODEL, msg.voice.mime_type or 'audio/ogg'),
-                status=status,
-            )
-            await safe_status_edit(status,msg,'‚úÖ *Voice note understood.*\n\nApplying the changes now...',parse_mode='Markdown')
-            await msg.reply_text('üéôÔ∏è *I understood:*\n' + transcript, parse_mode='Markdown')
-            saved = load_record(reference) or {}
-            variant = _tour_reply_variant_command(transcript) if saved.get('type') == 'package' else None
-            if variant:
-                context.user_data.pop('editing_reference', None)
-                await _reply_saved_tour_variant(msg, context, reference, saved, variant)
-            else:
-                context.user_data['editing_reference']=reference
-                await perform_saved_edit(update, context, transcript)
-        except Exception as exc:
-            logger.exception('Voice edit failed')
-            context.user_data['editing_reference']=reference
-            await safe_status_edit(status,msg,f'‚ö†Ô∏è Voice edit could not be completed. You can resend the voice note or type the same change; /start is not required.\n\nReason: {str(exc)[:500]}')
-        finally:
-            try: path.unlink(missing_ok=True)
-            except Exception: pass
-        return
-
-    # No saved edit target: when Auto Creation intake is active, add this voice
-    # note to the current mixed-source batch.
-    if context.user_data.get('auto_creation'):
-        tg_file=await context.bot.get_file(msg.voice.file_id)
-        path=TEMP_DIR/f"voice_auto_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.ogg"
-        status=await msg.reply_text('üéôÔ∏è *Auto Creation voice note received.*\n\nUnderstanding your tour instructions...', parse_mode='Markdown')
-        try:
-            await tg_file.download_to_drive(path)
-            transcript=await _run_ai_with_retry_status(
-                msg,
-                lambda: asyncio.to_thread(transcribe_voice_note, path, AI_API_KEY, AI_MODEL, msg.voice.mime_type or 'audio/ogg'),
-                status=status,
-            )
-            context.user_data['smart_text']=(context.user_data.get('smart_text','')+'\n'+transcript).strip()
-            await safe_status_edit(status,msg,'‚úÖ *Voice note understood.*\n\n'+transcript,parse_mode='Markdown')
-            ack=await _source_ack_message(update, context, 'Send another file/text/voice within 5 seconds if needed; otherwise I will combine the Auto Creation batch automatically.', reply_markup=auto_creation_keyboard())
-            _schedule_source_auto_process(update,context,'auto_creation',lambda: smart_process(_SyntheticUpdate(_BotMessageProxy(context.bot,update.effective_chat.id),update.effective_user.id),context),prompt_message=ack)
-        except Exception as exc:
-            logger.exception('Auto Creation voice note failed')
-            await safe_status_edit(status,msg,f'‚ö†Ô∏è Could not understand the voice note. You can resend it or type the same instruction.\n\nReason: {str(exc)[:500]}')
-        finally:
-            try: path.unlink(missing_ok=True)
-            except Exception: pass
-        return
-
-    # V168: when AI Assistant is active, a normal voice note is a free-form
-    # create/edit request. No prefix and no separate voice button is required.
-    if context.user_data.get("smart_mode"):
-        await smart_voice(update, context)
-        raise ApplicationHandlerStop
-
-    await msg.reply_text('üéôÔ∏è Voice editing is ready after you tap *Modify & Regenerate* on a generated PDF, or press *ü§ñ AI Assistant / New Request* and speak naturally.', parse_mode='Markdown', reply_markup=main_keyboard())
-    return
-def voucher_keyboard():
-    return ReplyKeyboardMarkup([["‚ùå Cancel"]], resize_keyboard=True)
-
-
-def media_keyboard():
-    return ReplyKeyboardMarkup(
-        [["‚ûï Add Another Page", "‚úÖ Done"]],
-        resize_keyboard=True
-    )
-
-def source_keyboard():
-    return ReplyKeyboardMarkup(
-        [["üìÑ Send PDF / üìù Text"], ["üì∏ Send Screenshot"], ["‚úàÔ∏è Flight Screenshot", "‚úçÔ∏è Flight Text"], ["‚úÖ Done"]],
-        resize_keyboard=True
-    )
-
-
-async def _render_ticket_with_automatic_fit(kind, data, fare, logo_path, footer_mode, clean=False, requested_size="auto", logo_scale_override=None, progress=None):
-    """Fast Air/Bus/Hotel renderer.
-
-    V127 removes the old A4/Legal/Letter x five-scale trial loop. Normal printing now
-    renders only once. If an automatic A4 output is one page before the footer but the
-    footer alone pushes it to page 2, the bot performs ONE quick A4 retry at 90% text.
-    This keeps Auto Fit protection without making every print wait through many renders.
-    """
-    if kind not in ("flight", "bus", "hotel"):
-        raise RuntimeError("Unsupported document type:")
-    filename={"flight":_flight_filename,"bus":_bus_filename,"hotel":_hotel_filename}[kind](data)
-    final=GENERATED_DIR / filename
-    ws=load_settings()
-    watermark_enabled=bool(ws.get('buttons',{}).get('watermark',True)) and not clean
-    watermark_opacity=float(ws.get('watermark_opacity',0.04))
-    watermark_scale=float(ws.get('watermark_scale',1.5))
-    explicit=_normalize_page_size(requested_size)
-    paper=explicit if explicit and explicit!='auto' else 'A4'
-
-    async def render_once(scale=None, suffix='fast'):
-        base=GENERATED_DIR / f"_{suffix}_{kind}_{filename}_base.pdf"
-        wm=GENERATED_DIR / f"_{suffix}_{kind}_{filename}_wm.pdf"
-        candidate=GENERATED_DIR / f"_{suffix}_{kind}_{filename}_final.pdf"
-        try:
-            if progress: await progress('Rendering PDF' if scale is None else 'Adjusting PDF layout')
-            await asyncio.to_thread(_generate_ticket_base,kind,data,fare,base,logo_path,paper,
-                                    text_scale_override=scale,logo_scale_override=logo_scale_override)
-            # WeasyPrint retains sizeable cyclic layout/font objects until a GC
-            # pass. Release them before pypdf loads the generated PDF and creates
-            # watermark/footer overlays, otherwise both memory peaks overlap.
-            await asyncio.to_thread(gc.collect)
-            base_pages=_pdf_page_count(base)
-            if progress: await progress('Adding watermark')
-            await asyncio.to_thread(add_watermark_to_pdf,base,wm,watermark_enabled,watermark_opacity,watermark_scale)
-            await asyncio.to_thread(gc.collect)
-            if progress: await progress('Adding footer and links')
-            if footer_mode=='bar': await asyncio.to_thread(add_contact_bar_to_pdf,wm,candidate)
-            elif footer_mode=='design': await asyncio.to_thread(add_footer_to_pdf,wm,candidate)
-            elif footer_mode=='footer2': await asyncio.to_thread(add_footer2_to_pdf,wm,candidate)
-            else: shutil.copyfile(wm,candidate)
-            await asyncio.to_thread(gc.collect)
-            final_pages=_pdf_page_count(candidate)
-            shutil.move(str(candidate),str(final))
-            return base_pages,final_pages
-        finally:
-            base.unlink(missing_ok=True); wm.unlink(missing_ok=True); candidate.unlink(missing_ok=True)
-            await asyncio.to_thread(gc.collect)
-
-    base_pages,final_pages=await render_once(None,'fast1')
-    selected_scale=None
-    # A footer on an extra page is valid. Do not render the whole itinerary
-    # again merely to save that page; long documents retain readable type.
-    return final,paper,selected_scale
-
-
-async def _print_ticket_final(message, context, kind, footer_mode="none", clean=False, add_footer=False, progress=None):
-    """Generate Air/Bus/Hotel with automatic footer-aware fitting.
-
-    The automatic fit is part of normal generation, not a button-only feature.
-    Modify & Regenerate keeps the reliable page-size/footer/content controls.
-    Font/Logo +/- buttons are intentionally not shown; Auto Size remains available.
-    """
-    if kind not in ("flight", "bus", "hotel"):
-        raise RuntimeError("Unsupported document type.")
-    data_key = {"flight":"pending_flight_data", "bus":"pending_bus_data", "hotel":"pending_hotel_data"}[kind]
-    fare_key = {"flight":"pending_flight_fare", "bus":"pending_bus_fare", "hotel":"pending_hotel_fare"}[kind]
-    data = context.user_data.get(data_key)
-    if not data:
-        raise RuntimeError(f"No {kind} data is available.")
-    fare = context.user_data.get(fare_key)
-    page_size = context.user_data.get("pending_page_size", "auto") or "auto"
-    logo_enabled = False if clean else context.user_data.get("pending_logo_enabled", True)
-    logo_path = LOGO_PATH if logo_enabled and LOGO_PATH.exists() else None
-    if footer_mode in (None, ""):
-        footer_mode = _default_footer_mode(kind)
-    if add_footer and footer_mode == "none":
-        footer_mode = _default_footer_mode(kind)
-    if clean:
-        footer_mode = "none"
-
-    filename = {"flight": _flight_filename, "bus": _bus_filename, "hotel": _hotel_filename}[kind](data)
-    pdf_path = GENERATED_DIR / filename
-    logo_scale_override = context.user_data.get("pending_logo_scale")
-
-    pdf_path, chosen_size, selected_scale = await _render_ticket_with_automatic_fit(
-        kind, data, fare, logo_path, footer_mode, clean=clean,
-        requested_size=page_size, logo_scale_override=logo_scale_override, progress=progress
-    )
-
-    # Reopen the final PDF only after footer placement so the reference record reflects
-    # the actual output settings.
-    if kind == "flight":
-        # The Air PDF now carries the complete line-by-line payment breakdown.
-        # Keep the Telegram caption clean instead of reducing it back to Base/Taxes.
-        caption_detail = (f"Updated Total Fare: INR {fare:,.0f}" if fare else "")
-    elif kind == "bus":
-        base, tax = (0, 0)
-        if fare:
-            try:
-                source_base = float(data.get("base_fare", 0) or 0)
-                source_tax = float(data.get("taxes", 0) or 0)
-                total_source = source_base + source_tax
-                if total_source > 0:
-                    base = round(float(fare) * source_base / total_source)
-                    tax = round(float(fare) - base)
-            except Exception:
-                pass
-        caption_detail = (f"Updated Fare: INR {fare:,.0f} | Base: INR {base:,.0f} | Taxes: INR {tax:,.0f}" if fare else "")
-    else:
-        caption_detail = (f"Hotel Total: INR {fare:,.0f}" if fare else "")
-
-    if progress: await progress('Saving completed PDF')
-    reference = create_reference()
-    save_record(reference, {
-        "type": kind,
-        "filename": pdf_path.name,
-        "data": data,
-        "fare": fare,
-        "footer": footer_mode != "none",
-        "footer_mode": footer_mode,
-        "logo_enabled": bool(logo_enabled),
-        "logo_scale": logo_scale_override,
-        "page_size": chosen_size,
-        "text_scale": selected_scale,
-    })
-    if progress: await progress('Sending PDF to Telegram')
-    with open(pdf_path, "rb") as fh:
-        sent_pdf = await message.reply_document(
-            fh,
-            filename=pdf_path.name,
-            caption=_record_caption(
-                reference,
-                f"{'‚úàÔ∏è' if kind=='flight' else 'üöå' if kind=='bus' else 'üè®'} MyTourBazar {kind.title()}",
-                ((caption_detail + "\n") if caption_detail else "") + f"Page size: {chosen_size}"
-            ),
-            parse_mode='Markdown',
-            reply_markup=generated_document_keyboard(reference, kind)
-        )
-    _register_reference_message(reference, sent_pdf)
-    for key in (data_key, fare_key, "pending_fare_kind", "pending_fare_supplier_total", "pending_footer_kind", "pending_page_size", "pending_logo_enabled", "pending_logo_scale"):
-        context.user_data.pop(key, None)
-    await message.reply_text("‚úÖ Ready for the next request.", reply_markup=ready_keyboard())
-
-def _cancel_auto_print(context):
-    context.user_data.pop("_auto_print_token", None)
-    task = context.user_data.pop("_auto_print_task", None)
-    if task and task is not asyncio.current_task() and not task.done():
-        task.cancel()
-
-
-def _default_footer_mode(kind):
-    mode = get_default_footer('package' if kind == 'package' else kind)
-    return mode if mode in ('bar','design','footer2') else 'footer2'
-
-
-async def _safe_message_text_edit(message, text, reply_markup=None):
-    """Strict single-message editor. Never falls back to sending another status message."""
-    if message is None:
-        return False
-    bot = None
-    try:
-        bot = message.get_bot()
-    except Exception:
-        bot = getattr(message, "_bot", None)
-    chat_id = getattr(message, "chat_id", None)
-    message_id = getattr(message, "message_id", None)
-    try:
-        if bot is not None and chat_id is not None and message_id is not None:
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=message_id,
-                text=str(text), reply_markup=reply_markup
-            )
-            return True
-        if getattr(message, "text", None) or getattr(message, "caption", None):
-            await message.edit_text(str(text), reply_markup=reply_markup)
-            return True
-    except BadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            logger.warning("Single-message edit failed: %s", exc)
-    except Exception as exc:
-        logger.warning("Single-message edit failed: %s", exc)
-    return False
-
-
-async def _auto_print_after_countdown(message, context, kind, supplier_total, prompt_message):
-    """After 5 seconds with no fare-button click, complete the print automatically.
-
-    Existing supplier fare -> print the supplier/original fare.
-    No supplier fare -> print without fare.
-    Footer -> current default footer preference.
-    """
-    token = object()
-    context.user_data["_auto_print_token"] = token
-    stage = 'Fare countdown'
-
-    async def progress(label):
-        nonlocal stage
-        stage = label
-        logger.info('AUTO_PRINT_STAGE kind=%s stage=%s', kind, label)
-        # Status transport must not prevent rendering from starting.
-        try:
-            await asyncio.wait_for(_safe_message_text_edit(
-                prompt_message, f'‚è≥ {label}...', reply_markup=None), timeout=8)
-        except Exception:
-            logger.warning('Auto-print status update unavailable')
-
-    async def finish(text):
-        try:
-            edited = await asyncio.wait_for(
-                _safe_message_text_edit(prompt_message, text, reply_markup=None), timeout=8)
-        except Exception:
-            edited = False
-        if not edited:
-            await message.reply_text(text)
-
-    try:
-        for remaining in range(AUTO_PRINT_SECONDS, 0, -1):
-            if context.user_data.get("_auto_print_token") is not token:
-                return
-            await _safe_message_text_edit(
-                prompt_message,
-                (
-                    (f"üí∞ Supplier fare found: INR {supplier_total:,.0f}.\n\n" if supplier_total > 0 else "‚ö†Ô∏è No supplier fare was found.\n\n")
-                    + f"Choose an option below.\n\n‚è≥ Auto-printing in {remaining}s if you do nothing."
-                ),
-                reply_markup=fare_missing_keyboard(kind, supplier_total),
-            )
-            await asyncio.sleep(1)
-        if context.user_data.get("_auto_print_token") is not token:
-            return
-        fare_key = f"pending_{kind}_fare"
-        context.user_data[fare_key] = supplier_total if supplier_total > 0 else None
-        context.user_data["pending_fare_kind"] = None
-        context.user_data["pending_footer_kind"] = kind
-        footer_mode = _default_footer_mode(kind)
-        await progress('Starting PDF generation')
-        await _print_ticket_final(
-            message, context, kind,
-            footer_mode=footer_mode,
-            clean=(footer_mode == "none"),
-            progress=progress,
-        )
-        await finish('‚úÖ PDF generated and sent.')
-    except asyncio.CancelledError:
-        logger.info('AUTO_PRINT_CANCELLED kind=%s stage=%s',kind,stage)
-        return
-    except Exception as exc:
-        logger.exception("Automatic 5-second print failed")
-        await finish(f'‚ùå Automatic print failed during: {stage}.\n\n{str(exc)[:700]}')
-    finally:
-        if context.user_data.get("_auto_print_token") is token:
-            context.user_data.pop("_auto_print_token", None)
-            context.user_data.pop("_auto_print_task", None)
-
-
-async def send_fare_choice_with_countdown(message, context, kind, supplier_total, status_message=None):
-    """Use the SAME status message for fare selection and the automatic print countdown."""
-    _cancel_auto_print(context)
-    context.user_data["pending_fare_supplier_total"] = float(supplier_total or 0)
-    if status_message is None:
-        status_message = context.user_data.get("_source_status_message")
-    if status_message is None:
-        status_message = await message.reply_text("Preparing fare options...")
-    context.user_data["_source_status_message"] = status_message
-
-    text = (
-        f"üí∞ *Supplier fare found: INR {supplier_total:,.0f}.*\n\n"
-        if supplier_total > 0 else
-        "‚ö†Ô∏è *No supplier fare was found.*\n\n"
-    ) + "Choose *Add Cost* to enter a final fare or choose a print option.\n\n" + f"‚è≥ Auto-printing in {AUTO_PRINT_SECONDS}s if you do nothing."
-    await _safe_message_text_edit(status_message, text, reply_markup=fare_missing_keyboard(kind, supplier_total))
-    context.user_data["_auto_print_task"] = context.application.create_task(
-        _auto_print_after_countdown(message, context, kind, float(supplier_total or 0), status_message)
-    )
-    return status_message
-
-
-def fare_missing_keyboard(kind, supplier_total=0):
-    """Show only fare actions that are valid for the extracted supplier data.
-
-    If no supplier fare exists, the customer must NOT be offered an
-    "original fare" option. They can only add a final cost or print without fare.
-    """
-    first = []
-    if button_enabled("add_cost"):
-        first.append(InlineKeyboardButton("‚ûï Add Cost", callback_data=f"fare_add:{kind}"))
-    if button_enabled("print_without_fare"):
-        first.append(InlineKeyboardButton("üñ®Ô∏è Print Without Fare", callback_data=f"fare_none:{kind}"))
-    rows = [first] if first else []
-    if float(supplier_total or 0) > 0 and button_enabled("print_original_fare"):
-        rows.append([InlineKeyboardButton("üí∞ Print Original Fare", callback_data=f"fare_original:{kind}")])
-    return InlineKeyboardMarkup(rows)
-
-def footer_choice_keyboard():
-    # Legacy compatibility; footer is now selected from /settings or post-generation Modify.
-    return modify_footer_keyboard(None, None)
-
-
-async def ask_footer_choice(message, context, kind):
-    # V94: footer is a persistent per-service setting. No footer choice is requested before printing.
-    context.user_data['pending_footer_kind'] = kind
-    footer_mode = _default_footer_mode(kind)
-    context.user_data.setdefault('pending_page_size', 'auto')
-    context.user_data.setdefault('pending_logo_enabled', True)
-    await message.reply_text(f'‚è≥ Generating {kind.title()} PDF with {footer_mode} footer...')
-    await _print_ticket_final(message, context, kind, footer_mode=footer_mode, clean=False)
-
-
-def confirmation_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("‚úÖ Generate PDF", callback_data="generate"),
-            InlineKeyboardButton("‚ûï Add Inclusion", callback_data="add_inclusion"),
-        ],
-        [
-            InlineKeyboardButton("‚ûï Add Exclusion", callback_data="add_exclusion"),
-            InlineKeyboardButton("‚úàÔ∏è Add Flight / Ticket", callback_data="add_flight"),
-        ],
-        [
-            InlineKeyboardButton("‚úçÔ∏è Add Flight Details in Text", callback_data="add_flight_text"),
-        ],
-        [
-            InlineKeyboardButton("üñ®Ô∏è Generate Without Cost", callback_data="generate_no_cost"),
-        ],
-        [
-            InlineKeyboardButton("üîÑ Re-enter", callback_data="reenter"),
-        ]
-    ])
-
-
-
-def ask_tour_terms_message(message, context, detail, no_cost=False):
-    context.user_data['pending_tour_pdf_detail'] = detail
-    context.user_data['pending_tour_pdf_no_cost'] = bool(no_cost)
-    return message.reply_text('üìú The final Tour PDF uses the default MyTourBazar T&C page.', parse_mode='Markdown')
-
-
-def tour_output_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("üì± WhatsApp ‚Ä¢ Basic", callback_data="tour_output:whatsapp:basic"),
-         InlineKeyboardButton("üì± WhatsApp ‚Ä¢ Detailed", callback_data="tour_output:whatsapp:detailed")],
-        [InlineKeyboardButton("üìÑ PDF ‚Ä¢ Basic", callback_data="tour_output:pdf:basic"),
-         InlineKeyboardButton("üìÑ PDF ‚Ä¢ Detailed", callback_data="tour_output:pdf:detailed")],
-        [InlineKeyboardButton("‚úèÔ∏è Smart Edit Draft", callback_data="draft_edit")],
-    ])
-
-
-def tour_pdf_mode_keyboard(detail):
-    detail = 'detailed' if str(detail).lower() == 'detailed' else 'basic'
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("üßæ Tour Quotation", callback_data=f"tour_output_mode:{detail}:quotation"),
-         InlineKeyboardButton("üé´ Tour Voucher", callback_data=f"tour_output_mode:{detail}:voucher")],
-        [InlineKeyboardButton("‚¨ÖÔ∏è Back to Draft Outputs", callback_data="draft_done")],
-    ])
-
-
-def pending_tour_name_keyboard():
-    return ReplyKeyboardMarkup(
-        [["‚è≠Ô∏è Print Without Name"], ["‚ùå Cancel"]],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
-
-
-def tour_transit_choice_keyboard(has_transit=False):
-    rows=[]
-    if has_transit:
-        rows.append([InlineKeyboardButton("‚úÖ Use Detected Transit", callback_data="tour_transit:use")])
-    rows.append([InlineKeyboardButton("‚úàÔ∏è Add / Replace Transit", callback_data="tour_transit:add")])
-    rows.append([InlineKeyboardButton("‚è≠Ô∏è Skip ‚Ä¢ Done by Self", callback_data="tour_transit:skip")])
-    rows.append([InlineKeyboardButton("‚ùå Cancel", callback_data="tour_transit:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def tour_transit_input_keyboard():
-    return ReplyKeyboardMarkup([["‚úÖ Done Transit"],["‚è≠Ô∏è Skip Transit"],["‚ùå Cancel"]],
-                               resize_keyboard=True, one_time_keyboard=False)
-
-
-async def _continue_tour_pdf_after_transit(message, context):
-    data=context.user_data.get("itinerary") or {}
-    if not str(data.get("client_name") or "").strip():
-        context.user_data["awaiting_tour_print_name"]=True
-        await message.reply_text(
-            "üë§ *Guest / Client Name is blank.*\n\n"
-            "Type the name now and I will add it immediately before printing.\n\n"
-            "Or tap *‚è≠Ô∏è Print Without Name* to continue with a generic Guest heading.",
-            parse_mode="Markdown", reply_markup=pending_tour_name_keyboard())
-        return
-    await _finish_pending_tour_pdf(message, context)
-
-
-async def _process_pending_tour_transit(message, context):
-    files=list(context.user_data.get("pending_tour_transit_files") or [])
-    text=str(context.user_data.get("pending_tour_transit_text") or "").strip()
-    if not files and not text:
-        await message.reply_text("‚ùå Send at least one flight PDF/screenshot/text, or tap Skip Transit.",
-                                 reply_markup=tour_transit_input_keyboard())
-        return
-    parts=[{"path":str(x),"mime_type":"application/pdf" if str(x).lower().endswith(".pdf") else "image/jpeg"} for x in files]
-    status=await message.reply_text("‚úàÔ∏è *Reading all transit files...*\n\nCombining PDFs, screenshots and text and detecting all sectors.",
-                                    parse_mode="Markdown")
-    try:
-        result=await _run_with_progress(status, message, lambda: asyncio.to_thread(extract_transit_from_parts, parts, text, AI_API_KEY, AI_MODEL), ['‚úàÔ∏è Reading transit sectors and terminals...','üîé Checking connecting flight details...'], 25, 92)
-        rows=result.get("transit") or []
-        data=context.user_data.get("itinerary") or {}
-        if rows:
-            data["transit"]=rows; data["transit_done_by_self"]=False
-            await safe_status_edit(status,message,f"‚úÖ *Transit recognized.*\n\n{len(rows)} sector(s) added. Terminals and aircraft are preserved whenever supplied.",parse_mode="Markdown")
-        else:
-            data["transit"]=[]; data["transit_done_by_self"]=True
-            await safe_status_edit(status,message,"‚ÑπÔ∏è No confirmed transit found. The box will show *Done by Self*.",parse_mode="Markdown")
-        context.user_data["itinerary"]=data
-        for k in ("awaiting_tour_transit_input","pending_tour_transit_files","pending_tour_transit_text"):
-            context.user_data.pop(k,None)
-        await _continue_tour_pdf_after_transit(message,context)
-    except Exception as exc:
-        logger.exception("Tour transit extraction failed")
-        await safe_status_edit(status,message,f"‚ùå *Transit extraction failed*\n\nReason: `{str(exc)[:700]}`",parse_mode="Markdown")
-        await message.reply_text("Send another transit source or tap Skip Transit.",reply_markup=tour_transit_input_keyboard())
-
-
-class _BotMessageProxy:
-    """Small Message-like adapter used by delayed auto-processing tasks."""
-    def __init__(self, bot, chat_id):
-        self._bot = bot
-        self.chat_id = chat_id
-
-    def get_bot(self):
-        return self._bot
-
-    async def reply_text(self, text, **kwargs):
-        return await self._bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
-
-    async def reply_document(self, document, **kwargs):
-        return await self._bot.send_document(chat_id=self.chat_id, document=document, **kwargs)
-
-
-class _SyntheticUpdate:
-    def __init__(self, message, user_id):
-        self.message = message
-        self.effective_user = type("User", (), {"id": user_id})()
-
-
-async def _source_ack_message(update, context, text, reply_markup=None):
-    """Create/maintain the ONE editable source-progress message.
-
-    IMPORTANT: this message must NEVER carry a normal Telegram ReplyKeyboardMarkup.
-    Telegram only allows editMessageText on messages with no reply markup or with
-    an inline keyboard. The service/action keyboard remains the chat's separate
-    reply keyboard, so the status message itself stays editable for the entire
-    countdown/extraction/generation workflow.
-    """
-    existing = context.user_data.get('_source_status_message')
-    bot = update.message.get_bot()
-
-    if existing is not None:
-        try:
-            await bot.edit_message_text(
-                chat_id=existing.chat_id,
-                message_id=existing.message_id,
-                text=text,
-                parse_mode='Markdown',
-                reply_markup=None,
-            )
-            context.user_data['_source_status_message'] = existing
-            return existing
-        except Exception as exc:
-            logger.warning(
-                "Existing source status is not editable; creating a clean status message %s/%s: %s",
-                getattr(existing, 'chat_id', None),
-                getattr(existing, 'message_id', None),
-                exc,
-            )
-
-    # NEVER attach reply_markup here.  A ReplyKeyboardMarkup makes the message
-    # non-editable and was the root cause of the repeated 400 errors in V99.
-    msg = await update.message.reply_text(text, parse_mode='Markdown')
-    context.user_data['_source_status_message'] = msg
-    return msg
-
-def _cancel_source_auto_process(context):
-    task = context.user_data.pop("_source_auto_task", None)
-    if task and not task.done():
-        task.cancel()
-
-
-async def _source_countdown(prompt_message, context, workflow, process_callback):
-    """Show a visible 5‚Üí1 countdown on a bot-owned message, then process."""
-    token = object()
-    context.user_data["_source_auto_token"] = token
-    try:
-        for remaining in range(AUTO_PRINT_SECONDS, 0, -1):
-            if context.user_data.get("_source_auto_token") is not token:
-                return
-            if workflow in ("flight", "bus", "hotel", "direct_smart", "auto_creation"):
-                text = (
-                    "‚è≥ *Auto-processing in " + str(remaining) + "s...*\n\n"
-                    "Send another page/source to reset the timer. Otherwise I will process automatically."
-                )
-            else:
-                text = (
-                    "‚è≥ *Auto-processing in " + str(remaining) + "s...*\n\n"
-                    "Send another source to reset the timer, or tap *‚úÖ Done* to process now."
-                )
-            await _safe_message_text_edit(prompt_message, text, reply_markup=None)
-            await asyncio.sleep(1)
-
-        if context.user_data.get("_source_auto_token") is not token:
-            return
-        context.user_data.pop("_source_auto_token", None)
-        context.user_data.pop("_source_auto_task", None)
-        context.user_data["_source_auto_processed"] = workflow
-        await _safe_message_text_edit(
-            prompt_message,
-            "ü§ñ *Processing your supplier material...*\n\n"
-            "‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\n"
-            "üîç Starting extraction now...",
-            reply_markup=None
-        )
-        await process_callback()
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        logger.exception("Automatic source processing failed for %s", workflow)
-    finally:
-        if context.user_data.get("_source_auto_token") is token:
-            context.user_data.pop("_source_auto_token", None)
-            context.user_data.pop("_source_auto_task", None)
-
-
-def _schedule_source_auto_process(update, context, workflow, process_callback, prompt_message=None):
-    _cancel_source_auto_process(context)
-    context.user_data['_source_auto_processed'] = None
-    if prompt_message is not None:
-        context.user_data['_source_status_message'] = prompt_message
-
-    async def _runner():
-        try:
-            msg = context.user_data.get('_source_status_message') or prompt_message
-            if msg is None:
-                msg = await update.message.reply_text('‚è≥ Auto-processing in 5s...')
-                context.user_data['_source_status_message'] = msg
-            await _source_countdown(msg, context, workflow, process_callback)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception('Could not start source countdown for %s', workflow)
-    context.user_data['_source_auto_task'] = context.application.create_task(_runner())
-
-
-def bus_ticket_keyboard():
-    return ReplyKeyboardMarkup([["‚ùå Cancel"]], resize_keyboard=True)
-
-async def bus_ticket_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        await update.message.reply_text("Sorry, this bot is private.")
-        return ConversationHandler.END
-    _cancel_auto_print(context)
-    _cancel_source_auto_process(context)
-    context.user_data.clear()
-    await update.message.reply_text(
-        "üöå *Send the bus supplier itinerary now.*\n\n"
-        "Drop a PDF, image or paste text. I will process it automatically after 5 seconds. "
-        "If the booking has more pages, send them within the countdown and I will include them together.\n\n"
-        "Tap *‚ùå Cancel* only if you want to stop.",
-        parse_mode="Markdown", reply_markup=bus_ticket_keyboard()
-    )
-    return BUS_TICKET_INPUT
-
-async def process_bus_ticket(update, context):
-    if context.user_data.get('_source_processing') == 'bus':
-        return ConversationHandler.END if 'bus' != 'tour' else None
-    context.user_data['_source_processing'] = 'bus'
-    _cancel_source_auto_process(context)
-    files=context.user_data.get('bus_ticket_files',[]); txt=context.user_data.get('bus_ticket_text','')
-    if not files and not txt:
-        await update.message.reply_text('Please send a bus PDF, image or text. Tap ‚ùå Cancel to stop.', reply_markup=bus_ticket_keyboard()); return BUS_TICKET_INPUT
-    # V176: continue editing the SAME countdown/source message.
-    status=context.user_data.get('_source_status_message')
-    if status is None:
-        status=await update.message.reply_text(
-            'üöå *Reading bus booking documents...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\n'
-            'üîç Extracting passenger, PNR, route and fare details...',
-            parse_mode='Markdown'
-        )
-        context.user_data['_source_status_message']=status
-    else:
-        await safe_status_edit(
-            status,
-            update.message,
-            'üöå *Reading bus booking documents...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\n'
-            'üîç Extracting passenger, PNR, route and fare details...',
-            parse_mode='Markdown'
-        )
-    try:
-        parts=[{'path':p,'mime_type':'application/pdf' if p.lower().endswith('.pdf') else 'image/jpeg'} for p in files]
-        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_bus_ticket,parts,txt,AI_API_KEY,AI_MODEL), ['üöå Reading bus booking pages...','üîç Extracting passenger, PNR, route and fare...'], 25, 92)
-        context.user_data['pending_bus_data']=data
-        supplier_total=_supplier_total(data)
-        context.user_data['pending_bus_fare']=None
-        context.user_data['pending_fare_supplier_total']=supplier_total
-        await safe_status_edit(status, update.message, 'üöå *Bus details extracted.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\nüí∞ Choose the fare option before I generate the ticket.',parse_mode='Markdown')
-        context.user_data['_source_processing'] = None
-        await send_fare_choice_with_countdown(update.message, context, 'bus', supplier_total, status_message=status)
-        return ConversationHandler.END
-    except Exception as exc:
-        logger.exception('Bus ticket extraction failed')
-        context.user_data['_source_processing'] = None
-        await safe_status_edit(status, update.message, f'‚ùå Bus ticket creation failed: {str(exc)[:700]}',parse_mode='Markdown')
-        return ConversationHandler.END
-
-async def bus_ticket_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    text=(update.message.text or '').strip()
-    if text == "‚úàÔ∏è Air Print":
-        return await flight_ticket_start(update, context)
-    if text == "üöå Bus Print":
-        return await bus_ticket_start(update, context)
-    if text == "üè® Hotel Print":
-        return await hotel_voucher_start(update, context)
-    if text in ("üó∫Ô∏è Tour Itinerary", "üó∫Ô∏è Tour Guide"):
-        return await new_itinerary(update, context)
-    if text in ("ü§ñ AI Assistant", "ü§ñ AI Assistant / New Request"):
-        return await smart_ai_start(update, context)
-    if text == '‚ùå Cancel': return await cancel(update,context)
-    if text == 'üìÑ Send Bus PDF':
-        await update.message.reply_text('üìÑ Send the bus booking confirmation PDF.', reply_markup=bus_ticket_keyboard()); return BUS_TICKET_INPUT
-    if text == 'üì∏ Send Bus Screenshot':
-        await update.message.reply_text('üì∏ Send one or more bus booking screenshots.', reply_markup=bus_ticket_keyboard()); return BUS_TICKET_INPUT
-    if text == '‚úçÔ∏è Send Bus Text':
-        await update.message.reply_text('‚úçÔ∏è Paste the bus booking details. You can send multiple messages.', reply_markup=bus_ticket_keyboard()); return BUS_TICKET_INPUT
-    if text == '‚úÖ Done':
-        _cancel_source_auto_process(context)
-        if context.user_data.get('_source_auto_processed') == 'bus':
-            return ConversationHandler.END
-        return await process_bus_ticket(update, context)
-    context.user_data['bus_ticket_text']=(context.user_data.get('bus_ticket_text','')+'\n'+text).strip()
-    msg=await _source_ack_message(update, context, 'üìù Bus booking text received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=bus_ticket_keyboard())
-    _schedule_source_auto_process(update, context, 'bus', lambda: process_bus_ticket(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-    return BUS_TICKET_INPUT
-
-async def bus_ticket_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    photo=update.message.photo[-1]; f=await context.bot.get_file(photo.file_id)
-    path=TEMP_DIR/f"bus_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"; await f.download_to_drive(path)
-    context.user_data.setdefault('bus_ticket_files',[]).append(str(path))
-    msg=await _source_ack_message(update, context, 'üì∏ Bus booking screenshot received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=bus_ticket_keyboard())
-    _schedule_source_auto_process(update, context, 'bus', lambda: process_bus_ticket(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-    return BUS_TICKET_INPUT
-
-async def bus_ticket_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or 'bus.pdf'
-    if not (name.lower().endswith('.pdf') or mime=='application/pdf'):
-        await update.message.reply_text('Please send the bus confirmation as PDF, screenshot, or text.', reply_markup=bus_ticket_keyboard()); return BUS_TICKET_INPUT
-    f=await context.bot.get_file(doc.file_id); safe=''.join(c if c.isalnum() or c in '._-' else '_' for c in name); path=TEMP_DIR/f"bus_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe}"; await f.download_to_drive(path)
-    context.user_data.setdefault('bus_ticket_files',[]).append(str(path))
-    msg=await _source_ack_message(update, context, 'üìÑ Bus booking PDF received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=bus_ticket_keyboard())
-    _schedule_source_auto_process(update, context, 'bus', lambda: process_bus_ticket(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-    return BUS_TICKET_INPUT
-
-async def bus_ticket_fare(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    raw=(update.message.text or '').replace(',','').replace('INR','').replace('‚Çπ','').strip()
-    try: fare=float(raw)
-    except ValueError:
-        await update.message.reply_text('‚ùå Please enter only the updated fare amount, e.g. `2500`.', parse_mode='Markdown'); return BUS_FARE_INPUT
-    if fare<=0:
-        await update.message.reply_text('‚ùå Fare must be greater than zero.'); return BUS_FARE_INPUT
-    context.user_data['pending_bus_fare']=fare
-    try:
-        await ask_footer_choice(update.message, context, 'bus')
-    except Exception as exc:
-        logger.exception('Bus PDF generation failed')
-        await update.message.reply_text(f'‚ùå PDF generation failed.\n\nReason: `{str(exc)[:800]}`', parse_mode='Markdown', reply_markup=main_keyboard())
-    return ConversationHandler.END
-
-def flight_ticket_keyboard():
-    return ReplyKeyboardMarkup([["‚ùå Cancel"]], resize_keyboard=True)
-
-async def flight_ticket_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        await update.message.reply_text("Sorry, this bot is private.")
-        return ConversationHandler.END
-    # Flight tickets do not require a separate guest-name step.
-    # Always cancel any stale auto-processing task BEFORE clearing state.
-    _cancel_auto_print(context)
-    _cancel_source_auto_process(context)
-    context.user_data.clear()
-    await update.message.reply_text(
-        "‚úàÔ∏è *Send the flight supplier itinerary now.*\n\n"
-        "Drop a PDF, image or paste text. I will process it automatically after 5 seconds. "
-        "If the booking has more pages, send them within the countdown and I will include them together.\n\n"
-        "Tap *‚ùå Cancel* only if you want to stop.",
-        parse_mode="Markdown", reply_markup=flight_ticket_keyboard()
-    )
-    return FLIGHT_TICKET_INPUT
-
-async def process_flight_ticket(update, context):
-    if context.user_data.get('_source_processing') == 'flight':
-        return ConversationHandler.END if 'flight' != 'tour' else None
-    context.user_data['_source_processing'] = 'flight'
-    _cancel_source_auto_process(context)
-    files=context.user_data.get('flight_ticket_files',[]); txt=context.user_data.get('flight_ticket_text','')
-    if not files and not txt:
-        await update.message.reply_text('Please send a flight PDF, image or text. Tap ‚ùå Cancel to stop.', reply_markup=flight_ticket_keyboard()); return FLIGHT_TICKET_INPUT
-    # V176: continue editing the SAME countdown/source message.
-    # Do not create a second "Reading flight documents" message.
-    status=context.user_data.get('_source_status_message')
-    if status is None:
-        status=await update.message.reply_text(
-            '‚úàÔ∏è *Reading flight documents...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\n'
-            'üîç Extracting passenger, PNR, flight sectors and fare details...',
-            parse_mode='Markdown'
-        )
-        context.user_data['_source_status_message']=status
-    else:
-        await safe_status_edit(
-            status,
-            update.message,
-            '‚úàÔ∏è *Reading flight documents...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\n'
-            'üîç Extracting passenger, PNR, flight sectors and fare details...',
-            parse_mode='Markdown'
-        )
-    try:
-        parts=[{'path':p,'mime_type':'application/pdf' if p.lower().endswith('.pdf') else 'image/jpeg'} for p in files]
-        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_flight_ticket,parts,txt,AI_API_KEY,AI_MODEL), ['‚úàÔ∏è Reading flight booking pages...','üîç Extracting passenger, PNR, sectors and fare...'], 25, 92)
-        context.user_data['pending_flight_data']=data
-        supplier_total=_supplier_total(data)
-        context.user_data['pending_flight_fare']=None
-        context.user_data['pending_fare_supplier_total']=supplier_total
-        context.user_data['_source_processing'] = None
-        await safe_status_edit(status, update.message, '‚úÖ *Flight details extracted from supplier source.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\nüè¢ Full airport wording preserved\nüö™ Terminal printed whenever supplied\n‚è±Ô∏è Duration printed whenever supplied\n\nüí∞ Choose the fare option before I generate the ticket.',parse_mode='Markdown')
-        await send_fare_choice_with_countdown(update.message, context, 'flight', supplier_total, status_message=status)
-        return ConversationHandler.END
-    except Exception as exc:
-        logger.exception('Flight ticket extraction failed')
-        context.user_data['_source_processing'] = None
-        await safe_status_edit(status, update.message, f'‚ùå Flight ticket creation failed: {str(exc)[:700]}',parse_mode='Markdown')
-        return ConversationHandler.END
-
-async def flight_ticket_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    text=(update.message.text or '').strip()
-    if text == "‚úàÔ∏è Air Print":
-        return await flight_ticket_start(update, context)
-    if text == "üöå Bus Print":
-        return await bus_ticket_start(update, context)
-    if text == "üè® Hotel Print":
-        return await hotel_voucher_start(update, context)
-    if text in ("üó∫Ô∏è Tour Itinerary", "üó∫Ô∏è Tour Guide"):
-        return await new_itinerary(update, context)
-    if text in ("ü§ñ AI Assistant", "ü§ñ AI Assistant / New Request"):
-        return await smart_ai_start(update, context)
-    if text == '‚ùå Cancel': return await cancel(update,context)
-    if text == 'üìÑ Send Flight PDF':
-        await update.message.reply_text('üìÑ Send the flight confirmation PDF.', reply_markup=flight_ticket_keyboard()); return FLIGHT_TICKET_INPUT
-    if text == 'üì∏ Send Flight Screenshot':
-        await update.message.reply_text('üì∏ Send one or more flight screenshots.', reply_markup=flight_ticket_keyboard()); return FLIGHT_TICKET_INPUT
-    if text == '‚úçÔ∏è Send Flight Text':
-        await update.message.reply_text('‚úçÔ∏è Paste flight details. You can send multiple messages.', reply_markup=flight_ticket_keyboard()); return FLIGHT_TICKET_INPUT
-    if text == '‚úÖ Done':
-        _cancel_source_auto_process(context)
-        if context.user_data.get('_source_auto_processed') == 'flight':
-            return ConversationHandler.END
-        return await process_flight_ticket(update, context)
-    context.user_data['flight_ticket_text']=(context.user_data.get('flight_ticket_text','')+'\n'+text).strip()
-    msg=await _source_ack_message(update, context, 'üìù Flight text received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=flight_ticket_keyboard())
-    _schedule_source_auto_process(update, context, 'flight', lambda: process_flight_ticket(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-    return FLIGHT_TICKET_INPUT
-
-async def flight_ticket_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    photo=update.message.photo[-1]; f=await context.bot.get_file(photo.file_id)
-    path=TEMP_DIR/f"flight_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"; await f.download_to_drive(path)
-    context.user_data.setdefault('flight_ticket_files',[]).append(str(path))
-    msg=await _source_ack_message(update, context, 'üì∏ Flight screenshot received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=flight_ticket_keyboard())
-    _schedule_source_auto_process(update, context, 'flight', lambda: process_flight_ticket(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-    return FLIGHT_TICKET_INPUT
-
-async def flight_ticket_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or 'flight.pdf'
-    if not (name.lower().endswith('.pdf') or mime=='application/pdf'):
-        await update.message.reply_text('Please send the flight confirmation as PDF, screenshot, or text.', reply_markup=flight_ticket_keyboard()); return FLIGHT_TICKET_INPUT
-    f=await context.bot.get_file(doc.file_id); safe=''.join(c if c.isalnum() or c in '._-' else '_' for c in name); path=TEMP_DIR/f"flight_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe}"; await f.download_to_drive(path)
-    context.user_data.setdefault('flight_ticket_files',[]).append(str(path))
-    msg=await _source_ack_message(update, context, 'üìÑ Flight PDF received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=flight_ticket_keyboard())
-    _schedule_source_auto_process(update, context, 'flight', lambda: process_flight_ticket(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-    return FLIGHT_TICKET_INPUT
-
-
-async def flight_ticket_fare(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    raw=(update.message.text or '').strip()
-    supplier_total=float(context.user_data.get('pending_fare_supplier_total',0) or 0)
-    include_infants=_fare_include_infants(raw)
-    pax_count=_fare_pax_count(
-        context.user_data.get('pending_flight_data') or {},
-        include_infants=include_infants,
-    )
-    try:
-        fare=_parse_markup_input(raw,supplier_total,pax_count)
-    except ValueError as exc:
-        await update.message.reply_text(
-            f'‚ùå {exc}\n\nExamples: `+800 per person`, `markup 1200 total`, `15000 total`.',
-            parse_mode='Markdown'
-        ); return FLIGHT_FARE_INPUT
-    await update.message.reply_text(_fare_cost_confirmation(raw,supplier_total,fare,pax_count),parse_mode='Markdown')
-    context.user_data['pending_flight_fare']=fare
-    try:
-        await ask_footer_choice(update.message, context, 'flight')
-    except Exception as exc:
-        logger.exception('Flight PDF generation failed')
-        await update.message.reply_text(f'‚ùå PDF generation failed.\n\nReason: `{str(exc)[:800]}`', parse_mode='Markdown', reply_markup=main_keyboard())
-    return ConversationHandler.END
-
-async def hotel_voucher_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        await update.message.reply_text("Sorry, this bot is private.")
-        return ConversationHandler.END
-
-    # Cancel any stale workflow timer before resetting this service.
-    _cancel_auto_print(context)
-    _cancel_source_auto_process(context)
-    context.user_data.clear()
-    context.user_data["voucher_files"] = []
-    context.user_data["voucher_text"] = ""
-    await update.message.reply_text(
-        "üè® *Send the hotel supplier itinerary now.*\n\n"
-        "Drop a PDF, image or paste text. I will automatically read the reservation, guest, hotel, room, occupancy, meal plan and terms. "
-        "If there are multiple pages, send them within the 5-second countdown.\n\n"
-        "Tap *‚ùå Cancel* only if you want to stop.",
-        parse_mode="Markdown",
-        reply_markup=voucher_keyboard(),
-    )
-    return HOTEL_VOUCHER_INPUT
-
-
-async def hotel_voucher_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-    text=(update.message.text or "").strip()
-    if text == "‚úàÔ∏è Air Print":
-        return await flight_ticket_start(update, context)
-    if text == "üöå Bus Print":
-        return await bus_ticket_start(update, context)
-    if text == "üè® Hotel Print":
-        return await hotel_voucher_start(update, context)
-    if text in ("üó∫Ô∏è Tour Itinerary", "üó∫Ô∏è Tour Guide"):
-        return await new_itinerary(update, context)
-    if text in ("ü§ñ AI Assistant", "ü§ñ AI Assistant / New Request"):
-        return await smart_ai_start(update, context)
-    if text == "‚ùå Cancel":
-        return await cancel(update, context)
-    if text == "üìÑ Send Hotel PDF":
-        await update.message.reply_text("üìÑ Send the hotel confirmation PDF now.", reply_markup=voucher_keyboard())
-        return HOTEL_VOUCHER_INPUT
-    if text == "üì∏ Send Hotel Screenshot":
-        await update.message.reply_text("üì∏ Send the hotel confirmation screenshot now. You can send multiple pages.", reply_markup=voucher_keyboard())
-        return HOTEL_VOUCHER_INPUT
-    if text == "‚úçÔ∏è Send Hotel Text":
-        await update.message.reply_text("‚úçÔ∏è Paste the hotel confirmation details now. You can send multiple messages.", reply_markup=voucher_keyboard())
-        return HOTEL_VOUCHER_INPUT
-    if text == "‚úÖ Done":
-        _cancel_source_auto_process(context)
-        if context.user_data.get('_source_auto_processed') == 'hotel':
-            return ConversationHandler.END
-        await process_hotel_voucher(update, context)
-        return ConversationHandler.END
-    if len(text) > 50000:
-        await update.message.reply_text("This text is too long for one Telegram message. Please send it in parts or as a PDF.", reply_markup=voucher_keyboard())
-        return HOTEL_VOUCHER_INPUT
-    context.user_data["voucher_text"] = (context.user_data.get("voucher_text", "") + "\n" + text).strip()
-    msg=await _source_ack_message(update, context, "üìù Hotel details received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.", reply_markup=voucher_keyboard())
-    _schedule_source_auto_process(update, context, 'hotel', lambda: process_hotel_voucher(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-    return HOTEL_VOUCHER_INPUT
-
-
-async def hotel_voucher_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-    try:
-        photo=update.message.photo[-1]
-        tg_file=await context.bot.get_file(photo.file_id)
-        filename=TEMP_DIR / f"voucher_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
-        await tg_file.download_to_drive(filename)
-        context.user_data.setdefault("voucher_files", []).append(str(filename))
-        msg=await _source_ack_message(
-            update,
-            context,
-            "üì∏ Hotel screenshot received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.",
-            reply_markup=voucher_keyboard()
-        )
-        _schedule_source_auto_process(update, context, 'hotel', lambda: process_hotel_voucher(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-        return HOTEL_VOUCHER_INPUT
-    except Exception as exc:
-        logger.exception("Hotel voucher photo failed")
-        await update.message.reply_text(f"‚ùå Could not read the hotel screenshot: {exc}", reply_markup=voucher_keyboard())
-        return HOTEL_VOUCHER_INPUT
-
-
-async def hotel_voucher_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-    doc=update.message.document
-    filename_lower=(doc.file_name or "").lower()
-    mime=(doc.mime_type or "").lower()
-    if not (filename_lower.endswith(".pdf") or mime == "application/pdf"):
-        await update.message.reply_text("Please send the hotel confirmation as a PDF, screenshot, or text.", reply_markup=voucher_keyboard())
-        return HOTEL_VOUCHER_INPUT
-    try:
-        tg_file=await context.bot.get_file(doc.file_id)
-        safe_name="".join(c if c.isalnum() or c in "._-" else "_" for c in (doc.file_name or "hotel_voucher.pdf"))
-        path=TEMP_DIR / f"voucher_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe_name}"
-        await tg_file.download_to_drive(path)
-        context.user_data.setdefault("voucher_files", []).append(str(path))
-        msg=await _source_ack_message(update, context, "üìÑ Hotel PDF received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.", reply_markup=voucher_keyboard())
-        _schedule_source_auto_process(update, context, 'hotel', lambda: process_hotel_voucher(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-        return HOTEL_VOUCHER_INPUT
-    except Exception as exc:
-        logger.exception("Hotel voucher PDF failed")
-        await update.message.reply_text(f"‚ùå Could not read the hotel PDF: {exc}", reply_markup=voucher_keyboard())
-        return HOTEL_VOUCHER_INPUT
-
-
-async def process_hotel_voucher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('_source_processing') == 'hotel':
-        return ConversationHandler.END if 'hotel' != 'tour' else None
-    context.user_data['_source_processing'] = 'hotel'
-    _cancel_source_auto_process(context)
-    # Hotel Print extraction is fully local.
-    files=context.user_data.get("voucher_files", [])
-    source_text=context.user_data.get("voucher_text", "")
-    if not files and not source_text:
-        await update.message.reply_text("Please send a hotel PDF, image or text. Tap ‚ùå Cancel to stop.", reply_markup=voucher_keyboard())
-        return
-    # V176: continue editing the SAME countdown/source message.
-    status=context.user_data.get('_source_status_message')
-    if status is None:
-        status=await update.message.reply_text(
-            "üè® *Reading hotel confirmation...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\n"
-            "üîç Extracting booking details...",
-            parse_mode="Markdown"
-        )
-        context.user_data['_source_status_message']=status
-    else:
-        await safe_status_edit(
-            status,
-            update.message,
-            "üè® *Reading hotel confirmation...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\n"
-            "üîç Extracting booking details...",
-            parse_mode="Markdown"
-        )
-    try:
-        parts=[]
-        for f in files:
-            mime="application/pdf" if f.lower().endswith(".pdf") else "image/jpeg"
-            parts.append({"path":f,"mime_type":mime})
-        data=await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_hotel_voucher, parts, source_text, AI_API_KEY, AI_MODEL), ['üè® Reading the complete hotel confirmation...','üß† Qwen is structuring guest, reservation, rooms and stay details...'], 25, 92)
-        # The extraction is complete and structured data is now self-contained. Clear the
-        # source list before fare/costing actions so a delayed callback can never try to
-        # reopen a deleted incoming voucher file.
-        for _src in list(files):
-            try: Path(_src).unlink(missing_ok=True)
-            except Exception: pass
-        context.user_data['voucher_files']=[]
-        await safe_status_edit(status, update.message, "üè® *Hotel details extracted successfully.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\nüí∞ Choose the fare option before I generate the voucher.", parse_mode="Markdown")
-        context.user_data['pending_hotel_data']=data
-        context.user_data['pending_hotel_fare']=None
-        context.user_data['pending_fare_supplier_total']=_supplier_total(data)
-        context.user_data['_source_processing'] = None
-        await send_fare_choice_with_countdown(update.message, context, 'hotel', context.user_data.get('pending_fare_supplier_total', 0), status_message=status)
-        return ConversationHandler.END
-    except Exception as exc:
-        logger.exception("Hotel voucher extraction failed")
-        context.user_data['_source_processing'] = None
-        await safe_status_edit(status, update.message, f"‚ùå *Hotel voucher creation failed*\n\nReason: `{str(exc)[:800]}`", parse_mode="Markdown")
-        await update.message.reply_text("Please try üè® Hotel Print again.", reply_markup=main_keyboard())
-
-
-
-def smart_source_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            ["‚úàÔ∏è Air Print", "üè® Hotel Print"],
-            ["üöå Bus Print", "‚ö° Process Now"],
-            ["‚ûï Send Another", "ü§ñ AI Assistant / New Request"],
-            ["‚ùå Cancel"],
-        ],
-        resize_keyboard=True,
-    )
-
-def direct_drop_keyboard():
-    """Minimal keyboard for the /start drag-and-drop path."""
-    return ReplyKeyboardMarkup([["‚ùå Cancel"]], resize_keyboard=True)
-
-
-def auto_creation_keyboard():
-    """Auto Creation intentionally has no workflow buttons beyond Cancel."""
-    return ReplyKeyboardMarkup([["‚ùå Cancel"]], resize_keyboard=True)
-
-
-async def auto_creation_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start one mixed-source Tour batch: supplier package + tickets + notes/voice."""
-    if not is_allowed(update):
-        return ConversationHandler.END
-    _cancel_auto_print(context)
-    _cancel_source_auto_process(context)
-    context.user_data.clear()
-    context.user_data["smart_mode"] = True
-    context.user_data["smart_force_kind"] = "package"
-    context.user_data["auto_creation"] = True
-    context.user_data["smart_files"] = []
-    context.user_data["smart_text"] = ""
-    await update.message.reply_text(
-        "ü§ñ *AUTO CREATION ‚Ä¢ SMART TOUR BUILDER*\n\n"
-        "Send everything related to *one client / one tour* together. You can mix:\n"
-        "‚Ä¢ Supplier Tour PDF / image / text\n"
-        "‚Ä¢ Flight ticket PDF / screenshot\n"
-        "‚Ä¢ Train ticket\n"
-        "‚Ä¢ Bus ticket\n"
-        "‚Ä¢ Hotel confirmation\n"
-        "‚Ä¢ Extra instructions as normal text or voice note\n\n"
-        "I will match passenger names, travel dates, routes, hotels and transport, remove duplicate sectors, "
-        "and build one proper *day-wise MyTourBazar Tour itinerary*.\n\n"
-        "Send multiple items one after another. Processing starts automatically a few seconds after the last item.",
-        parse_mode="Markdown",
-        reply_markup=auto_creation_keyboard(),
-    )
-    return SMART_INPUT
-
-
-def _smart_parts(context):
-    parts = []
-    for f in context.user_data.get("smart_files", []):
-        mime = "application/pdf" if str(f).lower().endswith(".pdf") else "image/jpeg"
-        parts.append({"path": str(f), "mime_type": mime})
-    return parts
-
-
-async def start_fresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-    _cancel_auto_print(context)
-    _cancel_source_auto_process(context)
-    context.user_data.clear()
-    context.user_data["smart_mode"] = True
-    context.user_data["smart_files"] = []
-    context.user_data["smart_text"] = ""
-    await update.message.reply_text(
-        "üÜï *Fresh start*\n\n"
-        "What do you want me to make or change? Tell me in your own words ‚Äî short details are enough.\n\n"
-        "Example: `Make a 4 night / 5 day Goa package for Mr. Amit, 2 adults, 3-star hotels, breakfast, private cab, North & South Goa sightseeing.`\n\n"
-        "You can also send a supplier *PDF, screenshot or text* and I will recognize whether it is Tour, Air, Bus or Hotel automatically.\n"
-        "‚úàÔ∏è No flight/train/bus mentioned = no transit will be added.\n"
-        "üè® No hotel name mentioned = no hotel name will be invented; only the requested category can be shown.",
-        parse_mode="Markdown",
-        reply_markup=smart_source_keyboard(),
-    )
-    return SMART_INPUT
-
-
-
-async def smart_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-    _cancel_auto_print(context)
-    _cancel_source_auto_process(context)
-    context.user_data.clear()
-    context.user_data["smart_mode"] = True
-    context.user_data["smart_files"] = []
-    context.user_data["smart_text"] = ""
-    await update.message.reply_text(
-        "ü§ñ *MyTourBazar AI Assistant ‚Ä¢ Quick Client Itinerary*\n\n"
-        "For a quick client enquiry, just send the details naturally ‚Äî no prefix is required. "
-        "I will create the full day-wise itinerary myself and open the same Tour draft/output workflow.\n\n"
-        "For example:\n"
-        "‚Ä¢ `Make a 4 night / 5 day Goa package for Mr. Amit, 2 adults, 3-star hotels, breakfast, private cab, North & South Goa sightseeing.`\n"
-        "‚Ä¢ `Make a 5 night / 6 day Kashmir family package, 4 adults, 3-star hotels, breakfast and private vehicle.`\n"
-        "‚Ä¢ `Edit MTB12 and change Day 3 sightseeing.`\n\n"
-        "I will automatically understand the destination, duration, hotel category, meals, vehicle, sightseeing and other details.\n"
-        "‚úàÔ∏è If you do not mention a flight/train/bus, I will NOT add one.\n"
-        "üè® If you do not give a hotel name, I will NOT invent one; I can show only the requested hotel category.\n\n"
-        "üì• You can still drop supplier PDFs/screenshots/text when you actually want supplier extraction.\n\n"
-        "üéôÔ∏è *Voice also works here:* after pressing AI Assistant, simply send a voice note and ask naturally ‚Äî no prefix or command is required.\n\n"
-        "Or use the quick Air / Hotel / Bus buttons below when you want to force a specific type.",
-        parse_mode="Markdown",
-        reply_markup=smart_source_keyboard(),
-    )
-    return SMART_INPUT
-
-
-def _smart_mtb_edit_request(text):
-    """Return (reference, instruction) for a natural MTB edit request, else ("","")."""
-    raw = str(text or "").strip()
-    ref_match = re.search(r"\bMTB\s*[-#]?\s*(\d+)\b", raw, re.I)
-    if not ref_match:
-        return "", ""
-    has_edit = bool(re.search(
-        r"\b(edit|modify|change|update|replace|remove|delete|add|revise|correct|fix)\b",
-        raw, re.I
-    ))
-    if not has_edit:
-        return "", ""
-    return f"MTB{int(ref_match.group(1)):02d}", raw
-
-
-def _looks_like_new_tour_brief(text):
-    """Catch quick client Tour briefs with or without command words.
-
-    Examples:
-      Goa 4N 5D, Mr Amit, 2 adults, 3 star, breakfast, private cab
-      Kashmir 5 nights 6 days, 4 adults, 3 star, breakfast
-      Make a Goa package...
-    """
-    t = str(text or "").strip()
-    low = t.lower()
-    if not low:
-        return False
-
-    # A saved-reference edit is not a new quick itinerary.
-    if _smart_mtb_edit_request(t)[0]:
-        return False
-
-    # Strong duration forms: 4N 5D / 4N/5D / 4 nights 5 days / 5 days.
-    duration_pair = bool(re.search(
-        r"\b\d+\s*(?:n|night|nights)\s*(?:[/+\-& ]+)?\s*\d+\s*(?:d|day|days)\b",
-        low, re.I
-    ))
-    duration_single = bool(re.search(r"\b\d+\s*(?:d|day|days|n|night|nights)\b", low, re.I))
-    duration = duration_pair or duration_single
-
-    pax = bool(re.search(
-        r"\b(?:\d+\s*(?:adult|adults|pax|person|persons|child|children|infant|infants)|couple|family)\b",
-        low, re.I
-    ))
-    hotel = bool(re.search(
-        r"\b[1-5]\s*(?:star|stars|\*)\b|\b(?:hotel|hotels|resort|resorts|accommodation)\b",
-        low, re.I
-    ))
-    service = bool(re.search(
-        r"\b(?:breakfast|dinner|lunch|meal|meals|cab|vehicle|car|transfer|transfers|"
-        r"sightseeing|pickup|drop|private|shared|cp|map|mapai)\b",
-        low, re.I
-    ))
-    create_word = bool(re.search(
-        r"\b(?:make|create|prepare|plan|build|design|draft|itinerary|package|tour|holiday|trip|quotation|quote|voucher)\b",
-        low, re.I
-    ))
-
-    # The quick format does not require "make/package/tour".
-    # Duration + one more travel signal is enough.
-    if duration and (pax or hotel or service):
-        return True
-
-    return bool(create_word and (duration or pax or hotel or service))
-
-
-def _smart_requested_tour_mode(text):
-    low = str(text or "").lower()
-    if re.search(r"\b(?:tour\s+)?voucher\b", low):
-        return "voucher"
-    if re.search(r"\bquotation\b|\bquote\b", low):
-        return "quotation"
-    return ""
-
-
-def _smart_requested_tour_detail(text):
-    low = str(text or "").lower()
-    if re.search(r"\b(detailed|detail|full[- ]?length|elaborate)\b", low):
-        return "detailed"
-    if re.search(r"\b(basic|short|brief)\b", low):
-        return "basic"
-    return "basic"
-
-
-def _looks_like_supplier_material(text):
-    """Return True when text looks like supplier/booking source material, not an owner brief.
-
-    Text-only Smart Assistant input used to be treated as a NEW TOUR brief whenever the
-    classifier returned package. That caused supplier tour text to be regenerated as a
-    generic destination plan instead of being extracted. This detector keeps supplier
-    text on the source-extraction path while preserving natural-language tour requests.
-    """
-    t = str(text or "").lower()
-    if not t:
-        return False
-    supplier_markers = (
-        "supplier", "booking confirmation", "confirmation number", "reservation number",
-        "booking reference", "booking id", "pnr", "ticket number", "e-ticket", "eticket",
-        "passenger name", "traveller name", "travel date", "departure", "arrival",
-        "boarding", "terminal", "baggage", "fare", "base fare", "taxes",
-        "hotel confirmation", "check-in", "check in", "check-out", "check out",
-        "room type", "room category", "meal plan", "hotel contact", "property address",
-        "bus operator", "boarding point", "dropping point", "drop point", "seat number",
-        "service number", "day 1", "day 2", "day 3", "sightseeing", "inclusions",
-        "exclusions", "accommodation schedule", "package cost", "per adult",
-        "cwb", "cnb", "extra bed", "option 2"
-    )
-    hits = sum(1 for marker in supplier_markers if marker in t)
-    # A reasonably long structured source is almost certainly supplier material.
-    line_count = len([x for x in t.splitlines() if x.strip()])
-    return hits >= 2 or line_count >= 12 or len(t) >= 900
-
-
-async def smart_process(update, context):
-    text = context.user_data.get("smart_text", "").strip()
-    parts = _smart_parts(context)
-    if not text and not parts:
-        await update.message.reply_text("Send a PDF, image or text first.", reply_markup=direct_drop_keyboard() if context.user_data.get('_direct_drop_mode') else smart_source_keyboard())
-        return SMART_INPUT
-    # Reuse the single source/status message created when the supplier file/text was received.
-    # Never create a second progress message if one already exists.
-    status = context.user_data.get("_source_status_message")
-    if status is None:
-        status = await update.message.reply_text(
-            "ü§ñ *Understanding your request...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\n‚ö° Checking only the relevant booking pages and ignoring supplier terms/offers...",
-            parse_mode="Markdown"
-        )
-        context.user_data["_source_status_message"] = status
-    try:
-        # Supplier material uses one fast source-classification call before service extraction.
-        # Owner-only natural-language requests use the autonomous planner, so buttons are not the limit.
-        supplier_text = bool(text and _looks_like_supplier_material(text))
-        forced_kind = str(context.user_data.get("smart_force_kind") or "").lower()
-        if forced_kind in ("flight", "bus", "hotel", "package"):
-            result = {"kind": forced_kind, "confidence": 1.0, "reason": f"{forced_kind.title()} mode was selected manually.", "reference": "", "instruction": text}
-        elif parts or supplier_text:
-            result = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_classify, parts, text, AI_API_KEY, AI_MODEL), ["‚ö° Identifying the supplier document type locally...", "üîé Reading the supplied material..."], 20, 48)
-        else:
-            # Deterministic no-prefix routing before local planning.
-            # This prevents natural Tour briefs such as "Goa 4N/5D..." from being
-            # incorrectly redirected to Tour Guide, while MTB edits still win.
-            direct_ref, direct_instruction = _smart_mtb_edit_request(text)
-            if direct_ref:
-                result = {
-                    "kind": "edit", "confidence": 1.0,
-                    "reason": "Existing MyTourBazar reference edit detected.",
-                    "reference": direct_ref, "instruction": direct_instruction or text,
-                }
-            elif _looks_like_new_tour_brief(text):
-                result = {
-                    "kind": "package", "confidence": 1.0,
-                    "reason": "New Tour itinerary/quotation brief detected.",
-                    "reference": "", "instruction": text,
-                }
-            else:
-                plan = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(agent_plan, text, text, AI_API_KEY, AI_MODEL), ["üß† Local Assistant is understanding the request...", "üß≠ Selecting the correct MyTourBazar workflow..."], 10, 30)
-                action = str(plan.get("action", "ask_user"))
-                if action == "edit_document" and plan.get("reference"):
-                    result = {"kind":"edit", "confidence":0.99, "reason":plan.get("reason","Existing document change requested."), "reference":plan.get("reference",""), "instruction":plan.get("instruction") or text}
-                elif action == "generate_brief":
-                    result = {"kind":"package", "confidence":0.99, "reason":plan.get("reason","New tour itinerary requested."), "reference":"", "instruction":plan.get("instruction") or text}
-                elif action == "chat":
-                    result = {"kind":"chat", "confidence":0.99, "reason":plan.get("reason","Normal assistant request."), "reference":"", "instruction":text, "answer":plan.get("answer","")}
-                else:
-                    result = {"kind":"unknown", "confidence":0.0, "reason":plan.get("needs_user_input") or "I need more information.", "reference":"", "instruction":text}
-        kind = str(result.get("kind", "unknown")).lower()
-        conf = float(result.get("confidence", 0) or 0)
-        reason = result.get("reason", "")
-        forced_kind = str(context.user_data.get("smart_force_kind") or "").lower()
-        if forced_kind in ("flight", "bus", "hotel", "package"):
-            kind = forced_kind
-            conf = 1.0
-            reason = f"{forced_kind.title()} mode was selected manually."
-        ref = str(result.get("reference", "") or "").upper()
-        instruction = str(result.get("instruction", "") or text).strip()
-        await safe_status_edit(status, update.message, 
-            f"ü§ñ *I understood this as: {kind.upper()}*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 55%\n\n{reason or 'Preparing the correct MyTourBazar workflow...'}",
-            parse_mode="Markdown",
-        )
-
-        if kind == "edit" and ref:
-            record = load_record(ref)
-            if not record:
-                await safe_status_edit(status, update.message, f"‚ùå I understood the reference as `{ref}`, but that reference was not found.", parse_mode="Markdown")
-                await update.message.reply_text("Please tap *Modify & Regenerate* on the PDF you want to change.", parse_mode="Markdown", reply_markup=main_keyboard())
-                return ConversationHandler.END
-            context.user_data["editing_reference"] = ref
-            await safe_status_edit(status, update.message, f"‚úèÔ∏è *Reference {ref} identified.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\nApplying your requested changes...", parse_mode="Markdown")
-            await perform_saved_edit(update, context, instruction)
-            return ConversationHandler.END
-
-        if kind == "chat":
-            answer = str(result.get("answer") or "").strip()
-            if not answer:
-                answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text, AI_API_KEY, AI_MODEL), ['üí¨ Local Assistant is preparing your reply...'], 60, 92)
-            await safe_status_edit(status, update.message, answer or "I‚Äôm ready. Tell me what you want me to do.", parse_mode=None)
-            await update.message.reply_text("Send another request or supplier document.", reply_markup=main_keyboard())
-            return ConversationHandler.END
-
-        if kind == "unknown" or conf < 0.45:
-            answer = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(ai_chat, text or "I sent a supplier document but its type could not be identified.", AI_API_KEY, AI_MODEL), ['üí¨ Local Assistant is reviewing what you sent...'], 60, 92)
-            await safe_status_edit(status, update.message, "ü§î *I need a little more information.*\n\n" + (answer or "Please tell me whether this is a tour, flight, bus or hotel document."))
-            await update.message.reply_text("You can send another file/text or use a print button.", reply_markup=main_keyboard())
-            return ConversationHandler.END
-
-        if kind == "package":
-            smart_files = [str(x) for x in context.user_data.get("smart_files", [])]
-            smart_text_value = text
-            auto_creation = bool(context.user_data.get("auto_creation"))
-            if auto_creation:
-                smart_text_value = (
-                    "AUTO CREATION MODE. Treat all supplied items as one candidate client-tour batch. "
-                    "Use the supplier package/day plan as the main itinerary source when one is supplied. Match flight/train/bus/hotel tickets to the tour using passenger names, travel dates, route continuity, destination, pickup/drop and package dates. "
-                    "If there is no supplier day plan but the owner explicitly asks to CREATE a tour for a stated destination/duration, you may build a sensible day-wise sightseeing plan from normal travel knowledge; never invent confirmed hotel names, bookings, prices, tickets or transport facts. "
-                    "Deduplicate repeated tickets/sectors. Do not merge a clearly mismatched passenger/date/route. Never invent missing confirmed facts. "
-                    "Build one proper day-wise itinerary and weave matched arrival/departure transport naturally into the relevant day descriptions while ALSO preserving every real public-transport sector in transit. "
-                    "Infer outward/connection/return direction from dates and route sequence without requiring Onward/Return labels.\n\nOWNER NOTES:\n"
-                    + smart_text_value
-                ).strip()
-            # V168: AI Assistant can create a brand-new Tour directly from a natural
-            # owner brief. Supplier extraction remains a separate path.
-            if not auto_creation and not smart_files and smart_text_value and not _looks_like_supplier_material(smart_text_value):
-                requested_detail = _smart_requested_tour_detail(smart_text_value)
-                requested_mode = _smart_requested_tour_mode(smart_text_value)
-                requested_b2b = _smart_requested_b2b(smart_text_value)
-
-                await safe_status_edit(
-                    status,
-                    update.message,
-                    "üó∫Ô∏è *New Tour brief understood.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 55%\n\n‚ú® Building a professional day-wise itinerary from your instructions...",
-                    parse_mode="Markdown",
-                )
-
-                data = await _run_with_progress(
-                    status,
-                    update.message,
-                    lambda: asyncio.to_thread(
-                        generate_package_from_brief,
-                        smart_text_value,
-                        AI_API_KEY,
-                        AI_MODEL,
-                        requested_detail,
-                    ),
-                    [
-                        "üß≠ Planning the destination flow...",
-                        "üè® Applying your hotel category, meals and vehicle...",
-                        "üó∫Ô∏è Building the requested day-wise sightseeing plan...",
-                    ],
-                    55,
-                    92,
-                )
-
-                data = _normalize_guest_counts(data or {})
-                data["detail_level"] = requested_detail
-                data["document_mode"] = requested_mode or "itinerary"
-                data["show_cost"] = bool(data.get("package_costs"))
-                if requested_b2b:
-                    data = _b2b_neutralize_data(data, requested_mode or "itinerary")
-                    data["greeting"] = _b2b_greeting(data, requested_mode or "itinerary")
-
-                # V169: Quick Client Itinerary must enter the SAME normal Tour
-                # draft/review/output workflow used by Tour Guide after extraction.
-                # This gives Modify & Regenerate, Basic/Detailed WhatsApp,
-                # Basic/Detailed PDF, then Quotation/Voucher selection.
-                context.user_data.clear()
-                context.user_data["quick_ai_tour"] = True
-                context.user_data["smart_owner_brief"] = True
-                context.user_data["source_text"] = smart_text_value
-                context.user_data["itinerary"] = data
-                context.user_data["_source_status_message"] = status
-                context.user_data["pending_tour_document_mode"] = requested_mode or "itinerary"
-                context.user_data["smart_requested_document_mode"] = requested_mode
-                context.user_data["pending_tour_pdf_no_cost"] = not bool(
-                    data.get("show_cost") and data.get("package_costs")
-                )
-                if requested_b2b:
-                    context.user_data["pending_b2b"] = True
-                    context.user_data["pending_clean_agency"] = True
-                    context.user_data["pending_tour_last_page"] = "b2b"
-
-                await safe_status_edit(
-                    status,
-                    update.message,
-                    "‚úÖ *Quick client itinerary created.*\n\n"
-                    "‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\n" +
-                    ("B2B white-label mode is active. " if requested_b2b else "") +
-                    "Review the client draft below. You can Modify & Regenerate it, "
-                    "send Basic/Detailed WhatsApp, or create Basic/Detailed PDF and then choose Quotation/Voucher.",
-                    parse_mode="Markdown",
-                )
-
-                await continue_tour_preprint_options(update.message, context, data)
-                return ConversationHandler.END
-
-            # Supplier package material goes directly into the authoritative source
-            # extractor. Do not stop at classification or wait for a guest name first:
-            # the supplier itself may contain the guest name. If it doesn't, the
-            # extractor will leave it blank and we can ask afterwards.
-            context.user_data.clear()
-            context.user_data["tour_v2"] = True
-            context.user_data["tour_v2_phase"] = "source"
-            context.user_data["auto_creation"] = auto_creation
-            context.user_data["_source_status_message"] = status
-            context.user_data["media_files"] = smart_files
-            context.user_data["source_text"] = smart_text_value
-            if auto_creation:
-                context.user_data["pending_tour_last_page"] = "without_footer"
-                context.user_data["pending_tour_footer_mode"] = "none"
-            context.user_data["flight_files"] = []
-            context.user_data["flight_text"] = ""
-            context.user_data["extra_inclusions"] = []
-            context.user_data["extra_exclusions"] = []
-            await safe_status_edit(status, update.message, "üó∫Ô∏è *Tour supplier material recognized.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\nüì• Sending the complete source to the Tour extractor now...", parse_mode="Markdown")
-            await process_sources(update, context)
-            # Missing guest name does not block the draft; it is handled only before PDF printing.
-            return ConversationHandler.END
-
-        if kind == "flight":
-            files = [str(x) for x in context.user_data.get("smart_files", [])]
-            data = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_flight_ticket, _smart_parts(context), text, AI_API_KEY, AI_MODEL), ["‚úàÔ∏è Reading passenger, PNR and flight sectors...", "üîç Extracting airport, terminal and duration details..."], 60, 92)
-            context.user_data.clear()
-            context.user_data["_source_status_message"] = status
-            context.user_data["pending_flight_data"] = data
-            supplier_total = _supplier_total(data)
-            context.user_data["smart_mode"] = False
-            context.user_data["pending_flight_fare"] = None
-            context.user_data["pending_fare_supplier_total"] = supplier_total
-            await safe_status_edit(status, update.message, "‚úÖ *Air Print extracted from supplier source.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\nüè¢ Full airport text preserved\nüö™ Terminal kept whenever supplied\n‚è±Ô∏è Duration kept whenever supplied", parse_mode="Markdown")
-            await send_fare_choice_with_countdown(update.message, context, "flight", supplier_total, status_message=status)
-            return ConversationHandler.END
-
-        if kind == "bus":
-            data = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_bus_ticket, _smart_parts(context), text, AI_API_KEY, AI_MODEL), ["üöå Reading passenger, PNR and route details...", "üîç Extracting fare and journey details..."], 60, 92)
-            context.user_data.clear()
-            context.user_data["_source_status_message"] = status
-            context.user_data["pending_bus_data"] = data
-            supplier_total = _supplier_total(data)
-            await safe_status_edit(status, update.message, "üöå *Bus Print recognized and extracted.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%", parse_mode="Markdown")
-            context.user_data["smart_mode"] = False
-            context.user_data["pending_bus_fare"] = None
-            context.user_data["pending_fare_supplier_total"] = supplier_total
-            await send_fare_choice_with_countdown(update.message, context, "bus", supplier_total, status_message=status)
-            return ConversationHandler.END
-
-        if kind == "hotel":
-            context.user_data["voucher_files"] = [str(x) for x in context.user_data.get("smart_files", [])]
-            context.user_data["voucher_text"] = text
-            await safe_status_edit(status, update.message, "üè® *Hotel Print recognized.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\nExtracting booking details, then I will ask for fare / markup before printing.", parse_mode="Markdown")
-            await process_hotel_voucher(update, context)
-            return ConversationHandler.END
-
-    except Exception as exc:
-        logger.exception("Smart local processing failed")
-        await safe_status_edit(status, update.message, f"‚ùå *Local processing failed*\n\nReason: `{str(exc)[:800]}`", parse_mode="Markdown")
-        await update.message.reply_text("Try üÜï Start Fresh and send the supplier material again.", reply_markup=main_keyboard())
-        return ConversationHandler.END
-
-
-async def smart_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-    text = (update.message.text or "").strip()
-    if text == "ü§ñ Auto Creation":
-        return await auto_creation_start(update, context)
-    if text == "üÜï Start Fresh":
-        return await smart_ai_start(update, context)
-    if text == "‚ùå Cancel":
-        return await cancel(update, context)
-    if text in ("‚úàÔ∏è Air Print", "üöå Bus Print", "üè® Hotel Print"):
-        forced = {"‚úàÔ∏è Air Print":"flight", "üöå Bus Print":"bus", "üè® Hotel Print":"hotel"}[text]
-        context.user_data["smart_force_kind"] = forced
-        label = {"flight":"Air", "bus":"Bus", "hotel":"Hotel"}[forced]
-        await update.message.reply_text(
-            f"{text.split()[0]} *{label} mode selected.*\n\nDrop the supplier PDF/screenshot/text here. I will still read all pages automatically.",
-            parse_mode="Markdown", reply_markup=smart_source_keyboard()
-        )
-        return SMART_INPUT
-    if text == "‚ö° Process Now":
-        _cancel_source_auto_process(context)
-        return await smart_process(update, context)
-    if text == "‚ûï Send Another":
-        await update.message.reply_text("üìé Send the next supplier PDF/screenshot or paste more text.", reply_markup=smart_source_keyboard())
-        return SMART_INPUT
-    context.user_data["smart_text"] = (context.user_data.get("smart_text", "") + "\n" + text).strip()
-
-    # V169 QUICK CLIENT ITINERARY:
-    # When AI Assistant receives a natural no-prefix Tour brief, process it
-    # immediately as a new client itinerary. Do not treat it as supplier text
-    # and do not wait for the source-batch timer.
-    if (
-        context.user_data.get("smart_mode")
-        and not context.user_data.get("auto_creation")
-        and not context.user_data.get("smart_files")
-        and _looks_like_new_tour_brief(context.user_data.get("smart_text", ""))
-        and not _looks_like_supplier_material(context.user_data.get("smart_text", ""))
-    ):
-        _cancel_source_auto_process(context)
-        status = await update.message.reply_text(
-            "‚ö° *Quick client itinerary request received.*\n\n"
-            "üß† I‚Äôll build the day-wise Tour itinerary myself from these details and then open the normal Tour workflow.",
-            parse_mode="Markdown",
-        )
-        context.user_data["_source_status_message"] = status
-        return await smart_process(update, context)
-
-    if context.user_data.get("auto_creation"):
-        msg=await _source_ack_message(
-            update, context,
-            'üìù Auto Creation note received. Send another file/text/voice within 5 seconds if needed; otherwise I will combine the batch automatically.',
-            reply_markup=auto_creation_keyboard())
-        _schedule_source_auto_process(update,context,'auto_creation',lambda: smart_process(_SyntheticUpdate(_BotMessageProxy(context.bot,update.effective_chat.id),update.effective_user.id),context),prompt_message=msg)
-    else:
-        msg=await _source_ack_message(update, context, 'üìù Source text received.\n\nSend another source to reset the timer, or tap ‚ö° Process Now.',reply_markup=smart_source_keyboard())
-        _schedule_source_auto_process(update,context,'smart',lambda: smart_process(_SyntheticUpdate(_BotMessageProxy(context.bot,update.effective_chat.id),update.effective_user.id),context),prompt_message=msg)
-    return SMART_INPUT
-
-
-async def smart_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """No-prefix AI Assistant voice request.
-
-    Press AI Assistant, send a voice note, and the transcript is routed through the
-    exact same free-form text planner used by smart_text/smart_process.
-    """
-    if not is_allowed(update):
-        return ConversationHandler.END
-    msg = update.message
-    if not msg or not msg.voice:
-        return SMART_INPUT
-    tg_file = await context.bot.get_file(msg.voice.file_id)
-    path = TEMP_DIR / f"voice_ai_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.ogg"
-    status = await msg.reply_text(
-        "üéôÔ∏è *Listening to your AI Assistant request...*\\n\\nYou can speak naturally ‚Äî no command or prefix is required.",
-        parse_mode="Markdown",
-    )
-    try:
-        await tg_file.download_to_drive(path)
-        transcript = await _run_ai_with_retry_status(
-            msg,
-            lambda: asyncio.to_thread(
-                transcribe_voice_note,
-                path,
-                AI_API_KEY,
-                AI_MODEL,
-                msg.voice.mime_type or "audio/ogg",
-            ),
-            status=status,
-        )
-        transcript = str(transcript or "").strip()
-        if not transcript:
-            raise RuntimeError("Voice transcription was empty.")
-
-        await safe_status_edit(
-            status,
-            msg,
-            "‚úÖ *Voice request understood.*\\n\\nüß† Building the requested itinerary / action now...",
-            parse_mode="Markdown",
-        )
-        await msg.reply_text("üéôÔ∏è *I understood:*\\n" + transcript, parse_mode="Markdown")
-
-        context.user_data["smart_mode"] = True
-        context.user_data.setdefault("smart_files", [])
-        context.user_data["smart_text"] = transcript
-        context.user_data["_source_status_message"] = status
-        return await smart_process(update, context)
-
-    except Exception as exc:
-        logger.exception("AI Assistant voice request failed")
-        await safe_status_edit(
-            status,
-            msg,
-            f"‚ö†Ô∏è *Voice request could not be completed.*\\n\\nReason: `{str(exc)[:600]}`\\n\\nYou can resend the voice note or type the same request.",
-            parse_mode="Markdown",
-        )
-        return SMART_INPUT
-    finally:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-async def smart_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    photo=update.message.photo[-1]
-    tg_file=await context.bot.get_file(photo.file_id)
-    path=TEMP_DIR/f"smart_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
-    await tg_file.download_to_drive(path)
-    context.user_data.setdefault('smart_files',[]).append(str(path))
-    direct=bool(context.user_data.get('_direct_drop_mode'))
-    auto=bool(context.user_data.get('auto_creation'))
-    if auto:
-        n=len(context.user_data.get('smart_files') or [])
-        ack=f'üì∏ Auto Creation source received ({n}). Send another file/text/voice within 5 seconds if needed; otherwise I will combine the batch automatically.'
-        kb=auto_creation_keyboard(); workflow='auto_creation'
-    else:
-        ack=('üì∏ Supplier file received. Send another page/source within 5 seconds if needed; otherwise I will identify and process it automatically.'
-             if direct else 'üì∏ Supplier file received.\n\nSend another source to reset the timer, or tap ‚ö° Process Now.')
-        kb=direct_drop_keyboard() if direct else smart_source_keyboard(); workflow='direct_smart' if direct else 'smart'
-    msg=await _source_ack_message(update, context, ack, reply_markup=kb)
-    _schedule_source_auto_process(update,context,workflow,lambda: smart_process(_SyntheticUpdate(_BotMessageProxy(context.bot,update.effective_chat.id),update.effective_user.id),context),prompt_message=msg)
-    return SMART_INPUT
-
-async def smart_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or 'supplier.pdf'
-    if not (name.lower().endswith('.pdf') or mime=='application/pdf'):
-        await update.message.reply_text('Please send a PDF, screenshot, or text.',reply_markup=smart_source_keyboard()); return SMART_INPUT
-    tg_file=await context.bot.get_file(doc.file_id)
-    safe=''.join(c if c.isalnum() or c in '._-' else '_' for c in name)
-    path=TEMP_DIR/f"smart_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe}"
-    await tg_file.download_to_drive(path)
-    context.user_data.setdefault('smart_files',[]).append(str(path))
-    direct=bool(context.user_data.get('_direct_drop_mode'))
-    auto=bool(context.user_data.get('auto_creation'))
-    if auto:
-        n=len(context.user_data.get('smart_files') or [])
-        ack=f'üìÑ Auto Creation source received ({n}). Send another file/text/voice within 5 seconds if needed; otherwise I will combine the batch automatically.'
-        kb=auto_creation_keyboard(); workflow='auto_creation'
-    else:
-        ack=('üìÑ Supplier file received. Send another page/source within 5 seconds if needed; otherwise I will identify and process it automatically.'
-             if direct else 'üìÑ Supplier file received.\n\nSend another source to reset the timer, or tap ‚ö° Process Now.')
-        kb=direct_drop_keyboard() if direct else smart_source_keyboard(); workflow='direct_smart' if direct else 'smart'
-    msg=await _source_ack_message(update, context, ack, reply_markup=kb)
-    _schedule_source_auto_process(update,context,workflow,lambda: smart_process(_SyntheticUpdate(_BotMessageProxy(context.bot,update.effective_chat.id),update.effective_user.id),context),prompt_message=msg)
-    return SMART_INPUT
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        await update.message.reply_text("Sorry, this bot is private.")
-        return ConversationHandler.END
-
-    # /START is a true workflow reset. Never allow a previous countdown/task to
-    # survive into the newly selected Air/Bus/Hotel/Tour workflow.
-    _cancel_auto_print(context)
-    _cancel_source_auto_process(context)
-    context.user_data.clear()
-
-    await update.message.reply_text(
-        "‚úàÔ∏è *MyTourBazar Print Bot*\n\n"
-        "üì• Drop an *Air, Bus or Hotel* supplier itinerary here ‚Äî PDF, image or text ‚Äî and I will create the MyTourBazar print automatically.\n\n"
-        "üó∫Ô∏è For a normal *Tour itinerary*, tap *Tour Guide* below.\n\n"
-        "ü§ñ For a supplier package plus multiple client flight/train/bus/hotel tickets, tap *Auto Creation* and send them together.\n\n"
-        "You can also use the service buttons when you want to force Air, Bus or Hotel mode.",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(),
-    )
-    return ConversationHandler.END
-
-
-async def stop_bot_workflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-    _cancel_auto_print(context)
-    _cancel_source_auto_process(context)
-    context.user_data.clear()
-    await update.message.reply_text('‚èπÔ∏è *Current process stopped.*\n\nThe bot is still running and ready for the next request.', parse_mode='Markdown', reply_markup=main_keyboard())
-    return ConversationHandler.END
-
-def guest_name_keyboard():
-    # Keep cancellation visible during every guest/client-name prompt.
-    # The conversation fallback maps this button to the same /cancel handler.
-    return ReplyKeyboardMarkup([["‚ùå Cancel"]], resize_keyboard=True, one_time_keyboard=False)
-
-
-async def new_itinerary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        await update.message.reply_text("Sorry, this bot is private.")
-        return ConversationHandler.END
-
-    _cancel_auto_print(context)
-    _cancel_source_auto_process(context)
-    context.user_data.clear()
-    context.user_data["media_files"] = []
-    context.user_data["flight_files"] = []
-    context.user_data["flight_text"] = ""
-    context.user_data["source_text"] = ""
-    context.user_data["guest_name"] = ""
-    context.user_data["extra_inclusions"] = []
-    context.user_data["extra_exclusions"] = []
-    context.user_data["tour_v2"] = True
-    context.user_data["tour_v2_phase"] = "source"
-
-    await update.message.reply_text(
-        "üó∫Ô∏è *Tour Itinerary ‚Ä¢ New Workflow*\n\n"
-        "Drop the supplier text, PDF or image. AI will extract all available details first. "
-        "If an important accommodation detail is genuinely missing, I will ask you in a simple normal message before creating the draft.",
-        parse_mode="Markdown",
-        reply_markup=source_keyboard(),
-    )
-    return WAITING_SOURCE
-
-
-async def receive_tour_source_without_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return ConversationHandler.END
-    try:
-        context.user_data.setdefault('media_files', []); context.user_data.setdefault('flight_files', []); context.user_data.setdefault('flight_text', '')
-        context.user_data.setdefault('extra_inclusions', []); context.user_data.setdefault('extra_exclusions', [])
-        if update.message.photo:
-            tg_file=await context.bot.get_file(update.message.photo[-1].file_id)
-            path=TEMP_DIR/f"tour_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
-            await tg_file.download_to_drive(path); context.user_data['media_files'].append(str(path))
-            await _source_ack_message(update, context, 'üì∏ Supplier screenshot received. Extracting it now‚Ä¶')
-        else:
-            doc=update.message.document; name=doc.file_name or 'supplier.pdf'; mime=(doc.mime_type or '').lower()
-            if not (name.lower().endswith('.pdf') or mime=='application/pdf'):
-                await update.message.reply_text('Please send a PDF, screenshot, or supplier text.')
-                return WAITING_GUEST_NAME
-            tg_file=await context.bot.get_file(doc.file_id); safe=''.join(c if c.isalnum() or c in '._-' else '_' for c in name)
-            path=TEMP_DIR/f"tour_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe}"
-            await tg_file.download_to_drive(path); context.user_data['media_files'].append(str(path))
-            await _source_ack_message(update, context, 'üìÑ Supplier PDF received. Extracting it now‚Ä¶')
-        await process_sources(update, context)
-        return ConversationHandler.END
-    except Exception as exc:
-        logger.exception('Tour source before guest failed')
-        await update.message.reply_text(f'‚ùå Could not read supplier source: {str(exc)[:500]}')
-        return WAITING_GUEST_NAME
-
-
-async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-
-    text = (update.message.text or "").strip()
-    if text == "‚úàÔ∏è Air Print":
-        return await flight_ticket_start(update, context)
-    if text == "üöå Bus Print":
-        return await bus_ticket_start(update, context)
-    if text == "üè® Hotel Print":
-        return await hotel_voucher_start(update, context)
-    if text in ("üó∫Ô∏è Tour Itinerary", "üó∫Ô∏è Tour Guide"):
-        return await new_itinerary(update, context)
-    if text in ("ü§ñ AI Assistant", "ü§ñ AI Assistant / New Request"):
-        return await smart_ai_start(update, context)
-
-    # V154: once the editable Tour draft has been sent, the NEXT text message is
-    # the final submission. The Tour ConversationHandler may still be in WAITING_SOURCE
-    # because auto-processing happened in the background; do not let that message be
-    # appended as new supplier material and create another draft loop.
-    if _tour_v2_active(context) and context.user_data.get("tour_v2_phase") == "awaiting_edited_final":
-        await _tour_v2_process_edited_final(update.message, context, text)
-        return ConversationHandler.END
-
-    if text == "üñºÔ∏è Set Logo":
-        return await set_logo(update, context)
-    if text in ("üìÇ My Files", "‚úèÔ∏è Edit by Ref"):
-        await update.message.reply_text(
-            "That old shortcut has been removed. Open the generated PDF you want to change and tap *Modify & Regenerate* or *Voice / Text Edit*.",
-            parse_mode="Markdown", reply_markup=main_keyboard()
-        )
-        return ConversationHandler.END
-    if text == "üè® Hotel Voucher":
-        return await hotel_voucher_start(update, context)
-    if text == "üöå Bus Ticket Itinerary":
-        return await bus_ticket_start(update, context)
-    if text in ("ü§ñ AI Assistant", "ü§ñ AI Assistant / New Request"):
-        return await smart_ai_start(update, context)
-    if text == "üÜï Start Fresh":
-        return await smart_ai_start(update, context)
-
-    if text in ("‚ùå Cancel", "üìÑ Send PDF / üìù Text", "üì∏ Send Screenshot"):
-        if text == "‚ùå Cancel":
-            return await cancel(update, context)
-        await update.message.reply_text(
-            "Please send the actual itinerary PDF, paste the itinerary text, or send a screenshot.",
-            reply_markup=source_keyboard()
-        )
-        return WAITING_SOURCE
-
-    if text == "‚ûï Add Another Page":
-        await update.message.reply_text(
-            "üìé Send the next file/page. Tap *‚úÖ Done* when all supplier material is sent.",
-            parse_mode="Markdown",
-            reply_markup=source_keyboard()
-        )
-        return WAITING_SOURCE
-
-    if text == "‚úàÔ∏è Flight Screenshot":
-        context.user_data["awaiting_flight"] = True
-        await update.message.reply_text(
-            "‚úàÔ∏è Send the flight screenshot now. You can send onward and return screenshots one after another. "
-            "I will identify and separate every flight automatically.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return WAITING_SOURCE
-
-    if text == "‚úçÔ∏è Flight Text":
-        context.user_data["awaiting_flight"] = True
-        await update.message.reply_text(
-            "‚úçÔ∏è *Enter the flight / train details in text.*\n\n"
-            "You can paste onward and return details together or send them one by one. "
-            "You do not need special formatting ‚Äî the local parser will organize supported details automatically.\n\n"
-            "Example:\n`01 Oct: IndiGo 6E-594 Raipur ‚Üí Mumbai 09:30 AM ‚Äì 11:25 AM\n"
-            "01 Oct: IndiGo 6E-273 Mumbai ‚Üí Rajkot 01:10 PM ‚Äì 03:50 PM\n"
-            "05 Oct: IndiGo 6E-233 Rajkot ‚Üí Mumbai 09:15 AM ‚Äì 11:05 AM\n"
-            "05 Oct: IndiGo 6E-5345 Mumbai ‚Üí Raipur 02:15 PM ‚Äì 04:25 PM`\n\n"
-            "When finished, tap *‚úÖ Done*.",
-            parse_mode="Markdown",
-            reply_markup=source_keyboard()
-        )
-        return WAITING_SOURCE
-
-    if text == "‚úÖ Done":
-        _cancel_source_auto_process(context)
-        if context.user_data.get('_source_auto_processed') in ('tour','smart'):
-            return ConversationHandler.END
-        await process_sources(update, context)
-        return ConversationHandler.END
-
-    if len(text) > 50000:
-        await update.message.reply_text("This text is too long for one Telegram message. Please send it as a PDF instead.")
-        return WAITING_SOURCE
-
-    if context.user_data.get("awaiting_flight"):
-        context.user_data["flight_text"] = (context.user_data.get("flight_text", "") + "\n" + text).strip()
-        context.user_data["awaiting_flight"] = False
-        msg=await update.message.reply_text(
-            "‚úàÔ∏è Flight text received. You can send another flight screenshot/text, or tap *‚úÖ Done*.",
-            parse_mode="Markdown",
-            reply_markup=source_keyboard()
-        )
-        _schedule_source_auto_process(update, context, 'tour', lambda: process_sources(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-        return WAITING_SOURCE
-
-    context.user_data["source_text"] = (context.user_data.get("source_text", "") + "\n" + text).strip()
-    msg=await _source_ack_message(update, context, "üìù Text received.\n\nSend another source to reset the timer, or tap *‚úÖ Done*.",reply_markup=source_keyboard())
-    _schedule_source_auto_process(update,context,'tour',lambda: process_sources(_SyntheticUpdate(_BotMessageProxy(context.bot,update.effective_chat.id),update.effective_user.id),context),prompt_message=msg)
-    return WAITING_SOURCE
-
-
-async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-
-    try:
-        if context.user_data.get("waiting_for_logo"):
-            return await receive_logo(update, context)
-        photo = update.message.photo[-1]
-        tg_file = await context.bot.get_file(photo.file_id)
-        filename = TEMP_DIR / f"{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
-        await tg_file.download_to_drive(filename)
-
-        if context.user_data.get("awaiting_flight"):
-            context.user_data.setdefault("flight_files", []).append(str(filename))
-            context.user_data["awaiting_flight"] = True
-            msg=await _source_ack_message(update, context, "‚úàÔ∏è Flight screenshot received. Send another flight screenshot/text, or tap *‚úÖ Done*.", reply_markup=source_keyboard())
-            _schedule_source_auto_process(update, context, 'tour', lambda: process_sources(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-        else:
-            context.user_data.setdefault("media_files", []).append(str(filename))
-            msg=await _source_ack_message(update, context, "üì∏ Supplier screenshot received. Send more material, or tap *‚úÖ Done*.", reply_markup=source_keyboard())
-            _schedule_source_auto_process(update, context, 'tour', lambda: process_sources(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-        return WAITING_SOURCE
-    except Exception as exc:
-        logger.exception("Photo download failed")
-        await update.message.reply_text(f"‚ùå Could not read the image: {exc}")
-        return WAITING_SOURCE
-
-
-async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-
-    doc = update.message.document
-    filename_lower = (doc.file_name or "").lower()
-    mime = (doc.mime_type or "").lower()
-
-    if not (filename_lower.endswith(".pdf") or mime == "application/pdf"):
-        await update.message.reply_text("Please send a PDF, image, or paste the itinerary text.")
-        return WAITING_SOURCE
-
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in (doc.file_name or "supplier.pdf"))
-        path = TEMP_DIR / f"{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe_name}"
-        await tg_file.download_to_drive(path)
-        context.user_data.setdefault("media_files", []).append(str(path))
-        msg=await _source_ack_message(update, context, "üìÑ Supplier PDF received. Send more material if needed, or tap *‚úÖ Done*.", reply_markup=source_keyboard())
-        _schedule_source_auto_process(update, context, 'tour', lambda: process_sources(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
-        return WAITING_SOURCE
-    except Exception as exc:
-        logger.exception("PDF download failed")
-        await update.message.reply_text(f"‚ùå Could not read the PDF: {exc}")
-        return WAITING_SOURCE
-
-
-async def media_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-
-    text = update.message.text
-
-    if text == "‚ùå Cancel":
-        return await cancel(update, context)
-
-    if text == "‚ûï Add Another Page":
-        await update.message.reply_text(
-            "üì∏ Send the next screenshot/page.",
-            reply_markup=media_keyboard()
-        )
-        return WAITING_SOURCE
-
-    if text == "‚úÖ Done":
-        files = context.user_data.get("media_files", [])
-        if not files:
-            await update.message.reply_text(
-                "No screenshot has been received yet. Please send a screenshot or PDF."
-            )
-            return WAITING_SOURCE
-
-        await update.message.reply_text(
-            "üë§ *Whose itinerary are you preparing?*\n\n"
-            "Please enter the Guest/Client Name.\n"
-            "Example: `Mr. Amit Sharma & Family`",
-            parse_mode="Markdown",
-            reply_markup=guest_name_keyboard(),
-        )
-        return WAITING_GUEST_NAME
-
-    return WAITING_SOURCE
-
-
-async def receive_guest_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return ConversationHandler.END
-
-    guest_name = (update.message.text or "").strip()
-    if not guest_name or guest_name in ("‚ùå Cancel",):
-        await update.message.reply_text("Please enter the Guest / Client Name.", reply_markup=guest_name_keyboard())
-        return WAITING_GUEST_NAME
-    if _looks_like_supplier_material(guest_name):
-        context.user_data['source_text']=guest_name
-        context.user_data.setdefault('media_files', []); context.user_data.setdefault('flight_files', []); context.user_data.setdefault('flight_text','')
-        context.user_data.setdefault('extra_inclusions', []); context.user_data.setdefault('extra_exclusions', [])
-        await update.message.reply_text('üì• Supplier text received. I‚Äôm extracting it as Tour/Air/Bus/Hotel source material now.')
-        await process_sources(update, context)
-        return ConversationHandler.END
-
-    context.user_data["guest_name"] = guest_name
-    if context.user_data.get("ai_tour_pending"):
-        data = context.user_data.get("itinerary", {})
-        data["client_name"] = guest_name
-        context.user_data["itinerary"] = data
-        context.user_data.pop("ai_tour_pending", None)
-        await update.message.reply_text(build_confirmation(data), parse_mode="Markdown", reply_markup=confirmation_keyboard())
-        return ConversationHandler.END
-    if context.user_data.get("smart_supplier_pending"):
-        context.user_data.pop("smart_supplier_pending", None)
-        await update.message.reply_text("üë§ Guest name saved. Now I‚Äôll build the final itinerary from the supplier material.", reply_markup=ReplyKeyboardRemove())
-        await process_sources(update, context)
-        return ConversationHandler.END
-    await update.message.reply_text(
-        f"üë§ Guest name saved: *{guest_name}*\n\n"
-        "Now send *everything you have* ‚Äî supplier PDF, supplier text, screenshots, hotel details, "
-        "or flight screenshots.\n\n"
-        "You do NOT need to tell me what each file is. The local classifier will identify it automatically.\n\n"
-        "When you have finished sending all material, tap *‚úÖ Done*.",
-        parse_mode="Markdown",
-        reply_markup=source_keyboard(),
-    )
-    return WAITING_SOURCE
-
-
-def tour_special_notes_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton('‚ûï Add Special Notes', callback_data='tour_special_notes:add'),
-                                  InlineKeyboardButton('‚û°Ô∏è Skip Special Notes', callback_data='tour_special_notes:skip')]])
-
-def tour_cost_keyboard():
-    # Legacy pre-print cost menu is intentionally empty. Customer costing is handled
-    # only through Modify & Regenerate as direct final selling rates.
-    return InlineKeyboardMarkup([])
-
-def _money(value):
-    try:
-        return f"‚Çπ{_num_cost(value):,.0f}"
-    except Exception:
-        return "‚Çπ0"
-
-def _ensure_supplier_costs(data):
-    """Store the extracted package cost as the internal supplier cost by default."""
-    data = copy.deepcopy(data or {})
-    costs = data.get('package_costs') or []
-    adults=int(data.get('adult_count') or 0)
-    child=int(data.get('child_count') or 0)
-    cwb=int(data.get('child_cwb_count') or 0)
-    cnb=int(data.get('child_cnb_count') or 0)
-    eb=int(data.get('extra_bed_count') or 0)
-    if cwb or cnb or any(_num_cost(c.get('per_child_cwb'))>0 or _num_cost(c.get('per_child_cnb'))>0 for c in costs):
-        child=0
-    for c in costs:
-        if _num_cost(c.get('supplier_total')) > 0:
-            continue
-        pa=_num_cost(c.get('per_adult'))
-        pc=_num_cost(c.get('per_child'))
-        pcw=_num_cost(c.get('per_child_cwb'))
-        pcn=_num_cost(c.get('per_child_cnb'))
-        peb=_num_cost(c.get('per_extra_bed'))
-        calculated=(pa*adults)+(pc*child)+(pcw*cwb)+(pcn*cnb)+(peb*eb)
-        supplier=calculated if calculated > 0 else _num_cost(c.get('total_cost'))
-        if supplier > 0:
-            c['supplier_total']=f'{supplier:,.0f}'
-    return data
-
-def custom_cost_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton('‚òëÔ∏è Done', callback_data='tour_custom_cost:done')],
-        [InlineKeyboardButton('‚ùå Cancel', callback_data='tour_custom_cost:cancel')],
-    ])
-
-
-def _custom_cost_fields(data):
-    """Return the cost fields that have a real passenger count."""
-    fields = []
-    split_child=bool(int(data.get('child_cwb_count') or 0) or int(data.get('child_cnb_count') or 0))
-    counts = [
-        ('adult', 'per_adult', 'Adult', int(data.get('adult_count') or 0)),
-        ('child', 'per_child', 'Child', 0 if split_child else int(data.get('child_count') or 0)),
-        ('cwb', 'per_child_cwb', 'Child CWB', int(data.get('child_cwb_count') or 0)),
-        ('cnb', 'per_child_cnb', 'Child CNB', int(data.get('child_cnb_count') or 0)),
-        ('eb', 'per_extra_bed', 'Extra Bed (EB)', int(data.get('extra_bed_count') or 0)),
-    ]
-    for key, field, label, count in counts:
-        if count > 0:
-            fields.append((key, field, label, count))
-    return fields
-
-
-def _custom_cost_summary(data):
-    costs = data.get('package_costs') or []
-    lines = ['üßæ *Custom Cost Preview*', '']
-    counts = {
-        'per_adult': int(data.get('adult_count') or 0),
-        'per_child': int(data.get('child_count') or 0),
-        'per_child_cwb': int(data.get('child_cwb_count') or 0),
-        'per_child_cnb': int(data.get('child_cnb_count') or 0),
-        'per_extra_bed': int(data.get('extra_bed_count') or 0),
-    }
-    if counts['per_child_cwb'] or counts['per_child_cnb']:
-        counts['per_child']=0
-    labels = {
-        'per_adult': 'Adult', 'per_child': 'Child', 'per_child_cwb': 'Child CWB',
-        'per_child_cnb': 'Child CNB', 'per_extra_bed': 'Extra Bed (EB)'
-    }
-    for c in costs:
-        lines.append(f"*{c.get('option') or 'Package'}*")
-        total = 0.0
-        for field, count in counts.items():
-            rate = _num_cost(c.get(field))
-            if rate > 0 and count > 0:
-                amount = rate * count
-                total += amount
-                lines.append(f"‚Ä¢ {labels[field]}: {_money(rate)} √ó {count} = *{_money(amount)}*")
-        lines.append(f"‚Ä¢ *Total Cost: {_money(total)}*")
-        lines.append('')
-    return '\n'.join(lines).rstrip()
-
-
-def _apply_custom_cost_field(data, field, amount):
-    data = copy.deepcopy(data or {})
-    costs = data.get('package_costs') or []
-    if not costs:
-        raise ValueError('No package cost is available.')
-    amount = float(amount)
-    if amount < 0:
-        raise ValueError('Cost cannot be negative.')
-    # Custom Cost is intentionally a direct replacement of the selected per-person rate.
-    for c in costs:
-        c[field] = f'{amount:,.0f}'
-        adults=int(data.get('adult_count') or 0); child=int(data.get('child_count') or 0)
-        cwb=int(data.get('child_cwb_count') or 0); cnb=int(data.get('child_cnb_count') or 0); eb=int(data.get('extra_bed_count') or 0)
-        if cwb or cnb: child=0
-        total = (_num_cost(c.get('per_adult'))*adults + _num_cost(c.get('per_child'))*child +
-                 _num_cost(c.get('per_child_cwb'))*cwb + _num_cost(c.get('per_child_cnb'))*cnb +
-                 _num_cost(c.get('per_extra_bed'))*eb)
-        c['supplier_total'] = f'{total:,.0f}'
-        c['total_cost'] = f'{total:,.0f}'
-        c['final_total'] = f'{total:,.0f}'
-        c['markup_total'] = '0'
-    data['markup_total'] = '0'
-    return data
-
-
-def _finalize_custom_cost(data):
-    data = copy.deepcopy(data or {})
-    costs = data.get('package_costs') or []
-    if not costs:
-        raise ValueError('No package cost is available.')
-    adults=int(data.get('adult_count') or 0); child=int(data.get('child_count') or 0)
-    cwb=int(data.get('child_cwb_count') or 0); cnb=int(data.get('child_cnb_count') or 0); eb=int(data.get('extra_bed_count') or 0)
-    if cwb or cnb: child=0
-    for c in costs:
-        total = (_num_cost(c.get('per_adult'))*adults + _num_cost(c.get('per_child'))*child +
-                 _num_cost(c.get('per_child_cwb'))*cwb + _num_cost(c.get('per_child_cnb'))*cnb +
-                 _num_cost(c.get('per_extra_bed'))*eb)
-        c['supplier_total'] = f'{total:,.0f}'
-        c['total_cost'] = f'{total:,.0f}'
-        c['final_total'] = f'{total:,.0f}'
-        c['markup_total'] = '0'
-    data['markup_total'] = '0'
-    data['show_cost'] = True
-    return data
-
-
-def _tour_policy_preview(text):
-    lines=[x.strip(' ‚Ä¢-') for x in str(text or '').splitlines() if x.strip()]
-    if not lines:
-        return ''
-    return '\n'.join(f'‚Ä¢ {x}' for x in lines[:10])
-
-async def continue_tour_preprint_options(message, context, data):
-    """Final draft checkpoint with Smart Edit plus Basic/Detailed WhatsApp/PDF shortcuts."""
-    data = _ensure_supplier_costs(data)
-    # Supplier cost is internal by default. Keep it in the saved working data so the
-    # saved supplier cost may remain internal, but customer costing is changed only through Modify & Regenerate.
-    context.user_data['itinerary'] = data
-    context.user_data['pending_tour_cost_decided'] = True
-    context.user_data['pending_tour_pdf_no_cost'] = True
-    context.user_data['pending_tour_document_mode'] = data.get('document_mode') or 'itinerary'
-    context.user_data['pending_tour_markup_print'] = None
-    await _send_draft_review(message, context, data)
-    return True
-
-async def _run_with_progress(status, chat_message, work, labels, start_pct=30, end_pct=58):
-    """Run bounded supplier/Qwen work while keeping Telegram responsive."""
-    task = asyncio.create_task(work())
-    started_at = time.monotonic()
-    max_seconds = max(60, int(os.getenv('EXTRACTION_TIMEOUT_SECONDS', '300')))
-    tick = 0
-    try:
-        while not task.done():
-            if time.monotonic() - started_at >= max_seconds:
-                task.cancel()
-                raise RuntimeError(f"Document extraction stopped after {max_seconds} seconds. Please retry the supplier file.")
-            pct = min(end_pct - 1, start_pct + tick * 3)
-            filled = min(16, round(pct / 100 * 16))
-            bar = '‚ñà' * filled + '‚ñë' * (16 - filled)
-            label = labels[tick % len(labels)]
-            await safe_status_edit(status, chat_message, f"‚öôÔ∏è *Processing your supplier material with Qwen...*\n\n{bar} {pct}%\n\n{label}", parse_mode='Markdown')
-            tick += 1
-            await asyncio.sleep(1.5)
-        return await task
-    except Exception:
-        if not task.done():
-            task.cancel()
-        raise
-
-async def _run_ai_with_retry_status(chat_message, work, status=None):
-    """Compatibility wrapper for local edit/detail operations."""
-    return await work()
-
-
-def _normalize_guest_counts(data):
-    """Fill passenger counts from explicit AI fields or the guests text when possible."""
-    data = data or {}
-    def n(key):
-        try: return max(0, int(data.get(key) or 0))
-        except Exception: return 0
-    adults, child, cwb, cnb, eb = n('adult_count'), n('child_count'), n('child_cwb_count'), n('child_cnb_count'), n('extra_bed_count')
-    raw = str(data.get('guests') or '')
-    if adults<=0:
-        m=re.search(r'(\d+)\s*adult', raw, re.I); adults=int(m.group(1)) if m else adults
-    if child<=0:
-        m=re.search(r'(\d+)\s*(?:generic\s+)?child(?![^,;]*(?:with\s*bed|no\s*bed|cwb|cnb))', raw, re.I); child=int(m.group(1)) if m else child
-    if cwb<=0:
-        m=re.search(r'(\d+)\s*(?:child[^,;]*?(?:with\s*bed|cwb)|cwb)', raw, re.I); cwb=int(m.group(1)) if m else cwb
-    if cnb<=0:
-        m=re.search(r'(\d+)\s*(?:child[^,;]*?(?:no\s*bed|cnb)|cnb)', raw, re.I); cnb=int(m.group(1)) if m else cnb
-    if eb<=0:
-        m=re.search(r'(\d+)\s*(?:extra\s*bed|eb)', raw, re.I); eb=int(m.group(1)) if m else eb
-    data['adult_count']=adults; data['child_count']=child; data['child_cwb_count']=cwb; data['child_cnb_count']=cnb; data['extra_bed_count']=eb
-
-    # Passenger Profile should show only real/non-zero categories.
-    # Example: 2 Adults + 1 EB -> "2 Adult(s) ‚Ä¢ 1 Extra Bed"
-    profile_parts=[]
-    if adults>0: profile_parts.append(f'{adults} Adult' + ('s' if adults!=1 else ''))
-    if child>0: profile_parts.append(f'{child} Child' + ('ren' if child!=1 else ''))
-    if cwb>0: profile_parts.append(f'{cwb} Child CWB')
-    if cnb>0: profile_parts.append(f'{cnb} Child CNB')
-    if eb>0: profile_parts.append(f'{eb} Extra Bed' + ('s' if eb!=1 else ''))
-    data['guest_profile']=' ‚Ä¢ '.join(profile_parts) if profile_parts else str(data.get('guests') or '').strip()
-    return data
-
-def _num_cost(v):
-    try:
-        return float(re.sub(r"[^0-9.\-]", "", str(v or "0").replace(",", "")))
-    except Exception:
-        return 0.0
-
-
-def _apply_category_values(data, changes):
-    data=dict(data or {})
-    for c in data.get('package_costs') or []:
-        for key,(op,delta) in changes.items():
-            field={'adult':'per_adult','cwb':'per_child_cwb','cnb':'per_child_cnb','eb':'per_extra_bed'}[key]
-            base=_num_cost(c.get(field))
-            value=delta if op=='=' else (base+delta if op=='+' else base-delta)
-            c[field]=f'{value:,.0f}'
-    return data
-
-
-# =========================
-# V145 SIMPLIFIED TOUR WORKFLOW
-# =========================
-def _tour_v2_active(context):
-    return bool(context.user_data.get("tour_v2"))
-
-
-def _tour_v2_missing_details(data):
-    """Ask only about practical accommodation facts that are genuinely absent."""
-    missing=[]
-    hotels=data.get("hotels") or []
-    if hotels:
-        def _has_category(h):
-            explicit=str(h.get("hotel_category") or h.get("star_category") or h.get("category") or "").strip()
-            if explicit: return True
-            combined=" ".join(str(h.get(k) or "") for k in ("hotel_name","room_category","room_type","option"))
-            return bool(re.search(r"\b[1-5]\s*(?:star|\*)\b|\b(?:deluxe|premium|luxury|standard|budget)\b",combined,re.I))
-        if any(not _has_category(h) for h in hotels):
-            missing.append("hotel category")
-        if any(not str(h.get("rooms") or "").strip() for h in hotels):
-            missing.append("number of rooms")
-        if any(not str(h.get("room_type") or h.get("room_category") or "").strip() for h in hotels):
-            missing.append("room type")
-    return missing
-
-
-def _tour_v2_stage_keyboard(stage):
-    labels={
-        "onward": "‚è≠Ô∏è No Onward Journey",
-        "return": "‚è≠Ô∏è No Return Journey",
-        "connection": "‚è≠Ô∏è No Connecting Journey",
-    }
-    return ReplyKeyboardMarkup([[labels[stage]],["‚ùå Cancel"]], resize_keyboard=True, one_time_keyboard=False)
-
-
-def _tour_v2_output_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("üì± Basic WhatsApp", callback_data="tour_output:whatsapp:basic"),
-         InlineKeyboardButton("üì± Detailed WhatsApp", callback_data="tour_output:whatsapp:detailed")],
-        [InlineKeyboardButton("üìÑ Basic PDF", callback_data="tour_output:pdf:basic"),
-         InlineKeyboardButton("üìÑ Detailed PDF", callback_data="tour_output:pdf:detailed")],
-    ])
-
-def _tour_v2_set_journey_type(rows, stage):
-    out=[]
-    for idx,row in enumerate(rows or []):
-        r=dict(row or {})
-        r["_v2_stage"]=stage
-        if stage=="connection":
-            r["journey_type"]="Connection"
-        elif stage=="onward":
-            r["journey_type"]="Onward" if idx==0 else "Connection"
-        elif stage=="return":
-            r["journey_type"]="Return" if idx==0 else "Connection"
-        out.append(r)
-    return out
-
-
-async def _tour_v2_show_draft(message, context, prefix=None):
-    data=context.user_data.get("itinerary") or {}
-    # Use the existing dynamic draft renderer but do not show the old workflow buttons.
-    body=build_confirmation(data)
-    if prefix:
-        body=f"{prefix}\n\n{body}"
-    await reply_text_chunked(message, body, parse_mode="Markdown")
-
-
-async def _tour_v2_ask_onward(message, context):
-    context.user_data["tour_v2_phase"]="onward"
-    await message.reply_text(
-        "‚úàÔ∏è *Add onward journey*\n\nSend the onward flight/train/bus part as an image, PDF or normal text. I will extract it and place it in the Transit section.\n\nIf there is no onward journey to add, tap No Onward Journey.",
-        parse_mode="Markdown", reply_markup=_tour_v2_stage_keyboard("onward"))
-
-
-async def _tour_v2_ask_return(message, context):
-    context.user_data["tour_v2_phase"]="return"
-    await message.reply_text(
-        "‚Ü©Ô∏è *Add return journey*\n\nSend the return journey as an image, PDF or normal text. I will add it beside the onward journey in the Transit section.\n\nIf there is no return journey, tap No Return Journey.",
-        parse_mode="Markdown", reply_markup=_tour_v2_stage_keyboard("return"))
-
-
-async def _tour_v2_ask_connection(message, context):
-    context.user_data["tour_v2_phase"]="connection"
-    await message.reply_text(
-        "üîÑ *Any connecting journey / transit?*\n\nIf yes, send the connecting-flight PDF, screenshot or text. Multiple sectors in the same source will all be extracted and added.\n\nIf there is no connecting journey, tap No Connecting Journey.",
-        parse_mode="Markdown", reply_markup=_tour_v2_stage_keyboard("connection"))
-
-
-async def _tour_v2_show_outputs(message, context):
-    context.user_data["tour_v2_phase"]="choose_output"
-    await message.reply_text("‚úÖ Draft is ready. Choose what you want to generate:", reply_markup=ReplyKeyboardRemove())
-    await message.reply_text("Choose Basic WhatsApp, Detailed WhatsApp, Basic PDF or Detailed PDF.", reply_markup=_tour_v2_output_keyboard())
-
-
-async def _tour_v2_after_initial_extract(message, context, data):
-    """V155 simple Tour flow: supplier ‚Üí draft ‚Üí output choice.
-
-    No forced transit/costing steps are inserted before printing. Missing or changed
-    costing/transit can be added later from the single Modify & Regenerate action.
-    """
-    data=copy.deepcopy(data or {})
-    # Supplier/internal cost is hidden by default. For a Tour created directly from
-    # the owner's AI Assistant brief, any explicitly supplied price is customer-authored
-    # and may remain visible.
-    if context.user_data.get('smart_owner_brief'):
-        data['show_cost']=bool(data.get('package_costs'))
-    else:
-        data['show_cost']=False
-    context.user_data['itinerary']=data
-    context.user_data['tour_v2_phase']='choose_output'
-    context.user_data.pop('tour_v2_missing',None)
-    for _k in ('pending_fare_kind','pending_fare_supplier_total','awaiting_tour_transit_choice',
-               'awaiting_tour_transit_input','pending_tour_transit_files','pending_tour_transit_text',
-               'pending_tour_pdf_request','tour_v2_output','post_cost_reference','post_transit_reference','post_transit_pending'):
-        context.user_data.pop(_k,None)
-    await _tour_v2_show_draft(message, context, '‚úÖ AI extraction complete. Review the draft below.')
-    await _tour_v2_show_outputs(message, context)
-
-
-def _tour_patch_transit_from_text(raw, existing=None):
-    """Parse simple owner-written Journey / Transit lines locally.
-
-    Examples:
-      Onward: Raipur to Delhi | 12:20 - 14:35
-      Return: DEL to RPR | AI 1730 | 22:30 - 23:55
-    Does not invent fields that are not written.
-    """
-    source=str(raw or '')
-    block=source
-    m=re.search(r'(?is)\bJourney\s*/\s*Transit\s*:\s*(.*?)(?=\n\s*(?:Package\s+Cost|Hotels?|Days?|Inclusions?|Exclusions?|PRINT\s+TYPE|DETAIL)\s*:|\Z)',source)
-    if m:
-        block=m.group(1)
-    rows=[]
-    for line in block.splitlines():
-        line=line.strip().lstrip('‚Ä¢*- ').strip()
-        if not line: continue
-        lm=re.match(r'(?i)^(onward|return|connection|transit|journey)\s*(?:\d+)?\s*(?::|-)?\s*(.+)$',line)
-        if not lm: continue
-        jt=lm.group(1).title()
-        rest=lm.group(2).strip()
-        parts=[x.strip() for x in rest.split('|')]
-        route_part=parts[0] if parts else rest
-        service=''
-        time_part=''
-        if len(parts)>=3:
-            service=parts[1]
-            time_part=' | '.join(parts[2:])
-        elif len(parts)==2:
-            # If second part contains times treat it as timing, otherwise service.
-            if re.search(r'\b\d{1,2}[:.]\d{2}\b.*(?:-|‚Üí|to).*\b\d{1,2}[:.]\d{2}\b',parts[1],re.I):
-                time_part=parts[1]
-            else:
-                service=parts[1]
-        rm=re.search(r'(?i)^(.+?)\s*(?:‚Üí|->|\bto\b)\s*(.+?)$',route_part)
-        frm=to=''
-        if rm:
-            frm=rm.group(1).strip(' ,')
-            to=rm.group(2).strip(' ,')
-            # A natural reply often keeps times on the same line; do not absorb them into locations.
-            frm=re.sub(r'\s+\b(?:[01]?\d|2[0-3])[:.]\d{2}\b.*$','',frm).strip(' ,-')
-            to=re.sub(r'\s+\b(?:[01]?\d|2[0-3])[:.]\d{2}\b.*$','',to).strip(' ,-')
-        else:
-            codes=re.findall(r'\b[A-Z]{3}\b',route_part.upper())
-            if len(codes)>=2:
-                frm,to=codes[0],codes[1]
-        times=re.findall(r'\b(?:[01]?\d|2[0-3])[:.]([0-5]\d)\b',time_part or rest)
-        # Preserve actual matched full strings, not only minutes.
-        full_times=re.findall(r'\b(?:[01]?\d|2[0-3])[:.]\d{2}\b',time_part or rest)
-        dep=full_times[0].replace('.',':') if full_times else ''
-        arr=full_times[1].replace('.',':') if len(full_times)>1 else ''
-        flight_no=''
-        fm=re.search(r'\b([A-Z]{2,3})\s*[- ]?\s*(\d{2,4})\b',service.upper())
-        if fm:
-            flight_no=f'{fm.group(1)} {fm.group(2)}'
-        row={
-            'journey_type': jt,
-            'segment_mode': 'Flight' if flight_no else ('Train' if re.search(r'(?i)\btrain\b',service) else 'Transit'),
-            'route': f'{frm} ‚Üí {to}' if frm and to else route_part,
-            'from': frm,
-            'to': to,
-            'departure': dep,
-            'arrival': arr,
-        }
-        if flight_no: row['flight_number']=flight_no
-        elif service: row['carrier']=service
-        rows.append(row)
-    return rows
-
-
-def _tour_core_draft_signature(raw):
-    """Return the non-cost/non-transit core of an editable Tour draft.
-
-    This lets a resent full draft print locally when the owner only changed costing,
-    transit or PRINT TYPE/DETAIL. Hotel/day-plan edits use the local editor.
-    """
-    s=str(raw or '')
-    marker=re.search(r'(?i)AI-completed itinerary draft\s*:',s)
-    if marker:
-        s=s[marker.start():]
-    # Journey and costing are parsed deterministically elsewhere, so exclude them
-    # from the core-comparison used to decide whether a content edit is necessary.
-    s=re.sub(r'(?is)\*?Journey\s*/\s*Transit\s*:\*?.*?(?=\n\s*\*?Package\s+Cost\s*:\*?|\Z)','',s)
-    s=re.sub(r'(?is)\*?Package\s+Cost\s*:\*?.*?(?=\n\s*Edit this final draft|\Z)','',s)
-    s=re.sub(r'(?is)\n\s*Edit this final draft.*$','',s)
-    # Controls/instruction prose are not itinerary facts.
-    s=re.sub(r'(?im)^.*(?:PRINT\s+TYPE|DETAIL\s*:|EDIT OR REPLY NATURALLY|I will understand the reply|For costing:|For journeys/transits).*$', '', s)
-    s=re.sub(r'[*_`]+','',s)
-    s=re.sub(r'\s+',' ',s).strip().lower()
-    return s
-
-
-def _tour_reply_is_simple_cost_transit_patch(raw):
-    """True when the owner reply only changes costing/transit/print controls.
-    Such replies should never rebuild the draft.
-    """
-    s=str(raw or '')
-    # Full draft markers imply there may be hotel/day edits that need the smart editor.
-    if re.search(r'(?im)^\s*\*?(?:Guest|Tour|Destination|Hotels?\s*\(|Days?\s*\(|AI Inclusions|AI Exclusions)\*?\s*:',s):
-        return False
-    allowed_signal=bool(re.search(r'(?i)\b(?:Journey\s*/\s*Transit|Package\s+Cost|Onward\b|Return\b|Inbound\b|Outbound\b|Connection\b|Transit\b|Adult\b|CWB\b|CNB\b|EB\b|extra\s*bed|child\s+with\s+bed|child\s+(?:no|without)\s+bed|PRINT\s+TYPE|DETAIL)\b',s))
-    return allowed_signal or _looks_like_freeform_transit_lines(s)
-
-
-async def _tour_v2_process_edited_final(message, context, edited_text):
-    """Apply the owner's final Tour reply and print directly.
-
-    Simple costing/transit replies are processed entirely locally. The editor is used
-    only when the owner actually edits hotels, day plans or other free-form draft data.
-    """
-    current=copy.deepcopy(context.user_data.get('itinerary') or {})
-    if not current:
-        context.user_data.pop('tour_v2_phase',None)
-        await message.reply_text('‚ùå The current Tour draft expired. Please send the supplier file again.',reply_markup=main_keyboard())
-        return
-
-    raw=str(edited_text or '').strip()
-    low=raw.lower()
-    # Preserve the current selected/default mode unless the reply explicitly changes it.
-    current_mode=str(current.get('document_mode') or context.user_data.get('pending_tour_document_mode') or 'quotation').lower()
-    current_detail=str(current.get('detail_level') or context.user_data.get('pending_tour_pdf_detail') or 'basic').lower()
-    mode='voucher' if re.search(r'(?i)\bprint\s*type\s*[:=-]?\s*voucher\b|\btour\s+voucher\b',raw) else ('quotation' if re.search(r'(?i)\bprint\s*type\s*[:=-]?\s*quotation\b|\btour\s+quotation\b',raw) else current_mode)
-    detail='detailed' if re.search(r'(?i)\bdetail\s*[:=-]?\s*detailed\b|\bdetailed\s+(?:pdf|itinerary|plan)\b',raw) else ('basic' if re.search(r'(?i)\bdetail\s*[:=-]?\s*basic\b|\bbasic\s+(?:pdf|itinerary|plan)\b',raw) else current_detail)
-    if mode not in ('voucher','quotation'): mode='quotation'
-    if detail not in ('basic','detailed'): detail='basic'
-
-    status=await message.reply_text(
-        'üß† *Reading your final Tour changes...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 25%\n\nApplying transit and costing...',
-        parse_mode='Markdown')
-    try:
-        data=copy.deepcopy(current)
-
-        # 1) Costing is always parsed locally FIRST and becomes authoritative.
-        has_explicit_cost = bool(
-            re.search(r'(?i)\b(?:adult|cwb|cnb|eb|extra\s*bed|child\s+with\s+bed|child\s+no\s+bed)\b[^\n]{0,35}\d', raw)
-            or re.search(r'(?i)\d[^\n]{0,20}\b(?:adult|cwb|cnb|eb|extra\s*bed)\b', raw)
-        )
-        rates={}
-        if has_explicit_cost:
-            try: rates=_tour_v2_parse_costs(raw)
-            except Exception: rates={}
-        if rates:
-            data=_tour_v2_apply_costs(data,rates)
-
-        # 2) Natural Transit reply. No prefix, colon, pipe or template is required.
-        # If the owner says Onward/Return/Connection (or otherwise clearly talks about
-        # a journey), the local parser gets the raw reply and extracts supported sectors.
-        local_transit=[]
-        transit_changed=False
-        clear_transit=bool(re.search(r'(?i)\b(?:no\s+transit|no\s+journey|skip\s+transit|done\s+by\s+self)\b',raw))
-        transit_signal=bool(re.search(r'(?i)\b(?:onward|return|inbound|outbound|connection|transit|flight|train|rail)\b',raw)) or _looks_like_freeform_transit_lines(raw)
-        if clear_transit:
-            data['transit']=[]
-            data['transit_done_by_self']=True
-            transit_changed=True
-        elif transit_signal:
-            # A copied final draft already has a clean Journey / Transit block. Parse
-            # that block locally so resending the draft does not need another content
-            # call. Free-form line-by-line shorthand still uses the smart AI parser.
-            local_backup=_tour_patch_transit_from_text(raw,data.get('transit'))
-            structured_transit_block=bool(re.search(r'(?i)Journey\s*/\s*Transit\s*:',raw))
-            if structured_transit_block and local_backup:
-                local_transit=local_backup
-            else:
-                try:
-                    await safe_status_edit(status,message,'üß† *Understanding your journey reply...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 38%\n\nReading the line-by-line travel sectors...',parse_mode='Markdown')
-                    parsed=await _run_ai_with_retry_status(
-                        message,
-                        lambda: asyncio.to_thread(extract_transit_from_parts,[],raw,AI_API_KEY,AI_MODEL),
-                        status=status)
-                    local_transit=list((parsed or {}).get('transit') or [])
-                except Exception:
-                    logger.exception('Natural transit AI parsing failed; using local backup')
-                    local_transit=local_backup
-                if not local_transit:
-                    local_transit=local_backup
-            if local_transit:
-                data['transit']=local_transit
-                data['transit_done_by_self']=False
-                transit_changed=True
-
-        # 3) Only call the general Tour editor for real hotel/day-plan/content edits.
-        # If the owner resent the full draft but only changed costing/transit/controls,
-        # compare the non-cost/non-transit core and print locally.
-        core_unchanged = (_tour_core_draft_signature(raw) == _tour_core_draft_signature(build_confirmation(current)))
-        simple_final_patch = _tour_reply_is_simple_cost_transit_patch(raw) or core_unchanged
-        if not simple_final_patch:
-            await safe_status_edit(status,message,'üß† *Reading your final Tour changes...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 50%\n\nApplying hotel/day-plan edits...',parse_mode='Markdown')
-            instruction=(
-                'The user has copied, edited and resent the FULL FINAL TOUR DRAFT. Treat the edited text as authoritative. '
-                'Update the current tour data to match it. Preserve any current factual field that is not contradicted. '
-                'Do not invent missing facts. Costing is already handled locally and must not be removed. '
-                'Transit already parsed locally must not be removed unless the edited text explicitly changes it.\n\n'
-                'EDITED FINAL DRAFT:\n'+raw
-            )
-            updated,_=await _run_ai_with_retry_status(
-                message,
-                lambda: asyncio.to_thread(apply_edit,'package',data,instruction,AI_API_KEY,AI_MODEL,None),
-                status=status)
-            ai_data=_normalize_guest_counts(updated or data)
-            # Re-apply deterministic owner-entered costing/transit after AI so AI can never erase them.
-            if rates:
-                ai_data=_tour_v2_apply_costs(ai_data,rates)
-            if local_transit:
-                ai_data['transit']=local_transit
-                ai_data['transit_done_by_self']=False
-            if clear_transit:
-                ai_data['transit']=[]; ai_data['transit_done_by_self']=True
-            data=ai_data
-
-        # Never erase existing customer costing merely because this edit did not mention price.
-        if not rates and current.get('show_cost') and current.get('package_costs'):
-            data['package_costs']=copy.deepcopy(current.get('package_costs'))
-            data['show_cost']=True
-
-        # Dynamic costing: when the owner starts adding customer costing, require only
-        # the categories that actually exist in this package. Do not ask for irrelevant
-        # CWB/CNB/EB categories, and do not print an incomplete cost table by accident.
-        if data.get('show_cost'):
-            missing_costs=_missing_required_package_cost_fields(data)
-            if missing_costs:
-                context.user_data['itinerary']=data
-                context.user_data['tour_v2_phase']='awaiting_edited_final'
-                labels=[label for _,label in missing_costs]
-                need=', '.join(labels[:-1]) + (f" and {labels[-1]}" if len(labels)>1 else labels[0])
-                accepted=[]
-                if rates:
-                    lab={'per_adult':'Adult','per_child':'Child','per_child_cwb':'CWB','per_child_cnb':'CNB','per_extra_bed':'EB'}
-                    accepted=[f"{lab.get(k,k)} ‚Çπ{float(v):,.0f}" for k,v in rates.items()]
-                prefix=("I saved " + ', '.join(accepted) + ". ") if accepted else ''
-                await safe_status_edit(status,message,f"üí∞ {prefix}This package also needs {need}.\n\nReply naturally with the remaining rate(s). No /start and no special format is required.")
-                return
-
-        if detail=='detailed' and str(data.get('detail_level') or '').lower()!='detailed':
-            await safe_status_edit(status,message,'‚ú® *Changes applied.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 65%\n\nExpanding the day plan to Detailed level...',parse_mode='Markdown')
-            old_name=str(data.get('client_name') or '')
-            saved_costs=copy.deepcopy(data.get('package_costs'))
-            saved_show=bool(data.get('show_cost'))
-            saved_transit=copy.deepcopy(data.get('transit'))
-            data=await _run_ai_with_retry_status(
-                message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,'detailed'),status=status)
-            data['client_name']=old_name or str(data.get('client_name') or '')
-            if saved_costs:
-                data['package_costs']=saved_costs; data['show_cost']=saved_show
-            if saved_transit:
-                data['transit']=saved_transit
-
-        data['detail_level']=detail
-        data['document_mode']=mode
-        context.user_data['itinerary']=data
-        context.user_data['pending_tour_document_mode']=mode
-        context.user_data['pending_tour_pdf_detail']=detail
-        context.user_data['pending_tour_pdf_no_cost']=not bool(data.get('show_cost') and data.get('package_costs'))
-        context.user_data['tour_v2_phase']='printing_direct'
-
-        # Show what was actually accepted, rather than sending another draft.
-        accepted=[]
-        if rates:
-            labels={'per_adult':'Adult','per_child_cwb':'CWB','per_child_cnb':'CNB','per_extra_bed':'EB','per_child':'Child'}
-            accepted.append('Costing: '+', '.join(f"{labels.get(k,k)} ‚Çπ{float(v):,.0f}" for k,v in rates.items()))
-        if data.get('transit'):
-            accepted.append(f"Transit: {len(data.get('transit') or [])} journey sector(s) understood and saved")
-        progress_note='\n'.join('‚Ä¢ '+x for x in accepted) if accepted else '‚Ä¢ Draft changes saved'
-        await safe_status_edit(
-            status,message,
-            f'‚úÖ *Changes applied.*\n\n{progress_note}\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë 88%\n\nGenerating {detail.title()} Tour {"Voucher" if mode=="voucher" else "Quotation"}...',
-            parse_mode='Markdown')
-
-        ref,_=await generate_tour_pdf_final(message,context,data,detail,not bool(data.get('show_cost') and data.get('package_costs')))
-        context.user_data['tour_v2_phase']='complete'
-        await safe_status_edit(status,message,'‚úÖ *PDF delivered successfully.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%',parse_mode='Markdown')
-        await message.reply_text('‚úÖ Ready for the next supplier file.',reply_markup=main_keyboard())
-    except Exception as exc:
-        logger.exception('Direct edited Tour draft failed')
-        context.user_data['tour_v2_phase']='awaiting_edited_final'
-        await safe_status_edit(status,message,f'‚ö†Ô∏è I could not finish this Tour update. Your current draft is still active ‚Äî reply again; /start is not required.\n\nReason: {str(exc)[:600]}',parse_mode='Markdown')
-
-
-async def _tour_v2_apply_missing_reply(message, context, reply_text):
-    data=context.user_data.get("itinerary") or {}
-    missing=context.user_data.get("tour_v2_missing") or []
-    updated,changed=apply_missing_accommodation_locally(data,reply_text,missing)
-    if changed:
-        context.user_data["itinerary"]=_normalize_guest_counts(updated)
-        context.user_data.pop("tour_v2_missing",None)
-        await message.reply_text("‚úÖ Missing hotel/room details added locally.")
-        await _tour_v2_show_draft(message, context, "‚úÖ Draft updated.")
-        await _tour_v2_show_outputs(message, context)
-        return
-    status=await message.reply_text("ü§ñ This reply needs interpretation, using AI only for this correction...")
-    instruction=(
-        "The user is supplying only missing accommodation information for the current tour draft. "
-        "Apply these facts to the appropriate hotel rows. Do not change unrelated itinerary facts. "
-        f"Missing fields were: {', '.join(missing)}. User reply: {reply_text}"
-    )
-    updated,_=await _run_ai_with_retry_status(message, lambda: asyncio.to_thread(apply_edit,"package",data,instruction,AI_API_KEY,AI_MODEL,None), status=status)
-    context.user_data["itinerary"]=_normalize_guest_counts(updated or data)
-    context.user_data.pop("tour_v2_missing",None)
-    await safe_status_edit(status,message,"‚úÖ Missing details added to the draft.")
-    await _tour_v2_show_draft(message, context, "‚úÖ Draft updated.")
-    await _tour_v2_show_outputs(message, context)
-
-
-async def _tour_v2_extract_journey(message, context, stage, file_path=None, source_text=""):
-    parts=[]; paths=[]
-    if file_path:
-        paths=[str(file_path)]
-        parts=[{"path":str(file_path),"mime_type":"application/pdf" if str(file_path).lower().endswith(".pdf") else "image/jpeg"}]
-    status=await message.reply_text("‚ö° Reading the journey locally first...")
-    try:
-        local=await asyncio.to_thread(parse_transit_files_local,paths,source_text)
-        rows=local.get("transit") or []
-        used_ai=False
-        if not rows:
-            used_ai=True
-            await safe_status_edit(status,message,"ü§ñ Local parser could not confidently read this source. Using AI fallback once...")
-            result=await _run_with_progress(status,message,lambda: asyncio.to_thread(extract_transit_from_parts,parts,source_text,AI_API_KEY,AI_MODEL),["‚úàÔ∏è Extracting sectors, airports, terminals and timings...","üîé Organizing journey details..."],25,92)
-            rows=result.get("transit") or []
-        else:
-            for q in paths:
-                try: Path(q).unlink(missing_ok=True)
-                except Exception: pass
-        rows=_tour_v2_set_journey_type(rows,stage)
-        data=context.user_data.get("itinerary") or {}
-        existing=list(data.get("transit") or [])
-        stage_label={"onward":"Onward","return":"Return","connection":"Connection"}[stage]
-        existing=[r for r in existing if str(r.get("_v2_stage") or "").lower()!=stage.lower()]
-        data["transit"]=existing+rows
-        context.user_data["itinerary"]=data
-        mode="AI fallback" if used_ai else "local parser"
-        await safe_status_edit(status,message,f"‚úÖ {stage_label} journey added ‚Ä¢ {len(rows)} sector(s) ‚Ä¢ {mode}.")
-        await _tour_v2_show_draft(message,context,f"‚úÖ {stage_label} journey added.")
-        if stage=="onward": await _tour_v2_ask_return(message,context)
-        elif stage=="return": await _tour_v2_ask_connection(message,context)
-        else: await _tour_v2_show_outputs(message,context)
-    except Exception as exc:
-        logger.exception("Tour V2 journey extraction failed")
-        await safe_status_edit(status,message,f"‚ùå Could not extract this journey: {str(exc)[:600]}")
-        await message.reply_text("Please resend the journey source, or use the No Journey button.",reply_markup=_tour_v2_stage_keyboard(stage))
-
-
-
-def _post_transit_keyboard():
-    return ReplyKeyboardRemove()
-
-
-_PACKAGE_COST_FIELDS = [
-    ("per_adult", "Adult", "adult_count"),
-    ("per_child", "Child", "child_count"),
-    ("per_child_cwb", "CWB", "child_cwb_count"),
-    ("per_child_cnb", "CNB", "child_cnb_count"),
-    ("per_extra_bed", "EB", "extra_bed_count"),
-]
-
-def _required_package_cost_fields(data):
-    """Return only customer-rate categories that actually exist in this package."""
-    d=_normalize_guest_counts(copy.deepcopy(data or {}))
-    split_child=bool(int(d.get('child_cwb_count') or 0) or int(d.get('child_cnb_count') or 0))
-    required=[]
-    for field,label,count_key in _PACKAGE_COST_FIELDS:
-        try: count=int(d.get(count_key) or 0)
-        except Exception: count=0
-        if field=='per_child' and split_child:
-            continue
-        if count>0:
-            required.append((field,label))
-    # Most tours have adults. If passenger counts were not extractable, asking Adult is
-    # safer and simpler than showing every possible category.
-    if not required:
-        required=[("per_adult","Adult")]
-    return required
-
-def _package_cost_prompt(data):
-    labels=[label for _,label in _required_package_cost_fields(data)]
-    if len(labels)==1:
-        need=labels[0]
-    elif len(labels)==2:
-        need=f"{labels[0]} and {labels[1]}"
-    else:
-        need=', '.join(labels[:-1]) + f" and {labels[-1]}"
-    return f"Please send the customer rate for {need} in one normal message. No heading or fixed format is required."
-
-def _missing_required_package_cost_fields(data):
-    rows=list((data or {}).get('package_costs') or [])
-    row=rows[0] if rows else {}
-    missing=[]
-    for field,label in _required_package_cost_fields(data):
-        value=str(row.get(field) or '').replace(',','').strip()
-        try: ok=float(value)>0
-        except Exception: ok=False
-        if not ok:
-            missing.append((field,label))
-    return missing
-
-def _looks_like_freeform_transit_lines(text):
-    """Detect short line-by-line flight/train sectors without requiring prefixes."""
-    raw=str(text or '').strip()
-    if not raw:
-        return False
-    lines=[x.strip() for x in raw.splitlines() if x.strip()]
-    # A full itinerary draft can contain many unrelated lines. Here we only need to
-    # recognize compact sector replies or an explicit Journey/Transit block.
-    explicit=bool(re.search(r'(?i)journey\s*/\s*transit|transit\s*:',raw))
-    hits=0
-    for line in lines:
-        codes=re.findall(r'\b[A-Z]{3}\b',line.upper())
-        times=re.findall(r'\b(?:[01]?\d|2[0-3])[:.]?[0-5]\d\b',line)
-        service=bool(re.search(r'\b[A-Z]{2,3}\s*[- ]?\s*\d{2,4}\b',line.upper()) or re.search(r'(?i)\b(?:train|rail|flight)\b',line))
-        route_words=bool(re.search(r'(?i)\b(?:to|‚Üí|->)\b',line))
-        if (len(codes)>=2 and (len(times)>=1 or service)) or (service and len(times)>=2) or (route_words and len(times)>=2):
-            hits+=1
-    return explicit or hits>=1
-
-def _package_has_customer_costing(data):
-    """True only when every rate category that exists in this package has a customer rate."""
-    data=data or {}
-    if not data.get('show_cost'):
-        return False
-    return not bool(_missing_required_package_cost_fields(data))
-
-
-def _format_transit_preview(rows):
-    """Human-readable preview matching the fields used by the PDF transit table."""
-    blocks=[]
-    for idx,row in enumerate(rows or [],1):
-        r=row or {}
-        jt=str(r.get('journey_type') or 'Transit').strip().title()
-        mode=str(r.get('segment_mode') or 'Flight').strip().title()
-        carrier=str(r.get('carrier') or r.get('airline') or '').strip()
-        number=str(r.get('flight_number') or r.get('train_number') or '').strip()
-        service=' '.join(x for x in (carrier,number) if x).strip() or mode
-        route=str(r.get('route') or '').strip()
-        if not route:
-            a=str(r.get('from') or '').strip(); b=str(r.get('to') or '').strip()
-            route=' ‚Üí '.join(x for x in (a,b) if x)
-        dep=str(r.get('departure') or '').strip(); arr=str(r.get('arrival') or '').strip()
-        dep_air=str(r.get('from_airport') or '').strip(); arr_air=str(r.get('to_airport') or '').strip()
-        dep_t=str(r.get('departure_terminal') or '').strip(); arr_t=str(r.get('arrival_terminal') or '').strip()
-        if dep_t and 'terminal' not in dep_t.lower(): dep_t='Terminal '+dep_t
-        if arr_t and 'terminal' not in arr_t.lower(): arr_t='Terminal '+arr_t
-        dep_extra=' ‚Ä¢ '.join(x for x in (dep_air,dep_t) if x)
-        arr_extra=' ‚Ä¢ '.join(x for x in (arr_air,arr_t) if x)
-        date=str(r.get('date') or '').strip()
-        aircraft=str(r.get('aircraft') or '').strip()
-        pnr=str(r.get('pnr') or '').strip()
-        lines=[f"*{jt} {idx} ‚Ä¢ {mode}*", f"{service}"]
-        if route: lines.append(f"Route: {route}")
-        if date: lines.append(f"Date: {date}")
-        if dep or dep_extra: lines.append(f"Departure: {dep or '‚Äî'}" + (f" ‚Ä¢ {dep_extra}" if dep_extra else ''))
-        if arr or arr_extra: lines.append(f"Arrival: {arr or '‚Äî'}" + (f" ‚Ä¢ {arr_extra}" if arr_extra else ''))
-        if aircraft: lines.append(f"Aircraft: {aircraft}")
-        if pnr: lines.append(f"PNR: {pnr}")
-        blocks.append('\n'.join(lines))
-    return '\n\n'.join(blocks)
-
-def _post_transit_confirm_keyboard(reference, needs_costing):
-    rows=[]
-    if needs_costing:
-        rows.append([InlineKeyboardButton('üí∞ Add Costing', callback_data=f'post_transit_cost:{reference}'),
-                     InlineKeyboardButton('üìÑ Make PDF', callback_data=f'post_transit_make:{reference}')])
-    else:
-        rows.append([InlineKeyboardButton('üìÑ Make PDF', callback_data=f'post_transit_make:{reference}')])
-    rows.append([InlineKeyboardButton('‚úèÔ∏è Re-enter Transit', callback_data=f'post_transit:{reference}')])
-    return InlineKeyboardMarkup(rows)
-
-async def _regenerate_saved_package(message, reference, record, data, caption):
-    record=copy.deepcopy(record or {})
-    record['data']=data
-    update_record(reference,record)
-    page_size=record.get('page_size') or 'A4'
-    footer_mode=record.get('footer_mode') or _default_footer_mode('package')
-    logo_enabled=bool(record.get('logo_enabled',True)) and not bool(record.get('agency_removed',False))
-    record['_clean_agency']=bool(record.get('agency_removed',False))
-    final,scale,filename=await _render_saved_pdf(
-        reference,record,data,'package',record.get('fare'),page_size,footer_mode,logo_enabled,
-        text_scale_override=record.get('text_scale'),logo_scale_override=record.get('logo_scale'),
-        auto_fit=False,last_page=record.get('terms_choice') or get_tour_last_page())
-    record.pop('_clean_agency',None)
-    record.update({'filename':filename,'data':data,'text_scale':scale})
-    update_record(reference,record)
-    with open(final,'rb') as fh:
-        sent_pdf=await message.reply_document(document=fh,filename=filename,caption=_record_caption(reference,caption),parse_mode='Markdown',reply_markup=generated_document_keyboard(reference,'package'))
-    _register_reference_message(reference, sent_pdf)
-
-async def _process_post_generated_transit_text(message, context, source_text):
-    reference=context.user_data.get("post_transit_reference")
-    record=load_record(reference) if reference else None
-    if not record or record.get("type")!="package":
-        context.user_data.pop("post_transit_reference",None)
-        context.user_data.pop("post_transit_pending",None)
-        await message.reply_text("‚ùå The saved Tour is no longer available. Please use the latest generated PDF.",reply_markup=main_keyboard()); return
-    status=await message.reply_text("‚úàÔ∏è Reading your transit details...")
-    try:
-        # Fast local parser first. AI is used only when the short/mixed text cannot be
-        # confidently understood locally (airport-code-only, train, round trip, etc.).
-        local=await asyncio.to_thread(parse_transit_files_local,[],source_text)
-        rows=local.get("transit") or []
-        confidence=float(local.get("local_confidence") or 0)
-        raw_lower=str(source_text or '').lower()
-        # Force the smarter pass for patterns where a deterministic parser can look
-        # confident while assigning the wrong sector (round trips, multiple sectors,
-        # compact T2/T3 terminal notation, or trains).
-        routes=[(str(r.get('from') or '').upper(),str(r.get('to') or '').upper()) for r in rows]
-        line_count=len([ln for ln in str(source_text or '').splitlines() if ln.strip()])
-        suspicious=(line_count>1 or len(rows)>1 or len(set(routes))<len(routes) or
-                    bool(re.search(r"\b(return|round\s*trip|back|inbound|train|rail)\b",raw_lower,re.I)) or
-                    bool(re.search(r"\bT[0-9A-Z]{1,3}\b",str(source_text or ''),re.I)))
-        if not rows or confidence < 0.72 or suspicious:
-            await safe_status_edit(status,message,"ü§ñ Understanding your short / mixed transit reply...")
-            result=await _run_ai_with_retry_status(
-                message,
-                lambda: asyncio.to_thread(extract_transit_from_parts,[],source_text,AI_API_KEY,AI_MODEL),
-                status=status)
-            ai_rows=result.get("transit") or []
-            if ai_rows:
-                rows=ai_rows
-        if not rows:
-            await safe_status_edit(status,message,"‚ùå I could not understand a transit sector. Please reply again in any short form, for example: `DEL 6:30 RPR 8:15 AI1729`.")
-            # IMPORTANT: keep post_transit_reference alive so the very next reply retries.
-            return
-
-        data=copy.deepcopy(record.get("data") or {})
-        existing=list(data.get("transit") or [])
-        seen={(str(r.get('date','')).lower(),str(r.get('flight_number','')).lower(),str(r.get('from','')).lower(),str(r.get('to','')).lower(),str(r.get('departure','')).lower()) for r in existing}
-        added=[]
-        for i,row in enumerate(rows):
-            r=dict(row or {})
-            if not r.get('journey_type'):
-                jt=str(r.get('type') or '').lower()
-                if 'return' in jt: r['journey_type']='Return'
-                elif 'connect' in jt: r['journey_type']='Connection'
-                else: r['journey_type']='Onward' if not existing and i==0 else 'Connection'
-            key=(str(r.get('date','')).lower(),str(r.get('flight_number','')).lower(),str(r.get('from','')).lower(),str(r.get('to','')).lower(),str(r.get('departure','')).lower())
-            if key not in seen:
-                seen.add(key); existing.append(r); added.append(r)
-        if not added and rows:
-            # User may intentionally re-enter/replace the same transit. Show the parsed
-            # result rather than leaving the workflow in a dead state.
-            added=rows
-        data['transit']=existing
-        data['transit_done_by_self']=False
-
-        preview=_format_transit_preview(added)
-        context.user_data['post_transit_pending']={'reference':reference,'data':data,'preview':preview}
-        context.user_data.pop('post_transit_reference',None)
-        await safe_status_edit(status,message,"‚úÖ Transit understood.")
-        await message.reply_text(
-            "‚úàÔ∏è *Transit details that will be printed*\n\n" + preview,
-            parse_mode='Markdown')
-
-        if _package_has_customer_costing(data):
-            await message.reply_text("üí∞ Costing is already available. Regenerating the PDF now...")
-            await _regenerate_saved_package(message,reference,record,data,'üìÑ Tour PDF regenerated with transit')
-            context.user_data.pop('post_transit_pending',None)
-            await message.reply_text("‚úÖ Transit added and PDF regenerated.",reply_markup=main_keyboard())
-        else:
-            await message.reply_text(
-                "Costing has not been added yet. " + _package_cost_prompt(data) + " You can add it now, or make the PDF without costing.",
-                reply_markup=_post_transit_confirm_keyboard(reference,True))
-    except Exception as exc:
-        logger.exception('Post-generated transit update failed')
-        # Clear only pending parsed data; keep the original reference so the next text
-        # reply automatically retries instead of forcing /start.
-        context.user_data.pop('post_transit_pending',None)
-        context.user_data['post_transit_reference']=reference
-        await safe_status_edit(status,message,f"‚ö†Ô∏è Transit could not be completed. Please reply again; your Tour is still active.\n\nReason: {str(exc)[:400]}")
-
-async def _process_post_generated_costing(message, context, cost_text):
-    reference=context.user_data.get('post_cost_reference')
-    record=load_record(reference) if reference else None
-    if not record or record.get('type')!='package':
-        context.user_data.pop('post_cost_reference',None)
-        await message.reply_text('‚ùå Saved Tour reference is no longer available.',reply_markup=main_keyboard()); return
-    try:
-        rates=_tour_v2_parse_costs(cost_text)
-    except ValueError as exc:
-        await message.reply_text(f"‚ùå I could not read a rate from that reply.\n\n{_package_cost_prompt(record.get('data') or {})}")
-        return
-    status=await message.reply_text('üí∞ Saving your customer costing...')
-    try:
-        data=_tour_v2_apply_costs(record.get('data') or {},rates)
-        data['show_cost']=True
-        missing=_missing_required_package_cost_fields(data)
-        if missing:
-            record['data']=data; update_record(reference,record)
-            context.user_data['post_cost_reference']=reference
-            labels=[label for _,label in missing]
-            need=', '.join(labels[:-1]) + (f" and {labels[-1]}" if len(labels)>1 else labels[0])
-            await safe_status_edit(status,message,f"‚úÖ Saved. This package still needs {need}.\n\nReply naturally with the remaining rate(s).")
-            return
-        await safe_status_edit(status,message,'üí∞ All required customer rates are available. Regenerating the PDF...')
-        await _regenerate_saved_package(message,reference,record,data,'üìÑ Tour PDF regenerated with costing')
-        context.user_data.pop('post_cost_reference',None)
-        await safe_status_edit(status,message,'‚úÖ Costing added successfully.')
-        await message.reply_text('Ready.',reply_markup=main_keyboard())
-    except Exception as exc:
-        logger.exception('Post-generated costing failed')
-        await safe_status_edit(status,message,f"‚ùå Costing regeneration failed: {str(exc)[:600]}")
-
-
-async def _process_post_generated_hotel_costing(message, context, cost_text):
-    reference=context.user_data.get('post_hotel_cost_reference')
-    record=load_record(reference) if reference else None
-    if not record or record.get('type')!='hotel':
-        context.user_data.pop('post_hotel_cost_reference',None)
-        await message.reply_text('‚ùå Saved Hotel reference is no longer available.',reply_markup=main_keyboard()); return
-    try:
-        data=copy.deepcopy(record.get('data') or {})
-        supplier=_supplier_total(data)
-        hotel_cost=_parse_hotel_cost_input(cost_text,supplier,data)
-    except ValueError as exc:
-        await message.reply_text(
-            f'‚ùå {exc}\n\nExamples: `3500 per room per night`, `room 4200 and EB 1200`, `total 25000`.',
-            parse_mode='Markdown'
-        )
-        return
-    status=await message.reply_text(_hotel_cost_confirmation(hotel_cost),parse_mode='Markdown')
-    try:
-        data['customer_hotel_cost']=hotel_cost
-        total=float(hotel_cost.get('total') or 0) or None
-        page_size=record.get('page_size') or 'A4'
-        footer_mode=record.get('footer_mode') or (_default_footer_mode('hotel') if record.get('footer') else 'none')
-        logo_enabled=bool(record.get('logo_enabled',True)) and not bool(record.get('agency_removed',False))
-        record['_clean_agency']=bool(record.get('agency_removed',False))
-        final,selected_scale,filename=await _render_saved_pdf(reference,record,data,'hotel',total,page_size,footer_mode,logo_enabled,text_scale_override=record.get('text_scale'),logo_scale_override=record.get('logo_scale'),auto_fit=False)
-        record.pop('_clean_agency',None)
-        record.update({'filename':filename,'data':data,'fare':total,'text_scale':selected_scale})
-        update_record(reference,record)
-        context.user_data.pop('post_hotel_cost_reference',None)
-        await safe_status_edit(status,message,'‚úÖ Hotel costing added successfully.')
-        with open(final,'rb') as fh:
-            sent_pdf=await message.reply_document(fh,filename=filename,caption=_record_caption(reference,'üè® Updated MyTourBazar Hotel',f'Hotel Total: INR {total:,.0f}' if total else ''),parse_mode='Markdown',reply_markup=generated_document_keyboard(reference,'hotel'))
-        _register_reference_message(reference, sent_pdf)
-        await message.reply_text('‚úÖ Ready for the next request.',reply_markup=main_keyboard())
-    except Exception as exc:
-        logger.exception('Post-generated Hotel costing failed')
-        context.user_data['post_hotel_cost_reference']=reference
-        await safe_status_edit(status,message,f'‚ö†Ô∏è Hotel costing could not be regenerated. Reply again; /start is not required.\n\nReason: {str(exc)[:500]}')
-
-
-def _tour_v2_parse_costs(text):
-    raw=str(text or "").replace("‚Çπ","").replace(",","")
-    aliases={
-        "per_adult":["per adult","adult","adults","adt"],
-        "per_child_cnb":["cnb","child no bed","child without bed"],
-        "per_child_cwb":["cwb","child with bed"],
-        "per_extra_bed":["extra bed","eb"],
-        "per_child":["child","children"],
-    }
-    found={}
-    for field,names in aliases.items():
-        for name in sorted(names,key=len,reverse=True):
-            m=re.search(
-                rf"\b{re.escape(name)}\b\s*(?:(?:rate|cost|price|fare)\s*)?(?:(?:is|should\s+be|will\s+be|at|[:=\-])\s*)?(?:rs\.?\s*)?([0-9]+(?:\.\d+)?)",
-                raw,re.I)
-            if not m:
-                m=re.search(rf"(?:rs\.?\s*)?([0-9]+(?:\.\d+)?)\s*(?:for|per|is\s+for)?\s*\b{re.escape(name)}\b",raw,re.I)
-            if m:
-                _amount=float(m.group(1))
-                # Tiny values are almost always guest counts (e.g. "4 adults"), not selling rates.
-                if _amount >= 100:
-                    found[field]=_amount; break
-    if not found:
-        raise ValueError("I could not read the costing. Example: Adult 25000, CNB 12000, CWB 18000, EB 8000")
-    return found
-
-
-def _tour_v2_apply_costs(data, rates):
-    """Apply only the customer cost categories explicitly mentioned.
-
-    The first customer-cost reply removes hidden supplier pricing. Later replies are
-    incremental: e.g. entering only CWB keeps an already-saved Adult rate unchanged.
-    """
-    data=copy.deepcopy(data or {})
-    costs=copy.deepcopy(data.get("package_costs") or [{"option":"Package","currency":"INR"}])
-    if not costs:
-        costs=[{"option":"Package","currency":"INR"}]
-    row=costs[0]
-    if not bool(data.get("show_cost")):
-        # First customer rate: discard all supplier/internal price fields before saving it.
-        for _field in ("per_adult","per_child","per_child_cwb","per_child_cnb","per_extra_bed",
-                       "supplier_total","total_cost","final_total","markup_total"):
-            row.pop(_field,None)
-    else:
-        # Existing customer rates remain, but supplier/markup totals never leak back in.
-        for _field in ("supplier_total","total_cost","final_total","markup_total"):
-            row.pop(_field,None)
-    for k,v in (rates or {}).items():
-        if float(v or 0)>0:
-            row[k]=f"{v:,.0f}"
-    row["currency"]="INR"
-    data["package_costs"]=costs
-    data["show_cost"]=bool(data.get("show_cost") or rates)
-    return data
-
-
-def _tour_reconcile_ai_customer_costs(old_data, new_data, instruction):
-    """Convert locally parsed Tour cost edits into clean customer selling rates.
-
-    The old supplier/markup workflow is intentionally not used. When the editor understands a
-    natural request such as "make adult forty three thousand seven hundred" or a mixed
-    hotel+cost edit, only the changed customer rate fields are copied into the cost box.
-    """
-    old_data=old_data or {}
-    new_data=copy.deepcopy(new_data or {})
-    text=str(instruction or '')
-    # Explicit hide/remove wording wins and does not destroy saved rates.
-    if re.search(r'(?i)\b(?:hide|remove|delete|do\s*not\s*show|without)\b.{0,20}\b(?:cost|costing|price|rate)\b', text):
-        new_data['show_cost']=False
-        return new_data, {}
-
-    fields=('per_adult','per_child','per_child_cwb','per_child_cnb','per_extra_bed')
-    old_rows=old_data.get('package_costs') or []
-    new_rows=new_data.get('package_costs') or []
-    old_row=old_rows[0] if old_rows and isinstance(old_rows[0],dict) else {}
-    new_row=new_rows[0] if new_rows and isinstance(new_rows[0],dict) else {}
-    changed={}
-    for field in fields:
-        ov=_num_cost(old_row.get(field))
-        nv=_num_cost(new_row.get(field))
-        if nv > 0 and abs(nv-ov) >= 0.5:
-            changed[field]=nv
-
-    # The editor may explicitly enable the customer cost box even when a requested value
-    # happens to equal the supplier value. In that case, preserve all positive rates it
-    # returned as customer-authored rates.
-    if not changed and bool(new_data.get('show_cost')) and not bool(old_data.get('show_cost')):
-        for field in fields:
-            nv=_num_cost(new_row.get(field))
-            if nv > 0:
-                changed[field]=nv
-
-    if changed:
-        # Base the first customer-cost update on the OLD show_cost state so hidden supplier
-        # prices are scrubbed before the customer values are saved. Other AI edits remain.
-        new_data['show_cost']=bool(old_data.get('show_cost'))
-        new_data=_tour_v2_apply_costs(new_data,changed)
-        new_data['show_cost']=True
-    return new_data, changed
-
-
-async def _tour_v2_finish_selected_output(message, context, cost_text):
-    try:
-        rates=_tour_v2_parse_costs(cost_text)
-    except ValueError as exc:
-        await message.reply_text(f"‚ùå {exc}\n\nSend the costing again in a normal message.")
-        return
-    data=_tour_v2_apply_costs(context.user_data.get("itinerary") or {},rates)
-    choice=context.user_data.get("tour_v2_output") or {"output":"whatsapp","detail":"basic"}
-    detail=choice.get("detail","basic"); output=choice.get("output","whatsapp")
-    if str(data.get("detail_level") or "basic").lower()!=detail:
-        status=await message.reply_text(f"‚ú® Preparing the {detail} itinerary...")
-        old_name=str(data.get("client_name") or "")
-        data=await _run_ai_with_retry_status(message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail),status=status)
-        data["client_name"]=old_name or str(data.get("client_name") or "")
-        data["detail_level"]=detail
-        await safe_status_edit(status,message,"‚úÖ Itinerary detail level ready.")
-    context.user_data["itinerary"]=data
-    context.user_data["tour_v2_phase"]="complete"
-    if output=="whatsapp":
-        await reply_text_chunked(message,build_whatsapp_itinerary(data,detail),parse_mode="Markdown")
-        await message.reply_text("‚úÖ Final WhatsApp itinerary generated.",reply_markup=main_keyboard())
-    else:
-        context.user_data["pending_tour_pdf_detail"]=detail
-        context.user_data["pending_tour_pdf_no_cost"]=False
-        context.user_data["pending_tour_document_mode"]="itinerary"
-        await generate_tour_pdf_final(message,context,data,detail,False)
-
-async def process_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('_source_processing') == 'tour':
-        return ConversationHandler.END if 'tour' != 'tour' else None
-    context.user_data['_source_processing'] = 'tour'
-    _cancel_source_auto_process(context)
-    # Always create the live progress message at the BOTTOM of the chat when real
-    # processing begins. Editing the earlier "source received" acknowledgement made
-    # the owner scroll upward to watch progress.
-    status = await update.message.reply_text(
-        "üöÄ *Preparing your MyTourBazar itinerary...*\n\n"
-        "‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 0%\n‚è±Ô∏è 00:00\n\n"
-        "üì• Preparing supplier material...", parse_mode="Markdown"
-    )
-    context.user_data['_source_status_message'] = status
-    started = time.monotonic()
-
-    async def progress(pct, label):
-        elapsed = int(time.monotonic() - started)
-        mm, ss = divmod(elapsed, 60)
-        filled = min(16, round(pct / 100 * 16))
-        bar = "‚ñà" * filled + "‚ñë" * (16 - filled)
-        try:
-            await safe_status_edit(status, update.message, 
-                f"ü§ñ *Creating your MyTourBazar itinerary...*\n\n"
-                f"{bar} {pct}%\n‚è±Ô∏è {mm:02d}:{ss:02d}\n\n{label}",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-    try:
-        await progress(10, "üì• Reading supplier material...")
-        text = context.user_data.get("source_text", "")
-        guest_name = context.user_data.get("guest_name", "")
-        text = f"AUTHORITATIVE GUEST / CLIENT NAME: {guest_name}\n\n" + text
-        files = context.user_data.get("media_files", [])
-        flight_files = context.user_data.get("flight_files", [])
-        flight_text = context.user_data.get("flight_text", "")
-
-        # Keep local text for speed/searchability, but also preserve the original Tour
-        # PDF so table layout (hotels, dates, costs, day rows) remains visible to AI.
-        parts, text, perf_stats = prepare_supplier_for_ai(
-            files, text, max_chars=120000, preserve_pdf_layout=True
-        )
-
-        # Flight screenshots still need visual interpretation.
-        for f in flight_files:
-            parts.append({"path": f, "mime_type": "image/jpeg"})
-
-        if flight_files or flight_text:
-            text += (
-                "\n\nFLIGHT EVIDENCE BELOW/IN THE TEXT IS EXPLICIT FLIGHT EVIDENCE. "
-                "Extract EVERY separate flight segment. Keep onward and return flights as separate transit objects."
-                f"\n{flight_text}"
-            )
-
-        await progress(30, f"‚ö° Local-first preprocessing ‚Ä¢ {perf_stats.get('local_pdfs',0)} text PDF(s), {perf_stats.get('visual_sources',0)} visual source(s)...")
-        data = await _run_with_progress(status, update.message, lambda: asyncio.to_thread(extract_itinerary_from_parts, parts, text, AI_API_KEY, AI_MODEL), ["üß† Structuring locally prepared supplier facts...", "üìë Organizing hotels, sightseeing, meals and transport...", "‚ú® Building the itinerary draft..."], 30, 58)
-
-        explicit_guest = str(context.user_data.get("guest_name") or "").strip()
-        if explicit_guest:
-            data["client_name"] = explicit_guest
-        else:
-            data["client_name"] = str(data.get("client_name") or "").strip()
-        data = _normalize_guest_counts(data)
-        data["detail_level"] = "basic"
-        for _day in data.get("days", []):
-            _day.setdefault("optional_activities", [])
-
-        await progress(58, "üè® Organizing accommodation, transport and day-wise itinerary...")
-        await asyncio.sleep(0.2)
-        await progress(72, "üó∫Ô∏è Preparing the day-wise sightseeing descriptions locally...")
-        await asyncio.sleep(0.2)
-        await progress(84, "üß≥ Building concise package inclusions locally...")
-        await asyncio.sleep(0.2)
-        await progress(92, "üö´ Building concise package exclusions locally...")
-        await asyncio.sleep(0.2)
-
-        # Apply any user-added inclusions/exclusions.
-        data.setdefault("inclusions", [])
-        data.setdefault("exclusions", [])
-        for item in context.user_data.get("extra_inclusions", []):
-            if item and item not in data["inclusions"]:
-                data["inclusions"].append(item)
-        for item in context.user_data.get("extra_exclusions", []):
-            if item and item not in data["exclusions"]:
-                data["exclusions"].append(item)
-
-        await progress(98, "‚ú® Finalizing itinerary for your review...")
-        await asyncio.sleep(0.2)
-
-        data['show_cost'] = bool(data.get('package_costs'))
-        context.user_data["itinerary"] = data
-        context.user_data['_source_processing'] = None
-        context.user_data['pending_special_notes_decided'] = False
-        context.user_data['pending_tour_cost_decided'] = False
-        elapsed = int(time.monotonic() - started)
-        mm, ss = divmod(elapsed, 60)
-
-        completion_note = (
-            "Extraction is complete. Edit/resend the final draft once; the bot will apply your costing/transit changes and print directly."
-            if _tour_v2_active(context) else
-            "Review the draft below. Supplier cost stays internal; choose your output when ready."
-        )
-        await safe_status_edit(status, update.message, 
-            f"‚úÖ *Itinerary preparation complete!*\n\n"
-            f"‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n‚è±Ô∏è {mm:02d}:{ss:02d}\n\n" + completion_note,
-            parse_mode="Markdown"
-        )
-        if _tour_v2_active(context):
-            await _tour_v2_after_initial_extract(update.message, context, data)
-        else:
-            await continue_tour_preprint_options(update.message, context, data)
-
-    except Exception as exc:
-        logger.exception("Extraction/enhancement failed")
-        context.user_data['_source_processing'] = None
-        elapsed = int(time.monotonic() - started)
-        mm, ss = divmod(elapsed, 60)
-        await safe_status_edit(status, update.message, 
-            f"‚ùå *Itinerary preparation failed*\n\n‚è±Ô∏è {mm:02d}:{ss:02d}\n\nReason: `{str(exc)[:800]}`",
-            parse_mode="Markdown"
-        )
-        await update.message.reply_text("Please try üó∫Ô∏è Tour Guide again.", reply_markup=main_keyboard())
-
-
-def _itinerary_detail_command(text):
-    """Return basic/detailed when the owner explicitly requests an itinerary detail level."""
-    low = re.sub(r"\s+", " ", str(text or "").lower().strip())
-    basic_patterns = (
-        r"\b(?:basic|short|brief)\s+(?:day[- ]?wise\s+)?(?:day\s+)?(?:itinerary|plan)\b",
-        r"\b(?:basic|short|brief)\s+(?:pdf|whatsapp|draft)\b",
-    )
-    detailed_patterns = (
-        r"\b(?:detailed|detail|full|expanded|more\s+detailed|more\s+detail)\s+(?:day[- ]?wise\s+)?(?:day\s+)?(?:itinerary|plan)\b",
-        r"\b(?:detailed|detail|full|expanded)\s+(?:pdf|whatsapp|draft|quotation|quote|voucher)\b",
-    )
-    if any(re.search(p, low, re.I) for p in basic_patterns) or low in {
-        "basic itinerary", "basic plan", "basic day plan", "short itinerary", "basic"
-    }:
-        return "basic"
-    if any(re.search(p, low, re.I) for p in detailed_patterns) or low in {
-        "detailed itinerary", "detailed plan", "detailed day plan",
-        "more details", "make it detailed", "detailed"
-    }:
-        return "detailed"
-    return None
-
-
-def _tour_reply_variant_command(text):
-    """Parse a *pure* Tour output/detail reply.
-
-    This intentionally activates only for commands such as:
-      detailed itinerary
-      detailed day plan
-      detailed draft
-      detailed whatsapp
-      detailed pdf
-      detailed quotation
-      basic itinerary
-
-    A normal edit such as "change Day 3 and make it detailed" is left to the
-    existing Modify & Regenerate AI editor.
-    """
-    low = re.sub(r"\s+", " ", str(text or "").lower().strip())
-    if not low:
-        return None
-
-    detail = _itinerary_detail_command(low)
-    if not detail:
-        if re.search(r"\b(?:detailed|detail|expanded|full)\b", low):
-            detail = "detailed"
-        elif re.search(r"\b(?:basic|short|brief)\b", low):
-            detail = "basic"
-
-    output = None
-    if re.search(r"\b(?:whatsapp|whats\s*app|text\s+version|text\s+itinerary)\b", low):
-        output = "whatsapp"
-    elif re.search(r"\b(?:pdf|print)\b", low):
-        output = "pdf"
-    elif re.search(r"\bdraft\b", low):
-        output = "draft"
-
-    mode = None
-    if re.search(r"\b(?:quotation|quote)\b", low):
-        mode = "quotation"
-    elif re.search(r"\bvoucher\b", low):
-        mode = "voucher"
-
-    if not (detail or output or mode):
-        return None
-
-    # Strip the small command vocabulary. If meaningful edit words remain, this
-    # is not just an output/detail request and should use the normal AI editor.
-    cleaned = low
-    removable = [
-        r"\bplease\b", r"\bkindly\b", r"\bgive\b", r"\bsend\b", r"\bshow\b",
-        r"\bmake\b", r"\bcreate\b", r"\bgenerate\b", r"\bconvert\b",
-        r"\bchange\b", r"\bturn\b", r"\bregenerate\b",
-        r"\bme\b", r"\bit\b", r"\bthis\b", r"\bthe\b", r"\ba\b", r"\ban\b",
-        r"\bto\b", r"\binto\b", r"\bas\b", r"\bversion\b", r"\bof\b",
-        r"\bbasic\b", r"\bshort\b", r"\bbrief\b",
-        r"\bdetailed\b", r"\bdetail\b", r"\bexpanded\b", r"\bfull\b",
-        r"\bmore\b", r"\bdetails\b",
-        r"\bday[- ]?wise\b", r"\bday\b", r"\bplan\b", r"\bitinerary\b",
-        r"\bpdf\b", r"\bprint\b", r"\bwhatsapp\b", r"\bwhats\s*app\b",
-        r"\btext\b", r"\bdraft\b", r"\bquotation\b", r"\bquote\b", r"\bvoucher\b",
-    ]
-    for pat in removable:
-        cleaned = re.sub(pat, " ", cleaned, flags=re.I)
-    cleaned = re.sub(r"[^a-z0-9]+", "", cleaned)
-
-    if cleaned:
-        return None
-
-    return {"detail": detail, "output": output, "mode": mode}
-
-
-async def _tour_variant_data(message, data, detail, status=None):
-    """Return the requested Basic/Detailed variant while preserving saved metadata."""
-    old = copy.deepcopy(data or {})
-    desired = detail or str(old.get("detail_level") or "basic").lower()
-    desired = "detailed" if desired == "detailed" else "basic"
-
-    if str(old.get("detail_level") or "").lower() == desired:
-        new_data = copy.deepcopy(old)
-    else:
-        new_data = await _run_ai_with_retry_status(
-            message,
-            lambda: asyncio.to_thread(
-                enhance_package_itinerary,
-                old,
-                AI_API_KEY,
-                AI_MODEL,
-                desired,
-            ),
-            status=status,
-        )
-        # The enhancement schema intentionally contains itinerary fields only.
-        # Merge it over the old object so customer costing / document metadata
-        # that are outside the AI schema are never lost.
-        merged = copy.deepcopy(old)
-        merged.update(new_data or {})
-        new_data = merged
-
-    new_data["detail_level"] = desired
-    if str(old.get("client_name") or "").strip():
-        new_data["client_name"] = old.get("client_name")
-    if "package_costs" in old:
-        new_data["package_costs"] = copy.deepcopy(old.get("package_costs"))
-    if "show_cost" in old:
-        new_data["show_cost"] = old.get("show_cost")
-    if old.get("document_mode"):
-        new_data["document_mode"] = old.get("document_mode")
-    if old.get("b2b") or old.get("brand_neutral"):
-        new_data = _b2b_neutralize_data(new_data, new_data.get("document_mode") or "itinerary")
-        new_data["greeting"] = _b2b_greeting(new_data, new_data.get("document_mode") or "itinerary")
-    return _normalize_guest_counts(new_data)
-
-
-def _apply_tour_document_mode_fields(data, mode, b2b=False):
-    """Apply Tour title/greeting rules, including strict B2B white-label mode."""
-    d = copy.deepcopy(data or {})
-    mode = str(mode or d.get("document_mode") or "itinerary").lower()
-    if mode not in ("quotation", "voucher", "itinerary"):
-        mode = "itinerary"
-    d["document_mode"] = mode
-    b2b = bool(b2b or d.get("b2b") or d.get("brand_neutral"))
-    guest = d.get("client_name") or "Guest"
-
-    if mode == "quotation":
-        d["document_title"] = "OFFICIAL TOUR QUOTATION"
-    elif mode == "voucher":
-        d["document_title"] = "OFFICIAL TOUR VOUCHER"
-    else:
-        d["document_title"] = "OFFICIAL TOUR ITINERARY"
-
-    if b2b:
-        d = _b2b_neutralize_data(d, mode)
-        d["greeting"] = _b2b_greeting(d, mode)
-        return d
-
-    if mode == "quotation":
-        d["greeting"] = (
-            f"Dear {guest},\n\nGreetings from MyTourBazar! We are delighted to present this official "
-            "tour quotation prepared especially for your travel requirements. The following proposal "
-            "summarizes the planned destinations, accommodation, transportation, sightseeing experiences, "
-            "inclusions and exclusions for your consideration. We look forward to arranging a comfortable "
-            "and memorable journey for you and your family.\n\nPlease review the itinerary and package "
-            "details carefully, and feel free to contact us for any clarification or amendment before confirmation."
-        )
-    elif mode == "voucher":
-        d["greeting"] = (
-            f"Dear {guest},\n\nGreetings from MyTourBazar! Thank you for choosing us for your journey. "
-            "Please find below your official tour voucher containing the confirmed travel plan, accommodation "
-            "schedule, services and day-wise arrangements. Kindly keep this voucher available during your "
-            "journey and review the included services and travel instructions before departure.\n\n"
-            "We wish you a smooth, comfortable and memorable trip."
-        )
-    else:
-        d["greeting"] = (
-            f"Dear {guest},\n\nGreetings from MyTourBazar! We are pleased to present your carefully planned "
-            "travel itinerary. This document brings together the accommodation schedule, transportation "
-            "arrangements, sightseeing experiences, inclusions and exclusions so that you have a clear "
-            "day-by-day plan for your journey.\n\nWe look forward to assisting you throughout your travel "
-            "and making your trip comfortable, smooth and memorable."
-        )
-    return d
-
-
-async def _reply_saved_tour_variant(message, context, reference, record, command):
-    """Reply to a generated Tour PDF with Basic/Detailed PDF/WhatsApp/Draft."""
-    old_data = copy.deepcopy(record.get("data") or {})
-    if not old_data:
-        return False
-
-    detail = command.get("detail") or record.get("detail_level") or old_data.get("detail_level") or "basic"
-    detail = "detailed" if str(detail).lower() == "detailed" else "basic"
-    output = command.get("output") or "pdf"   # PDF reply defaults to another PDF.
-    mode = command.get("mode") or record.get("document_mode") or old_data.get("document_mode") or "itinerary"
-
-    status = await message.reply_text(
-        f"ü§ñ *Preparing {detail.title()} Tour {output.title()}...*\\n\\n"
-        "‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 55%\\n\\n"
-        "Expanding or shortening only the day plan while preserving the confirmed Tour facts.",
-        parse_mode="Markdown",
-    )
-
-    try:
-        new_data = await _tour_variant_data(message, old_data, detail, status=status)
-        b2b = bool(record.get("b2b") or old_data.get("b2b") or old_data.get("brand_neutral"))
-        if b2b:
-            new_data = _b2b_neutralize_data(new_data, mode)
-            new_data["greeting"] = _b2b_greeting(new_data, mode)
-        new_data["document_mode"] = mode
-
-        if output == "draft":
-            context.user_data["itinerary"] = new_data
-            context.user_data["source_text"] = record.get("source_text", "")
-            if b2b:
-                context.user_data["pending_b2b"] = True
-                context.user_data["pending_clean_agency"] = True
-                context.user_data["pending_tour_last_page"] = "b2b"
-            await safe_status_edit(
-                status, message,
-                f"‚úÖ *{detail.title()} draft ready.*\\n\\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\\n\\n"
-                "Use the normal Tour buttons below for WhatsApp or PDF.",
-                parse_mode="Markdown",
-            )
-            await _send_draft_review(
-                message, context, new_data,
-                prefix=f"üìù *{detail.title()} draft created from the replied PDF.*",
-            )
-            return True
-
-        # Keep the richer data in the saved reference even when only WhatsApp is requested.
-        record["data"] = copy.deepcopy(new_data)
-        record["detail_level"] = detail
-        record["document_mode"] = mode
-
-        if output == "whatsapp":
-            update_record(reference, record)
-            context.user_data["itinerary"] = new_data
-            await safe_status_edit(
-                status, message,
-                f"‚úÖ *{detail.title()} WhatsApp itinerary ready.*\\n\\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%",
-                parse_mode="Markdown",
-            )
-            await reply_text_chunked(
-                message,
-                build_whatsapp_itinerary(new_data, detail),
-                parse_mode="Markdown",
-            )
-            await message.reply_text(
-                "You can reply again with `detailed PDF`, `basic PDF`, `detailed draft`, or another request.",
-                parse_mode="Markdown",
-            )
-            return True
-
-        # PDF: preserve the exact saved print personality of the replied PDF.
-        stored_data = _apply_tour_document_mode_fields(new_data, mode, b2b=b2b)
-        render_data = copy.deepcopy(stored_data)
-
-        if "no_cost" in record:
-            no_cost = bool(record.get("no_cost"))
-        else:
-            no_cost = not bool(
-                stored_data.get("show_cost") and stored_data.get("package_costs")
-            )
-        if no_cost:
-            render_data["show_cost"] = False
-            render_data.pop("package_costs", None)
-
-        clean = bool(record.get("agency_removed", False) or record.get("b2b", False))
-        footer_mode = "none" if clean else (
-            record.get("footer_mode") or _default_footer_mode("package")
-        )
-        page_size = record.get("page_size") or "A4"
-        logo_enabled = bool(record.get("logo_enabled", True)) and not clean
-        text_scale = float(record.get("text_scale") or load_settings().get("text_scale", 1.0))
-        logo_scale = float(record.get("logo_scale") or get_logo_scale("package"))
-        last_page = record.get("terms_choice") or get_tour_last_page()
-
-        render_record = copy.deepcopy(record)
-        render_record["_clean_agency"] = clean
-
-        final_pdf, selected_scale, filename = await _render_saved_pdf(
-            reference,
-            render_record,
-            render_data,
-            "package",
-            None,
-            page_size,
-            footer_mode,
-            logo_enabled,
-            text_scale_override=text_scale,
-            logo_scale_override=logo_scale,
-            auto_fit=False,
-            last_page=last_page,
-        )
-
-        record.update({
-            "filename": filename,
-            "data": stored_data,
-            "detail_level": detail,
-            "document_mode": mode,
-            "page_size": page_size,
-            "footer": footer_mode != "none",
-            "footer_mode": footer_mode,
-            "logo_enabled": logo_enabled,
-            "text_scale": selected_scale if selected_scale is not None else text_scale,
-            "logo_scale": logo_scale,
-            "terms_choice": last_page,
-            "agency_removed": clean,
-            "no_cost": no_cost,
-        })
-        update_record(reference, record)
-
-        await safe_status_edit(
-            status, message,
-            f"‚úÖ *{detail.title()} PDF ready.*\\n\\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\\n\\n"
-            f"The replied PDF has been regenerated as a {detail.lower()} "
-            f"{'quotation' if mode == 'quotation' else 'voucher' if mode == 'voucher' else 'itinerary'}.",
-            parse_mode="Markdown",
-        )
-
-        title = (
-            "Tour Quotation" if mode == "quotation"
-            else "Tour Voucher" if mode == "voucher"
-            else "Tour Itinerary"
-        )
-        with open(final_pdf, "rb") as fh:
-            sent_pdf = await message.reply_document(
-                document=fh,
-                filename=filename,
-                caption=(f"üìÑ {detail.title()} B2B {title}" if b2b else f"üìÑ {detail.title()} MyTourBazar {title}"),
-                reply_markup=generated_document_keyboard(reference, "package"),
-            )
-        _register_reference_message(reference, sent_pdf)
-        return True
-    except Exception as exc:
-        logger.exception("Reply Tour variant generation failed")
-        await safe_status_edit(
-            status, message,
-            f"‚ùå *Could not create the requested Tour version.*\\n\\nReason: `{str(exc)[:900]}`",
-            parse_mode="Markdown",
-        )
-        return True
-
-
-async def _reply_draft_tour_variant(message, context, command):
-    """Reply to a Tour draft: default is another draft; explicit WhatsApp/PDF is honored."""
-    old_data = copy.deepcopy(context.user_data.get("itinerary") or {})
-    if not old_data:
-        return False
-
-    detail = command.get("detail") or old_data.get("detail_level") or "basic"
-    detail = "detailed" if str(detail).lower() == "detailed" else "basic"
-    output = command.get("output") or "draft"  # Draft reply defaults to draft first.
-    mode = command.get("mode")
-
-    status = await message.reply_text(
-        f"ü§ñ *Preparing {detail.title()} version from this draft...*\\n\\n"
-        "‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 55%",
-        parse_mode="Markdown",
-    )
-    try:
-        new_data = await _tour_variant_data(message, old_data, detail, status=status)
-        draft_b2b = bool(old_data.get("b2b") or old_data.get("brand_neutral") or context.user_data.get("pending_b2b"))
-        if draft_b2b:
-            new_data = _b2b_neutralize_data(new_data, mode or new_data.get("document_mode") or "itinerary")
-            new_data["greeting"] = _b2b_greeting(new_data, mode or new_data.get("document_mode") or "itinerary")
-            context.user_data["pending_b2b"] = True
-            context.user_data["pending_clean_agency"] = True
-            context.user_data["pending_tour_last_page"] = "b2b"
-        context.user_data["itinerary"] = new_data
-
-        if output == "whatsapp":
-            await safe_status_edit(
-                status, message,
-                f"‚úÖ *{detail.title()} WhatsApp itinerary ready.*\\n\\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%",
-                parse_mode="Markdown",
-            )
-            await reply_text_chunked(
-                message,
-                build_whatsapp_itinerary(new_data, detail),
-                parse_mode="Markdown",
-            )
-            await message.reply_text(
-                "üß≠ *Tour draft actions*",
-                parse_mode="Markdown",
-                reply_markup=draft_review_keyboard(),
-            )
-            return True
-
-        if output == "pdf":
-            await safe_status_edit(
-                status, message,
-                f"‚úÖ *{detail.title()} day plan ready for PDF.*\\n\\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%",
-                parse_mode="Markdown",
-            )
-            if mode in ("quotation", "voucher"):
-                await _prepare_tour_pdf_request(message, context, detail, mode)
-            else:
-                await message.reply_text(
-                    f"üìÑ *{detail.title()} PDF selected.*\\n\\n"
-                    "Choose whether this should be a Tour Quotation or Tour Voucher.",
-                    parse_mode="Markdown",
-                    reply_markup=tour_pdf_mode_keyboard(detail),
-                )
-            return True
-
-        # Default for a reply to a draft: show the updated draft first.
-        await safe_status_edit(
-            status, message,
-            f"‚úÖ *{detail.title()} draft ready.*\\n\\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\\n\\n"
-            "Now choose Modify & Regenerate, WhatsApp, Basic PDF or Detailed PDF.",
-            parse_mode="Markdown",
-        )
-        await _send_draft_review(
-            message, context, new_data,
-            prefix=f"üìù *{detail.title()} day plan prepared.*",
-        )
-        return True
-    except Exception as exc:
-        logger.exception("Draft reply Tour variant failed")
-        context.user_data["itinerary"] = old_data
-        await safe_status_edit(
-            status, message,
-            f"‚ùå *Could not prepare the requested draft version.*\\n\\nReason: `{str(exc)[:900]}`",
-            parse_mode="Markdown",
-        )
-        return True
-
-
-def build_whatsapp_itinerary(data, detail_level=None):
-    """Build a clean WhatsApp-ready text version of a tour itinerary."""
-    detail_level = detail_level or data.get("detail_level") or "basic"
-    guest = str(data.get("client_name") or "Guest").strip()
-    lines = [
-        "‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ",
-        "üó∫Ô∏è TOUR ITINERARY",
-        "‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ‚îÅ",
-        f"üë§ Guest: {guest}",
-        f"üìç Destination: {data.get('destination') or '‚Äî'}",
-        f"üóìÔ∏è Dates: {data.get('travel_dates') or '‚Äî'}",
-        f"‚è±Ô∏è Duration: {data.get('duration') or '‚Äî'}",
-    ]
-    if data.get("guests"):
-        lines.append(f"üë®‚Äçüë©‚Äçüëß Guests: {data.get('guests')}")
-    if data.get("vehicle"):
-        lines.append(f"üöó Vehicle: {data.get('vehicle')}")
-    lines += ["", "üìÖ DAY-WISE PLAN"]
-    for day in data.get("days", []):
-        lines += [
-            "",
-            f"*{day.get('day','')} | {day.get('title','')}*",
-            str(day.get("description") or "").strip(),
-        ]
-        opts = day.get("optional_activities") or []
-        if detail_level == "detailed" and opts:
-            lines.append("üíõ Optional activities (at own cost):")
-            lines.extend(f"‚Ä¢ {x}" for x in opts)
-        if day.get("stay"):
-            lines.append(f"üè® Stay: {day.get('stay')}")
-        if day.get("meal_plan"):
-            lines.append(f"üçΩÔ∏è Meal: {day.get('meal_plan')}")
-    if data.get("transit"):
-        lines += ["", "‚úàÔ∏è JOURNEY / TRANSIT DETAILS"]
-        for t in data.get("transit", []):
-            jt=str(t.get("journey_type") or "Journey")
-            route=str(t.get("route") or ((str(t.get("from") or "") + " ‚Üí " + str(t.get("to") or "")).strip(" ‚Üí")))
-            carrier=" ".join(x for x in [str(t.get("carrier") or "").strip(),str(t.get("flight_number") or "").strip()] if x)
-            timing=" - ".join(x for x in [str(t.get("departure") or "").strip(),str(t.get("arrival") or "").strip()] if x)
-            lines.append(f"‚Ä¢ {jt}: {route}" + (f" | {carrier}" if carrier else "") + (f" | {timing}" if timing else ""))
-    if data.get("hotels"):
-        lines += ["", "üè® ACCOMMODATION"]
-        for h in data.get("hotels", []):
-            hotel_name = h.get("hotel_name") or "Hotel category as selected"
-            room_category = str(h.get('room_type') or h.get('room_category') or '').strip()
-            rooms = str(h.get('rooms') or '').strip()
-            parts=[hotel_name]
-            if room_category: parts.append(f"Category: {room_category}")
-            if rooms: parts.append(f"Total Rooms: {rooms}")
-            if h.get('meal_plan'): parts.append(f"Meal: {h.get('meal_plan')}")
-            lines.append(f"‚Ä¢ {h.get('destination','')} ‚Äî " + " | ".join(parts))
-    if data.get("inclusions"):
-        lines += ["", "‚úÖ INCLUSIONS"]
-        lines.extend(f"‚Ä¢ {x}" for x in (data.get("inclusions", []) or [])[:8])
-    if data.get("exclusions"):
-        lines += ["", "‚ùå EXCLUSIONS"]
-        lines.extend(f"‚Ä¢ {x}" for x in (data.get("exclusions", []) or [])[:6])
-    costs=data.get("package_costs") or []
-    if costs and data.get("show_cost", True):
-        lines += ["", "üí∞ PACKAGE COST"]
-        c=costs[0]
-        split_child=bool(str(c.get('per_child_cwb') or '').strip() or str(c.get('per_child_cnb') or '').strip() or data.get('child_cwb_count') or data.get('child_cnb_count'))
-        cost_fields=[("Adult","per_adult")]
-        if not split_child: cost_fields.append(("Child","per_child"))
-        cost_fields.extend([("CNB","per_child_cnb"),("CWB","per_child_cwb"),("Extra Bed","per_extra_bed")])
-        for label,key in cost_fields:
-            if str(c.get(key) or "").strip(): lines.append(f"‚Ä¢ {label}: INR {c.get(key)}")
-    mode=str(data.get('document_mode') or 'itinerary').lower()
-    b2b=bool(data.get('b2b') or data.get('brand_neutral'))
-    if b2b:
-        if mode == 'quotation':
-            lines += ["", f"Dear {guest},", "Greetings from our company! Please find below your official tour quotation prepared around the requested travel plan, accommodation, sightseeing, inclusions and exclusions. We hope the proposal gives you a clear understanding of the planned journey, and our company will be happy to assist with any clarification or amendment before confirmation."]
-        elif mode == 'voucher':
-            lines += ["", f"Dear {guest},", "Greetings from our company! Please find below your official tour voucher containing the confirmed travel plan, accommodation, services and day-wise arrangements. Kindly keep the voucher available during your journey and review the included services before departure."]
-        else:
-            lines += ["", f"Dear {guest},", "Greetings from our company! Please find below your carefully planned day-wise travel itinerary, including accommodation, transportation, sightseeing experiences, inclusions and exclusions for a smooth and comfortable journey."]
-        lines += ["", "Thank you for choosing our company!"]
-    else:
-        if mode == 'quotation':
-            lines += ["", "Dear Guest,", "Greetings from MyTourBazar! Please find below your official tour quotation prepared around the requested travel plan, accommodation, sightseeing, inclusions and exclusions. We hope the proposal gives you a clear understanding of the planned journey and we will be happy to assist with any clarification or amendment before confirmation."]
-        elif mode == 'voucher':
-            lines += ["", "Dear Guest,", "Greetings from MyTourBazar! Please find below your official tour voucher containing the confirmed travel plan, accommodation, services and day-wise arrangements. Kindly keep the voucher available during your journey and review the included services before departure."]
-        else:
-            lines += ["", f"Dear {guest},", "Greetings from MyTourBazar! Please find below your carefully planned day-wise travel itinerary, including accommodation, transportation, sightseeing experiences, inclusions and exclusions for a smooth and comfortable journey."]
-        lines += [
-            "",
-            "Thank you for choosing MyTourBazar!",
-            "Aapke Safar Ka Saathi",
-            "",
-            "MYTOURBAZAR",
-            "üìû +91 9425259086",
-            "‚úâÔ∏è sales@mytourbazar.com",
-            "üåê www.mytourbazar.com",
-        ]
-    return "\n".join(lines)
-
-async def reply_text_chunked(message, text, **kwargs):
-    """Send long Telegram text safely in multiple messages, preferring line boundaries."""
-    text = str(text or "")
-    limit = 3800
-    if len(text) <= limit:
-        return [await _reply_markdown_with_plain_fallback(message,text,**kwargs)]
-    parts = []
-    current = ""
-    for line in text.splitlines(True):
-        if len(current) + len(line) <= limit:
-            current += line
-        else:
-            if current.strip():
-                parts.append(current.rstrip())
-            while len(line) > limit:
-                cut = line.rfind(" ", 0, limit)
-                if cut < 100:
-                    cut = limit
-                parts.append(line[:cut].rstrip())
-                line = line[cut:].lstrip()
-            current = line
-    if current.strip():
-        parts.append(current.rstrip())
-    sent = []
-    for part in parts:
-        kw = dict(kwargs)
-        # Multi-part Markdown can break if a formatting span crosses a boundary.
-        # Send long chunks as plain text rather than fail the entire operation.
-        if len(parts) > 1:
-            kw.pop("parse_mode", None)
-        sent.append(await _reply_markdown_with_plain_fallback(message,part,**kw))
-    return sent
-
-
-async def _reply_markdown_with_plain_fallback(message,text,**kwargs):
-    """Retry supplier-derived Telegram text without formatting on entity errors."""
-    try:
-        return await message.reply_text(text,**kwargs)
-    except BadRequest as exc:
-        if "can't parse entities" not in str(exc).lower():
-            raise
-        plain_kwargs=dict(kwargs)
-        plain_kwargs.pop('parse_mode',None)
-        logger.warning('Telegram rejected supplier Markdown; resending the complete draft as plain text')
-        return await message.reply_text(text,**plain_kwargs)
-
-
-def build_confirmation(d):
-    def val(key, fallback="Not found"):
-        v = d.get(key, "")
-        return str(v).strip() if str(v).strip() else fallback
-
-    hotels = d.get("hotels", [])
-    days = d.get("days", [])
-    transit = d.get("transit", [])
-    inclusions = d.get("inclusions", [])
-    exclusions = d.get("exclusions", [])
-
-    hotel_text = "\n".join(
-        f"‚Ä¢ {h.get('destination','')} ‚Äî {h.get('hotel_name','')} "
-        f"(Category: {h.get('room_type') or h.get('room_category') or '‚Äî'} ‚Ä¢ Total Rooms: {h.get('rooms') or '‚Äî'}{(' ‚Ä¢ Meal: ' + str(h.get('meal_plan'))) if h.get('meal_plan') else ''})"
-        for h in hotels[:8]
-    ) or "Not found"
-
-    day_text = "\n".join(
-        f"‚Ä¢ {x.get('day','')} ‚Äî {x.get('title','')}"
-        for x in days[:12]
-    ) or "Not found"
-
-    inc_text = "\n".join(f"‚Ä¢ {x}" for x in inclusions[:12]) or "None generated"
-    exc_text = "\n".join(f"‚Ä¢ {x}" for x in exclusions[:12]) or "None generated"
-    costs = d.get('package_costs') or []
-    if costs and d.get('show_cost'):
-        if d.get('markup_total'):
-            cost_text = "\n".join(f"‚Ä¢ {c.get('option','Package')}: Final ‚Çπ{c.get('final_total') or c.get('total_cost','‚Äî')}" for c in costs)
-            cost_text += f"\n‚Ä¢ Markup added: ‚Çπ{d.get('markup_total')}"
-        else:
-            rows=[]
-            for c in costs:
-                split_child=bool(str(c.get('per_child_cwb') or '').strip() or str(c.get('per_child_cnb') or '').strip() or d.get('child_cwb_count') or d.get('child_cnb_count'))
-                fields=[f"Adult {c.get('per_adult','‚Äî')}"]
-                if not split_child: fields.append(f"Child {c.get('per_child','‚Äî')}")
-                fields.extend([f"CWB {c.get('per_child_cwb','‚Äî')}",f"CNB {c.get('per_child_cnb','‚Äî')}",f"EB {c.get('per_extra_bed','‚Äî')}"])
-                rows.append(f"‚Ä¢ {c.get('option','Package')}: "+' | '.join(fields))
-            cost_text='\n'.join(rows)
-    else:
-        needed=[label for _,label in _required_package_cost_fields(d)]
-        cost_text = "Customer costing not added yet ‚Äî " + _package_cost_prompt(d)
-
-    if transit:
-        transit_text = "\n".join(
-            f"‚Ä¢ {t.get('journey_type') or 'Journey'}: {t.get('route') or (str(t.get('from') or '') + ' ‚Üí ' + str(t.get('to') or ''))} "
-            f"| {(str(t.get('carrier') or '') + ' ' + str(t.get('flight_number') or '')).strip()} "
-            f"| {t.get('departure') or ''} - {t.get('arrival') or ''}"
-            for t in transit[:16]
-        )
-    else:
-        transit_text = "No journey/transit details added"
-
-    return (
-        "üìã *AI-completed itinerary draft:*\n\n"
-        f"*Guest:* {val('client_name')}\n"
-        f"*Tour:* {val('tour_title')}\n"
-        f"*Destination:* {val('destination')}\n"
-        f"*Dates:* {val('travel_dates')}\n"
-        f"*Duration:* {val('duration')}\n"
-        f"*Guests:* {val('guests')}\n"
-        f"*Vehicle:* {val('vehicle')}\n"
-        f"*Pickup:* {val('pickup')}\n"
-        f"*Drop:* {val('drop')}\n\n"
-        f"*Hotels ({len(hotels)}):*\n{hotel_text}\n\n"
-        f"*Days ({len(days)}):*\n{day_text}\n\n"
-        f"*AI Inclusions ({len(inclusions)}):*\n{inc_text}\n\n"
-        f"*AI Exclusions ({len(exclusions)}):*\n{exc_text}\n\n"
-        f"*Journey / Transit:*\n{transit_text}\n\n"
-        f"*Package Cost:*\n{cost_text}\n\n"
-        "Edit this final draft if required. Your next text reply is the final submission and will generate the PDF directly."
-    )
-
-
-
-def draft_review_keyboard():
-    """Draft actions: edit, WhatsApp preview, PDF detail choice, or confirm Done."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton('üõ†Ô∏è Modify & Regenerate', callback_data='draft_edit')],
-        [InlineKeyboardButton('üì± Basic WhatsApp', callback_data='tour_output:whatsapp:basic'),
-         InlineKeyboardButton('üì± Detailed WhatsApp', callback_data='tour_output:whatsapp:detailed')],
-        [InlineKeyboardButton('üìÑ Basic PDF', callback_data='tour_output:pdf:basic'),
-         InlineKeyboardButton('üìÑ Detailed PDF', callback_data='tour_output:pdf:detailed')],
-        [InlineKeyboardButton('‚úÖ Done', callback_data='draft_done')],
-    ])
-
-
-def _value_preview(value, limit=90):
-    if isinstance(value, (dict, list)):
-        return str(value)[:limit]
-    text = str(value or '').strip().replace('\n', ' ')
-    return text if len(text) <= limit else text[:limit-3] + '...'
-
-
-def _draft_change_notes(old, new):
-    """Create a concise, human-readable 'Noted' summary without another AI call."""
-    old = old or {}
-    new = new or {}
-    notes = []
-    labels = {
-        'client_name': 'Guest name', 'destination': 'Destination', 'tour_title': 'Tour title',
-        'travel_dates': 'Travel dates', 'duration': 'Duration', 'guests': 'Guests',
-        'vehicle': 'Vehicle', 'pickup': 'Pickup', 'drop': 'Drop', 'detail_level': 'Detail level',
-    }
-    for key, label in labels.items():
-        if _value_preview(old.get(key)) != _value_preview(new.get(key)):
-            notes.append(f'‚Ä¢ {label}: {_value_preview(old.get(key)) or "blank"} ‚Üí {_value_preview(new.get(key)) or "blank"}')
-
-    old_days = old.get('days') or []
-    new_days = new.get('days') or []
-    max_days = max(len(old_days), len(new_days))
-    for i in range(max_days):
-        a = old_days[i] if i < len(old_days) else None
-        b = new_days[i] if i < len(new_days) else None
-        if a is None:
-            notes.append(f'‚Ä¢ Day {i+1}: added')
-            continue
-        if b is None:
-            notes.append(f'‚Ä¢ Day {i+1}: removed')
-            continue
-        for key, label in [('title','title'),('description','plan'),('stay','stay'),('meal_plan','meal plan')]:
-            if _value_preview(a.get(key), 120) != _value_preview(b.get(key), 120):
-                notes.append(f'‚Ä¢ Day {i+1} {label}: updated')
-                break
-
-    old_hotels = old.get('hotels') or []
-    new_hotels = new.get('hotels') or []
-    if old_hotels != new_hotels:
-        notes.append(f'‚Ä¢ Accommodation: updated ({len(old_hotels)} ‚Üí {len(new_hotels)} option(s))')
-
-    for key, label in [('inclusions','Inclusions'),('exclusions','Exclusions'),('transit','Flight / transit details'),('special_notes','Special notes')]:
-        if old.get(key) != new.get(key):
-            notes.append(f'‚Ä¢ {label}: updated')
-
-    if old.get('package_costs') != new.get('package_costs'):
-        notes.append('‚Ä¢ Package costing: updated')
-
-    if not notes:
-        notes.append('‚Ä¢ The requested edit was processed, but no visible field difference was detected.')
-    return notes[:12]
-
-
-def _draft_review_text(data):
-    return build_confirmation(data)
-
-
-async def _send_draft_review(message, context, data, prefix=None):
-    """Render the current dynamic draft with live output shortcuts."""
-    context.user_data['itinerary'] = _ensure_supplier_costs(data)
-    text = _draft_review_text(context.user_data['itinerary'])
-    if prefix:
-        text = f'{prefix}\n\n{text}'
-    chunks = []
-    limit = 3800
-    if len(text) <= limit:
-        chunks = [text]
-    else:
-        current = ''
-        for line in text.splitlines(True):
-            if len(current) + len(line) <= limit:
-                current += line
-            else:
-                if current.strip(): chunks.append(current.rstrip())
-                current = line
-        if current.strip(): chunks.append(current.rstrip())
-    sent=[]
-    for i, chunk in enumerate(chunks):
-        kwargs={'parse_mode':'Markdown'} if len(chunks)==1 else {}
-        sent.append(await _reply_markdown_with_plain_fallback(message,chunk,**kwargs))
-    # Put the live draft actions on a fresh dynamic message. This prevents stale
-    # inline buttons from earlier workflow stages from remaining attached to the draft.
-    sent.append(await message.reply_text('üß≠ *Tour draft actions*\n\n‚Ä¢ Modify & Regenerate the draft\n‚Ä¢ Basic / Detailed WhatsApp\n‚Ä¢ Basic / Detailed PDF ‚Üí Quotation / Voucher', parse_mode='Markdown', reply_markup=draft_review_keyboard()))
-    # Keep a rolling set so Telegram Reply on any recent draft message is routed
-    # straight into the draft editor without requiring the Smart Edit button.
-    prior=[int(x) for x in (context.user_data.get('tour_draft_message_ids') or []) if str(x).isdigit()]
-    for _m in sent:
-        _mid=getattr(_m,'message_id',None)
-        if _mid is not None and int(_mid) not in prior:
-            prior.append(int(_mid))
-    context.user_data['tour_draft_message_ids']=prior[-100:]
-    return sent
-
-
-async def perform_draft_edit(update, context, instruction):
-    """Edit the in-memory draft only. No PDF is generated until Done is pressed."""
-    data = context.user_data.get('itinerary')
-    if not data:
-        context.user_data.pop('editing_current_itinerary', None)
-        await update.message.reply_text('‚ùå The current draft is no longer available. Please start the Tour workflow again.', reply_markup=main_keyboard())
-        return
-    old_data = copy.deepcopy(data)
-    status = await update.message.reply_text('‚úèÔ∏è *Updating the draft...*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë‚ñë 55%\n\nüîç Understanding your requested change...', parse_mode='Markdown')
-    try:
-        requested_detail = _itinerary_detail_command(instruction)
-        if requested_detail:
-            new_data = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(enhance_package_itinerary, old_data, AI_API_KEY, AI_MODEL, requested_detail), status=status)
-            new_data['client_name'] = old_data.get('client_name', '')
-            new_data['detail_level'] = requested_detail
-        else:
-            new_data, _ = await _run_ai_with_retry_status(update.message, lambda: asyncio.to_thread(apply_edit, 'package', old_data, instruction, AI_API_KEY, AI_MODEL, None), status=status)
-        new_data = _ensure_supplier_costs(new_data)
-        if old_data.get('b2b') or old_data.get('brand_neutral') or context.user_data.get('pending_b2b'):
-            new_data = _apply_tour_document_mode_fields(
-                new_data,
-                old_data.get('document_mode') or new_data.get('document_mode') or 'itinerary',
-                b2b=True,
-            )
-            context.user_data['pending_b2b'] = True
-            context.user_data['pending_clean_agency'] = True
-            context.user_data['pending_tour_last_page'] = 'b2b'
-        context.user_data['itinerary'] = new_data
-        context.user_data['pending_tour_markup_print'] = None
-        context.user_data.pop('editing_current_itinerary', None)
-        await safe_status_edit(status, update.message, '‚úÖ *Draft updated.*\n\n‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà‚ñà 100%\n\nüìù I noted the changes below. Review the updated draft before generating the PDF.', parse_mode='Markdown')
-        notes = _draft_change_notes(old_data, new_data)
-        await update.message.reply_text('üìù *Noted ‚Äî changes made:*\n' + '\n'.join(notes), parse_mode='Markdown')
-        await _send_draft_review(update.message, context, new_data)
-    except Exception as exc:
-        logger.exception('Draft smart edit failed')
-        context.user_data['itinerary'] = old_data
-        context.user_data.pop('editing_current_itinerary', None)
-        await safe_status_edit(status, update.message, f'‚ùå *Draft update failed*\n\nReason: `{str(exc)[:900]}`', parse_mode='Markdown')
-        await update.message.reply_text('You can try the Smart Edit Draft button again.', reply_markup=draft_review_keyboard())
-
-
-async def _finish_pending_tour_pdf(message, context):
-    req = context.user_data.get('pending_tour_pdf_request') or {}
-    data = context.user_data.get('itinerary') or {}
-    if not data or not req:
-        await message.reply_text('‚ùå The pending Tour PDF request expired. Please use the draft PDF button again.', reply_markup=draft_review_keyboard())
-        return
-    detail = req.get('detail') or 'basic'
-    mode = req.get('mode') or 'quotation'
-    no_cost = bool(req.get('no_cost', True))
-    context.user_data['pending_tour_pdf_detail'] = detail
-    context.user_data['pending_tour_pdf_no_cost'] = no_cost
-    context.user_data['pending_tour_document_mode'] = mode
-    data['document_mode'] = mode
-    context.user_data['itinerary'] = data
-    await message.reply_text(f"‚è≥ Generating {detail.title()} Tour {'Quotation' if mode=='quotation' else 'Voucher'}...")
-    try:
-        ref, _ = await generate_tour_pdf_final(message, context, data, detail, no_cost)
-        context.user_data.pop('pending_tour_pdf_request', None)
-        context.user_data.pop('awaiting_tour_print_name', None)
-        for k in ('pending_special_notes_decided','pending_tour_cost_decided','pending_special_notes','pending_tour_document_mode','pending_tour_pdf_detail','pending_tour_pdf_no_cost'):
-            context.user_data.pop(k, None)
-        # A completed Auto Creation batch is no longer an active intake session.
-        # The saved record keeps auto_creation=True, but the next normal upload is new work.
-        for k in ('auto_creation','smart_mode','smart_force_kind','smart_files','smart_text','_source_status_message','_source_auto_processed'):
-            context.user_data.pop(k, None)
-        _cancel_source_auto_process(context)
-        await message.reply_text('‚úÖ PDF generated successfully. Ready for a new upload or use the PDF buttons to modify it.', parse_mode='Markdown', reply_markup=ready_keyboard())
-    except Exception as exc:
-        logger.exception('Pending Tour PDF generation failed')
-        await message.reply_text(f'‚ùå Tour PDF generation failed.\n\nReason: `{str(exc)[:800]}`', parse_mode='Markdown', reply_markup=main_keyboard())
-
-
-async def _prepare_tour_pdf_request(message, context, detail, mode):
-    data = context.user_data.get('itinerary') or {}
-    if not data:
-        await message.reply_text('‚ùå No current Tour draft is available.', reply_markup=main_keyboard())
-        return
-    detail = 'detailed' if str(detail).lower() == 'detailed' else 'basic'
-    mode = 'voucher' if str(mode).lower() == 'voucher' else 'quotation'
-    if str(data.get('detail_level') or '').lower() != detail:
-        old_name = str(data.get('client_name') or '').strip()
-        status = await message.reply_text(f'ü§ñ Preparing the {detail} day plan...')
-        data = await _run_ai_with_retry_status(message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail), status=status)
-        data['client_name'] = old_name or str(data.get('client_name') or '').strip()
-        data['detail_level'] = detail
-        if context.user_data.get('pending_b2b'):
-            data = _apply_tour_document_mode_fields(data, mode, b2b=True)
-        context.user_data['itinerary'] = data
-        await safe_status_edit(status, message, f'‚úÖ {detail.title()} day plan ready.')
-    data['document_mode'] = mode
-    context.user_data['itinerary'] = data
-    context.user_data['pending_tour_pdf_request'] = {
-        'detail': detail,
-        'mode': mode,
-        'no_cost': not bool(data.get('show_cost') and data.get('package_costs')) if _tour_v2_active(context) else bool(context.user_data.get('pending_tour_pdf_no_cost', True)),
-    }
-    if _tour_v2_active(context):
-        context.user_data['pending_tour_document_mode']=mode
-        context.user_data['tour_v2_phase']='printing_direct'
-        await _finish_pending_tour_pdf(message,context)
-        context.user_data['tour_v2_phase']='complete'
-        return
-    has_transit=bool(data.get("transit"))
-    context.user_data["awaiting_tour_transit_choice"]=True
-    if has_transit:
-        prompt=("‚úàÔ∏è *Transit & Connection*\n\n"
-                f"I found *{len(data.get('transit') or [])} transit sector(s)* in the supplier material.\n\n"
-                "Use them, replace them with flight-ticket PDF(s)/screenshots/text, or skip.")
-    else:
-        prompt=("‚úàÔ∏è *Transit & Connection*\n\n"
-                "No confirmed transit was found in the Tour draft.\n\n"
-                "Add one-way/round-trip/connecting flights from one or multiple PDFs, screenshots or text.\n"
-                "If you skip, the box will show *Done by Self* in the center.")
-    await message.reply_text(prompt,parse_mode="Markdown",reply_markup=tour_transit_choice_keyboard(has_transit))
-
-
-async def generate_tour_pdf_final(message, context, data, detail='basic', no_cost=False, reference=None):
-    data = _normalize_guest_counts(dict(data))
-    data['detail_level'] = detail or 'basic'
-    document_mode = context.user_data.get('pending_tour_document_mode') or data.get('document_mode') or 'itinerary'
-    b2b = _is_b2b_tour(data=data, context=context)
-    data = _apply_tour_document_mode_fields(data, document_mode, b2b=b2b)
-    # Keep supplier/package costing in the saved record for future markup edits,
-    # while using a separate render copy when the customer PDF must hide cost.
-    stored_data = copy.deepcopy(data)
-    render_data = copy.deepcopy(data)
-    if no_cost:
-        render_data['show_cost'] = False
-        render_data.pop('package_costs', None)
-    filename = _package_filename(stored_data)
-    base_pdf = GENERATED_DIR / f'_tour_base_{filename}'
-    combined_pdf = GENERATED_DIR / f'_tour_terms_{filename}'
-    wm_pdf = GENERATED_DIR / f'_tour_wm_{filename}'
-    final_pdf = GENERATED_DIR / filename
-    size = context.user_data.get('pending_tour_page_size', 'A4') or 'A4'
-    footer_mode = context.user_data.get('pending_tour_footer_mode') or _default_footer_mode('package')
-    logo_path = LOGO_PATH if LOGO_PATH.exists() else None
-    clean = bool(b2b or context.user_data.get('pending_b2b', False) or context.user_data.get('pending_clean_agency', False))
-    if clean:
-        footer_mode = 'none'
-        render_data['agency_removed'] = True
-        stored_data['agency_removed'] = True
-    last_page = context.user_data.get('pending_tour_last_page') or get_tour_last_page()
-    if last_page == 'tc_default': last_page = 'tc_non_google'
-    if b2b or context.user_data.get('pending_b2b'):
-        last_page = 'b2b'
-        render_data = _b2b_neutralize_data(render_data, document_mode)
-        render_data['greeting'] = _b2b_greeting(render_data, document_mode)
-        stored_data = _b2b_neutralize_data(stored_data, document_mode)
-        stored_data['greeting'] = _b2b_greeting(stored_data, document_mode)
-    await asyncio.to_thread(generate_pdf, render_data, base_pdf, None if clean else logo_path, size)
-    await asyncio.to_thread(append_selected_terms, base_pdf, last_page, combined_pdf)
-    base_pdf.unlink(missing_ok=True)
-    ws = load_settings()
-    await asyncio.to_thread(add_watermark_to_pdf, combined_pdf, wm_pdf, ws['buttons'].get('watermark', True) and not clean, ws.get('watermark_opacity', 0.04), ws.get('watermark_scale', 1.5))
-    combined_pdf.unlink(missing_ok=True)
-    await asyncio.to_thread(_apply_footer_mode, wm_pdf, final_pdf, footer_mode)
-    wm_pdf.unlink(missing_ok=True)
-    ref = reference or create_reference()
-    save_record(ref, {'type':'package','filename':filename,'data':stored_data,'fare':None,'source_text':context.user_data.get('source_text',''),'detail_level':detail,'terms_choice':last_page,'document_mode':document_mode,'b2b':bool(b2b or context.user_data.get('pending_b2b')),'footer':footer_mode!='none','footer_mode':footer_mode,'logo_enabled':not clean,'page_size':size,'agency_removed':clean,'text_scale':float(load_settings().get('text_scale',1.0)),'logo_scale':float(get_logo_scale('package')),'auto_creation':bool(context.user_data.get('auto_creation')),'no_cost':bool(no_cost)})
-    if b2b:
-        caption_prefix = "üìÑ B2B"
-    else:
-        caption_prefix = "ü§ñ Auto-Created MyTourBazar" if context.user_data.get('auto_creation') else "üìÑ MyTourBazar"
-    caption = f"{caption_prefix} {data.get('document_title','OFFICIAL TOUR ITINERARY').title()}\n\nüìú Last page: {terms_label(last_page)}"
-    with open(final_pdf,'rb') as fh:
-        sent_pdf=await message.reply_document(document=fh, filename=filename, caption=caption, parse_mode='Markdown', reply_markup=generated_document_keyboard(ref, 'package'))
-    _register_reference_message(ref, sent_pdf)
-    return ref, final_pdf
-
-
-def modify_footer_keyboard(reference):
-    rows=[[InlineKeyboardButton('üß© Footer 1 (Old Design)', callback_data=f'mod_footer:{reference}:design'),
-           InlineKeyboardButton('üß≥ Footer 2 (New Design)', callback_data=f'mod_footer:{reference}:footer2')],
-          [InlineKeyboardButton('üüß Contact Bar', callback_data=f'mod_footer:{reference}:bar')],
-          [InlineKeyboardButton('‚¨ÖÔ∏è Back', callback_data=f'modify:{reference}')]]
-    return InlineKeyboardMarkup(rows)
-
-def modify_keyboard(reference, kind):
-    pending = context_dummy = None
-    rows=[]
-    if button_enabled('page_size_controls'):
-        rows.append([InlineKeyboardButton('üìê Page Size', callback_data=f'mod_size:{reference}'),
-                     InlineKeyboardButton('üßæ Footer', callback_data=f'mod_footer_menu:{reference}')])
-    if kind == 'package':
-        rows.append([InlineKeyboardButton('üìù Detailed Day Plan', callback_data=f'mod_detail:{reference}:detailed')])
-        rows.append([InlineKeyboardButton('üìú Last Page', callback_data=f'mod_last_page:{reference}'),
-                     InlineKeyboardButton('üè¢ B2B Print', callback_data=f'mod_b2b:{reference}')])
-        rows.append([InlineKeyboardButton('üßæ Quotation', callback_data=f'mod_mode:{reference}:quotation'),
-                     InlineKeyboardButton('üé´ Voucher', callback_data=f'mod_mode:{reference}:voucher')])
-    rows.append([InlineKeyboardButton('‚úÖ Done ‚Ä¢ Make Again', callback_data=f'mod_done:{reference}')])
-    return InlineKeyboardMarkup(rows)
-
-def modify_last_page_keyboard(reference):
-    current = get_tour_last_page()
-    labels = [('tc_non_google','üìú T&C NON GOOGLE'),('without_footer','üìÑ Without Footer')]
-    rows=[]
-    for key,label in labels:
-        prefix='‚úÖ ' if current==key else ''
-        rows.append([InlineKeyboardButton(prefix+label, callback_data=f'mod_last_page:{reference}:{key}')])
-    rows.append([InlineKeyboardButton('‚¨ÖÔ∏è Back', callback_data=f'modify:{reference}')])
-    return InlineKeyboardMarkup(rows)
-
-def modify_size_keyboard(reference):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton('A4', callback_data=f'mod_size:{reference}:A4'), InlineKeyboardButton('Letter', callback_data=f'mod_size:{reference}:Letter'), InlineKeyboardButton('Legal', callback_data=f'mod_size:{reference}:Legal')],
-        [InlineKeyboardButton('‚¨ÖÔ∏è Back', callback_data=f'modify:{reference}')],
-    ])
-
-def _pdf_page_count(path):
-    try:
-        import fitz
-        with fitz.open(str(path)) as doc:
-            return len(doc)
-    except Exception:
-        return 0
-
-
-async def _render_saved_pdf(reference, record, data, kind, fare, page_size, footer_mode, logo_enabled, text_scale_override=None, logo_scale_override=None, auto_fit=False, last_page=None):
-    filename = (_package_filename(data) if kind=='package' else _flight_filename(data) if kind=='flight' else _bus_filename(data) if kind=='bus' else _hotel_filename(data))
-    final=GENERATED_DIR/filename
-    scales=[text_scale_override] if text_scale_override is not None else [None]
-    if auto_fit:
-        current=float(load_settings().get('text_scale',1.0))
-        scales=[round(current*x,2) for x in (1.00,0.95,0.90,0.85,0.80,0.75,0.70)]
-    selected_scale=scales[-1] if scales else text_scale_override
-    for attempt,scale in enumerate(scales):
-        base=GENERATED_DIR/f'_modify_{reference}_base_{attempt}.pdf'
-        wm=GENERATED_DIR/f'_modify_{reference}_wm_{attempt}.pdf'
-        candidate=GENERATED_DIR/f'_modify_{reference}_final_{attempt}.pdf'
-        try:
-            logo_path=LOGO_PATH if logo_enabled and LOGO_PATH.exists() else None
-            if kind=='package':
-                render_data = copy.deepcopy(data)
-                render_b2b = bool(record.get('b2b') or render_data.get('b2b') or render_data.get('brand_neutral'))
-                if render_b2b:
-                    render_data = _apply_tour_document_mode_fields(render_data, record.get('document_mode') or render_data.get('document_mode') or 'itinerary', b2b=True)
-                    logo_path = None
-                    record['_clean_agency'] = True
-                    footer_mode = 'none'
-                    last_page = 'b2b'
-                await asyncio.to_thread(generate_pdf,render_data,base,logo_path,_normalize_page_size(page_size) or 'A4',text_scale_override=scale,logo_scale_override=logo_scale_override)
-                combined=GENERATED_DIR/f'_modify_{reference}_terms_{attempt}.pdf'
-                await asyncio.to_thread(append_selected_terms,base,last_page or record.get('terms_choice') or get_tour_last_page(),combined); base.unlink(missing_ok=True); base=combined
-            else:
-                await asyncio.to_thread(_generate_adaptive_ticket,kind,data,fare,base,logo_path,page_size,text_scale_override=scale,logo_scale_override=logo_scale_override)
-            base_pages=_pdf_page_count(base)
-            ws=load_settings()
-            await asyncio.to_thread(add_watermark_to_pdf,base,wm,ws['buttons'].get('watermark',True) and not record.get('_clean_agency',False),ws.get('watermark_opacity',0.04),ws.get('watermark_scale',1.5))
-            base.unlink(missing_ok=True)
-            if footer_mode == 'bar' and not record.get('_clean_agency',False):
-                await asyncio.to_thread(add_contact_bar_to_pdf,wm,candidate)
-            elif footer_mode == 'footer2' and not record.get('_clean_agency',False):
-                await asyncio.to_thread(add_footer2_to_pdf,wm,candidate)
-            elif footer_mode == 'design' and not record.get('_clean_agency',False):
-                await asyncio.to_thread(add_footer_to_pdf,wm,candidate)
-            else:
-                shutil.copyfile(wm,candidate)
-            wm.unlink(missing_ok=True)
-            final_pages=_pdf_page_count(candidate)
-            # Auto Fit intervenes only when the data itself is one page and the selected footer caused an extra page.
-            if auto_fit and base_pages == 1 and final_pages > 1 and footer_mode != 'none':
-                # If the footer was the cause, smaller text should eventually let it overlay the final page.
-                candidate.unlink(missing_ok=True)
-                continue
-            shutil.move(str(candidate),str(final))
-            selected_scale=scale
-            break
-        finally:
-            for q in (base,wm,candidate):
-                try: q.unlink(missing_ok=True)
-                except Exception: pass
-    return final, selected_scale, filename
-
-
-async def auto_fit_saved_ticket(query, context, reference):
-    """Auto-size any generated MyTourBazar document while preserving its saved settings.
-
-    For Tour/Auto Creation this also preserves the selected last-page asset and footer mode.
-    The best candidate uses the fewest pages, then the largest readable font, then A4/Letter/Legal.
-    """
-    record = load_record(reference)
-    if not record:
-        await query.message.reply_text('‚ùå This saved document is no longer available.', reply_markup=main_keyboard())
-        return
-    kind = record.get('type', 'package')
-    if kind not in ('package', 'flight', 'bus', 'hotel'):
-        await safe_callback_edit(query, '‚ö° Auto Size is not available for this document type.')
-        return
-
-    data = _normalize_guest_counts(copy.deepcopy(record.get('data') or {}))
-    if kind == 'package' and record.get('b2b'):
-        data = _apply_tour_document_mode_fields(data, record.get('document_mode') or data.get('document_mode') or 'itinerary', b2b=True)
-    fare = record.get('fare')
-    footer_mode = record.get('footer_mode') or (_default_footer_mode(kind) if record.get('footer') else 'none')
-    logo_enabled = bool(record.get('logo_enabled', True)) and not bool(record.get('agency_removed', False))
-    logo_scale = float(record.get('logo_scale') or get_logo_scale(kind))
-    clean = bool(record.get('agency_removed', False))
-    last_page = record.get('terms_choice') or get_tour_last_page()
-
-    await safe_callback_edit(query, '‚ö° *Auto Size is checking A4, Letter and Legal...*', parse_mode='Markdown')
-
-    sizes = ['A4', 'Letter', 'Legal']
-    current = float(record.get('text_scale') or load_settings().get('text_scale', 1.0))
-    current = max(0.70, min(1.35, current))
-    scales = [round(current * x, 2) for x in (1.00, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70)]
-    scales = list(dict.fromkeys(max(0.60, min(1.35, x)) for x in scales))
-
-    best = None
-    tmp_files = []
-    try:
-        for size_index, size in enumerate(sizes):
-            for scale_index, scale in enumerate(scales):
-                stem = f'_autofit_{reference}_{size}_{scale_index}'
-                base = GENERATED_DIR / f'{stem}_base.pdf'
-                combined = GENERATED_DIR / f'{stem}_terms.pdf'
-                wm = GENERATED_DIR / f'{stem}_wm.pdf'
-                candidate = GENERATED_DIR / f'{stem}_final.pdf'
-                tmp_files.extend([base, combined, wm, candidate])
-                try:
-                    logo_path = LOGO_PATH if logo_enabled and LOGO_PATH.exists() else None
-                    if kind == 'package':
-                        await asyncio.to_thread(
-                            generate_pdf, data, base, logo_path, size,
-                            text_scale_override=scale, logo_scale_override=logo_scale
-                        )
-                        await asyncio.to_thread(append_selected_terms, base, last_page, combined)
-                        base.unlink(missing_ok=True)
-                        render_source = combined
-                    else:
-                        await asyncio.to_thread(
-                            _generate_ticket_base, kind, data, fare, base, logo_path, size,
-                            text_scale_override=scale, logo_scale_override=logo_scale
-                        )
-                        render_source = base
-
-                    ws = load_settings()
-                    await asyncio.to_thread(
-                        add_watermark_to_pdf, render_source, wm,
-                        ws['buttons'].get('watermark', True) and not clean,
-                        ws.get('watermark_opacity', 0.04), ws.get('watermark_scale', 1.5)
-                    )
-                    if footer_mode == 'bar' and not clean:
-                        await asyncio.to_thread(add_contact_bar_to_pdf, wm, candidate)
-                    elif footer_mode == 'footer2' and not clean:
-                        await asyncio.to_thread(add_footer2_to_pdf, wm, candidate)
-                    elif footer_mode == 'design' and not clean:
-                        await asyncio.to_thread(add_footer_to_pdf, wm, candidate)
-                    else:
-                        shutil.copyfile(wm, candidate)
-
-                    final_pages = _pdf_page_count(candidate)
-                    if final_pages <= 0:
-                        continue
-                    score = (final_pages, -scale, size_index)
-                    if best is None or score < best['score']:
-                        best = {'score': score, 'size': size, 'scale': scale, 'pages': final_pages, 'source': candidate}
-                except Exception:
-                    logger.exception('Auto Size candidate failed: %s %s %s', kind, size, scale)
-
-        if not best:
-            raise RuntimeError('Auto Size could not create a valid PDF candidate.')
-
-        filename = (_package_filename(data) if kind == 'package' else
-                    _flight_filename(data) if kind == 'flight' else
-                    _bus_filename(data) if kind == 'bus' else _hotel_filename(data))
-        final = GENERATED_DIR / filename
-        shutil.copyfile(best['source'], final)
-        record.update({
-            'filename': final.name,
-            'data': data,
-            'page_size': best['size'],
-            'text_scale': best['scale'],
-            'logo_scale': logo_scale,
-        })
-        update_record(reference, record)
-
-        await safe_callback_edit(
-            query,
-            f"‚úÖ *Auto Size complete*\n\nüìê Page: *{best['size']}*\nüî§ Font scale: *{int(round(best['scale'] * 100))}%*\nüìÑ Pages: *{best['pages']}*",
-            parse_mode='Markdown'
-        )
-        label = 'Tour' if kind == 'package' else kind.title()
-        with open(final, 'rb') as fh:
-            sent_pdf=await query.message.reply_document(
-                document=fh,
-                filename=final.name,
-                caption=_record_caption(reference, f'üìÑ Auto-Sized MyTourBazar {label}', f"Page size: {best['size']} | Font: {int(round(best['scale']*100))}%"),
-                reply_markup=generated_document_keyboard(reference, kind),
-            )
-        _register_reference_message(reference, sent_pdf)
-    except Exception as exc:
-        logger.exception('Auto Size failed')
-        await query.message.reply_text(
-            f'‚ùå Auto Size failed.\n\nReason: `{str(exc)[:800]}`',
-            parse_mode='Markdown', reply_markup=generated_document_keyboard(reference, kind)
-        )
-    finally:
-        for path in tmp_files:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
-async def regenerate_saved_with_modifications(query, context, reference):
-    record=load_record(reference)
-    if not record:
-        await query.message.reply_text('‚ùå This saved document is no longer available.', reply_markup=main_keyboard()); return
-    pending=context.user_data.get(f'modify:{reference}', {})
-    if not pending:
-        await safe_callback_edit(query, 'No changes selected.'); return
-    old_data=record.get('data') or {}
-    kind=record.get('type','package')
-    fare=record.get('fare')
-    data=_normalize_guest_counts(dict(old_data))
-    detail=pending.get('detail')
-    if kind=='package' and detail and str(data.get('detail_level','')).lower()!=detail:
-        data=await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail))
-        data['client_name']=old_data.get('client_name',''); data['detail_level']=detail
-    page_size=pending.get('page_size') or record.get('page_size') or 'A4'
-    footer_mode=pending.get('footer_mode') or record.get('footer_mode') or _default_footer_mode(kind)
-    logo_enabled=record.get('logo_enabled',True) and not pending.get('clean_agency',False)
-    logo_scale=float(pending.get('logo_scale') or record.get('logo_scale') or get_logo_scale(kind))
-    font_scale=float(pending.get('font_scale') or record.get('text_scale') or load_settings().get('text_scale',1.0))
-    b2b=bool(pending.get('b2b',False) or record.get('b2b',False)) if kind=='package' else False
-    clean=bool(pending.get('clean_agency',False) or record.get('agency_removed',False) or b2b)
-    if clean:
-        footer_mode='none'
-    if kind=='package':
-        context.user_data['pending_tour_last_page']='b2b' if b2b else (pending.get('tour_last_page') or record.get('terms_choice') or get_tour_last_page())
-        if context.user_data['pending_tour_last_page']=='tc_default': context.user_data['pending_tour_last_page']='tc_non_google'
-        context.user_data['pending_b2b']=b2b
-        context.user_data['pending_tour_document_mode']=pending.get('document_mode') or record.get('document_mode') or 'itinerary'
-        if b2b:
-            data=_apply_tour_document_mode_fields(data,context.user_data['pending_tour_document_mode'],b2b=True)
-    # Use the selected per-service footer and keep it through page-size/font changes unless explicitly changed.
-    record['_clean_agency']=clean
-    final, selected_scale, filename=await _render_saved_pdf(reference,record,data,kind,fare,page_size,footer_mode,logo_enabled,text_scale_override=font_scale,logo_scale_override=logo_scale,auto_fit=False,last_page=context.user_data.get('pending_tour_last_page') or ('b2b' if pending.get('b2b') else record.get('terms_choice') or get_tour_last_page()))
-    record.pop('_clean_agency',None)
-    record.update({'filename':filename,'data':data,'page_size':page_size,'footer':footer_mode!='none','footer_mode':footer_mode,'detail_level':detail or record.get('detail_level','basic'),'logo_enabled':logo_enabled,'text_scale':selected_scale,'logo_scale':logo_scale,'agency_removed':clean,'terms_choice':context.user_data.get('pending_tour_last_page') or ('b2b' if pending.get('b2b') else record.get('terms_choice') or get_tour_last_page()),'document_mode':pending.get('document_mode') or record.get('document_mode','itinerary'),'b2b':bool(b2b)})
-    update_record(reference,record)
-    context.user_data.pop(f'modify:{reference}',None)
-    await safe_callback_edit(query,'‚è≥ Regenerating with your selected changes...')
-    with open(final,'rb') as fh:
-        sent_pdf=await query.message.reply_document(document=fh,filename=filename,caption=_record_caption(reference,(f'üìÑ Updated B2B {kind.title()}' if b2b else f'üìÑ Updated MyTourBazar {kind.title()}'),f'Page size: {page_size}'),reply_markup=generated_document_keyboard(reference,kind))
-    _register_reference_message(reference, sent_pdf)
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_allowed(update):
-        await safe_callback_edit(query, "Sorry, this bot is private.")
-        return
-
-    if query.data.startswith("settings:"):
-        await settings_callback(query, context)
-        return
-
-
-    if query.data.startswith("hotel_cost:"):
-        reference=query.data.split(":",1)[1]
-        record=load_record(reference)
-        if not record or record.get('type')!='hotel':
-            await query.message.reply_text('‚ùå This Hotel reference is no longer available.',reply_markup=main_keyboard()); return
-        context.user_data['post_hotel_cost_reference']=reference
-        # Clear generic fare state so the reply can never be misread as Air/Bus fare markup.
-        context.user_data.pop('pending_fare_kind',None)
-        context.user_data.pop('pending_fare_supplier_total',None)
-        await query.message.reply_text(
-            'üè® *Add Hotel Cost*\n\nReply in one message, for example:\n`3500 per room per night`\n`room 4200 and EB 1200 per night`\n`total 25000`\n\nNo prefix is required. I will use check-in/check-out to calculate nights and regenerate this same Hotel voucher.',
-            parse_mode='Markdown',reply_markup=ReplyKeyboardRemove())
-        return
-
-    if query.data.startswith("post_transit_make:"):
-        reference=query.data.split(":",1)[1]
-        pending=context.user_data.get('post_transit_pending') or {}
-        record=load_record(reference)
-        if not record or record.get('type')!='package':
-            context.user_data.pop('post_transit_pending',None)
-            await query.message.reply_text("‚ùå This Tour reference is no longer available.",reply_markup=main_keyboard()); return
-        data=pending.get('data') if pending.get('reference')==reference else record.get('data') or {}
-        await safe_callback_edit(query,'‚è≥ Regenerating Tour PDF with the confirmed transit...')
-        try:
-            await _regenerate_saved_package(query.message,reference,record,data,'üìÑ Tour PDF regenerated with transit')
-            context.user_data.pop('post_transit_pending',None)
-            await query.message.reply_text('‚úÖ Transit PDF ready.',reply_markup=main_keyboard())
-        except Exception as exc:
-            logger.exception('Post transit Make PDF failed')
-            await query.message.reply_text(f"‚ö†Ô∏è PDF could not be regenerated. Your transit is still saved in this session; tap Make PDF again.\n\nReason: {str(exc)[:400]}",reply_markup=_post_transit_confirm_keyboard(reference,not _package_has_customer_costing(data)))
-        return
-
-    if query.data.startswith("post_transit_cost:"):
-        reference=query.data.split(":",1)[1]
-        pending=context.user_data.get('post_transit_pending') or {}
-        record=load_record(reference)
-        if not record or record.get('type')!='package':
-            context.user_data.pop('post_transit_pending',None)
-            await query.message.reply_text("‚ùå This Tour reference is no longer available.",reply_markup=main_keyboard()); return
-        if pending.get('reference')==reference and pending.get('data'):
-            record['data']=pending['data']
-            update_record(reference,record)
-        context.user_data.pop('post_transit_pending',None)
-        context.user_data['post_cost_reference']=reference
-        await query.message.reply_text(
-            "üí∞ *Add Costing*\n\n" + _package_cost_prompt(record.get('data') or {}) + "\n\nAfter I have the applicable rates, I will regenerate the same PDF with Transit and Costing.",
-            parse_mode='Markdown',reply_markup=ReplyKeyboardRemove())
-        return
-
-    if query.data.startswith("post_cost:"):
-        reference=query.data.split(":",1)[1]
-        record=load_record(reference)
-        if not record or record.get("type")!="package":
-            await query.message.reply_text("‚ùå This Tour reference is no longer available.",reply_markup=main_keyboard()); return
-        context.user_data["post_cost_reference"]=reference
-        await query.message.reply_text(
-            "üí∞ *Add Costing*\n\n" + _package_cost_prompt(record.get('data') or {}) + "\n\nI will regenerate the same Tour PDF once the applicable customer rates are available.",
-            parse_mode="Markdown",reply_markup=ReplyKeyboardRemove())
-        return
-
-    if query.data.startswith("post_transit:"):
-        reference=query.data.split(":",1)[1]
-        record=load_record(reference)
-        if not record or record.get("type")!="package":
-            await query.message.reply_text("‚ùå This Tour reference is no longer available.",reply_markup=main_keyboard()); return
-        context.user_data["post_transit_reference"]=reference
-        await query.message.reply_text(
-            """‚úàÔ∏è *Add Transit*
-
-Type the travel sectors naturally, preferably one sector per line. No Onward / Return / Transit prefix is required.
-
-Airport codes, city names, flight/train numbers, dates, terminals and times can be mixed in any order. I will infer the journey sequence from the lines.
-
-Example:
-`RPR DEL AI1729 12:20 14:35`
-`DEL DXB EK511 18:30 21:00`
-`DXB DEL EK510 03:30 08:25`
-`DEL RPR AI1730 10:20 12:05`
-
-I will show the detailed Transit text I understood before regenerating the PDF.""",
-            parse_mode="Markdown",reply_markup=ReplyKeyboardRemove())
-        return
-
-    if query.data.startswith("edit_generated:"):
-        reference = query.data.split(":", 1)[1]
-        if not load_record(reference):
-            await query.message.reply_text("‚ùå That generated document is no longer available.", reply_markup=ready_keyboard())
-            return
-        context.user_data["editing_reference"] = reference
-        await query.message.reply_text(
-            f"ü§ñ *Smart editing {reference}*\n\nTell me naturally what you want changed. I will understand the request and update the correct part of the saved itinerary ‚Äî you do not need to use a predefined command.\n\nThis button stays with this generated PDF, so you can press it again later to make more changes.\n\nExamples: change a passenger, rename a hotel, correct a date/time, modify baggage, change fare, remove/add footer or logo, change page size, rewrite a day plan, or combine several changes in one message.",
-            parse_mode="Markdown", reply_markup=ready_keyboard()
-        )
-        return
-
-    if query.data == "enter_ref":
-        context.user_data["awaiting_edit_ref"] = True
-        await query.message.reply_text(
-            "‚úèÔ∏è *Enter the Reference Number*\n\nExample: `MTB01`",
-            parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    if query.data.startswith("files_page:"):
-        try:
-            page = int(query.data.split(":", 1)[1])
-        except ValueError:
-            page = 0
-        await query.edit_message_reply_markup(reply_markup=files_list_keyboard(page))
-        return
-
-    if query.data.startswith("size:"):
-        await safe_callback_edit(query, "‚ÑπÔ∏è Page size is now changed from üõ†Ô∏è Modify & Regenerate on the generated PDF.")
-        return
-
-    if query.data.startswith("select_ref:"):
-        reference = query.data.split(":", 1)[1]
-        record = load_record(reference)
-        if not record:
-            await query.message.reply_text("‚ùå That saved document no longer exists. Please use the latest generated PDF.", reply_markup=main_keyboard())
-            return
-        context.user_data["editing_reference"] = reference
-        await query.message.reply_text(
-            f"‚úèÔ∏è *Selected {reference}*\n\nType the changes you want to make. You can change day plans, flights, hotels, meal plans, inclusions, exclusions, passenger details, fare, or other supported document details.",
-            parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    if query.data == "cancel":
-        context.user_data.clear()
-        await safe_callback_edit(query, "‚ùå Cancelled.")
-        await query.message.reply_text("Ready for the next itinerary.", reply_markup=main_keyboard())
-        return
-
-    if query.data == "reenter":
-        context.user_data.clear()
-        await safe_callback_edit(query, "üîÑ Start again with üó∫Ô∏è Tour Guide.")
-        await query.message.reply_text("Ready.", reply_markup=main_keyboard())
-        return
-
-    if query.data == "add_inclusion":
-        await query.message.reply_text(
-            "‚ûï *Add extra inclusion*\n\nType the inclusion exactly as you want it to appear.",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        context.user_data["awaiting_extra"] = "inclusion"
-        return
-
-    if query.data == "add_exclusion":
-        await query.message.reply_text(
-            "‚ûï *Add extra exclusion*\n\nType the exclusion exactly as you want it to appear.",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        context.user_data["awaiting_extra"] = "exclusion"
-        return
-
-    if query.data == "add_flight":
-        await query.message.reply_text(
-            "‚úàÔ∏è *Add flight / train details*\n\n"
-            "You can now send *screenshots or text*. You may send onward and return details separately or together. "
-            "I will automatically identify every flight/train sector and keep connecting sectors separate.\n\n"
-            "When finished, tap *‚úÖ Done*.",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup([["‚úçÔ∏è Flight Text"], ["‚úàÔ∏è Flight Screenshot"], ["‚úÖ Done"]], resize_keyboard=True)
-        )
-        context.user_data["awaiting_flight"] = True
-        return
-
-    if query.data == "add_flight_text":
-        await query.message.reply_text(
-            "‚úçÔ∏è *Add Flight / Train Details in Text*\n\n"
-            "Paste whatever details you have. No special format is required. You can send onward and return journeys together or in separate messages.\n\n"
-            "Example:\n`01 Oct: IndiGo 6E-594 Raipur ‚Üí Mumbai 09:30 AM ‚Äì 11:25 AM\n"
-            "01 Oct: IndiGo 6E-273 Mumbai ‚Üí Rajkot 01:10 PM ‚Äì 03:50 PM`\n\n"
-            "The local parser will extract the operator, service number, route, date, departure and arrival automatically.\n\n"
-            "When finished, tap *‚úÖ Done*.",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup([["‚úçÔ∏è Flight Text"], ["‚úàÔ∏è Flight Screenshot"], ["‚úÖ Done"]], resize_keyboard=True)
-        )
-        context.user_data["awaiting_flight"] = True
-        return
-
-    if query.data == 'draft_edit':
-        if not context.user_data.get('itinerary'):
-            await query.message.reply_text('‚ùå No current draft is available. Please start the Tour workflow again.', reply_markup=main_keyboard())
-            return
-        context.user_data['editing_current_itinerary'] = True
-        await query.message.reply_text(
-            'üõ†Ô∏è *Modify & Regenerate*\n\n'
-            'Tell me exactly what you want changed. I will update the draft only ‚Äî no PDF will be generated yet.\n\n'
-            'Examples:\n'
-            '‚Ä¢ `Change Day 2 sightseeing to Sonmarg.`\n'
-            '‚Ä¢ `Change the hotel in Gulmarg to a 4 star option.`\n'
-            '‚Ä¢ `Correct the guest name to Mr. Amit Sharma.`\n'
-            '‚Ä¢ `Add private airport pickup to inclusions.`\n\n'
-            'You can type normally or reply directly to this message.',
-            parse_mode='Markdown', reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    if query.data == 'draft_done':
-        data = context.user_data.get('itinerary')
-        if not data:
-            await query.message.reply_text('‚ùå No current draft is available. Please start the Tour workflow again.', reply_markup=main_keyboard())
-            return
-        context.user_data['itinerary'] = _ensure_supplier_costs(data)
-        context.user_data['pending_tour_pdf_no_cost'] = True
-        context.user_data.pop('editing_current_itinerary', None)
-        await safe_callback_edit(
-            query,
-            '‚úÖ *Draft confirmed.*\n\nChoose the output you want. For PDF, first choose Basic/Detailed and then Tour Quotation or Tour Voucher.',
-            parse_mode='Markdown', reply_markup=tour_output_keyboard()
-        )
-        return
-
-    if query.data == "tour_detail:basic" or query.data == "tour_detail:detailed":
-        data = context.user_data.get("itinerary")
-        if not data:
-            await query.message.reply_text("No itinerary data is available. Please start the tour workflow again.", reply_markup=main_keyboard())
-            return
-        detail = query.data.split(":", 1)[1]
-        try:
-            status = await query.message.reply_text("‚öôÔ∏è Updating the day plans locally...")
-            new_data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail), status=status)
-            new_data["client_name"] = data.get("client_name", "")
-            new_data["detail_level"] = detail
-            if data.get('b2b') or data.get('brand_neutral') or context.user_data.get('pending_b2b'):
-                new_data = _apply_tour_document_mode_fields(
-                    new_data,
-                    data.get('document_mode') or new_data.get('document_mode') or 'itinerary',
-                    b2b=True,
-                )
-                context.user_data['pending_b2b'] = True
-                context.user_data['pending_clean_agency'] = True
-                context.user_data['pending_tour_last_page'] = 'b2b'
-            context.user_data["itinerary"] = new_data
-            await safe_status_edit(status, query.message, f"‚úÖ {detail.title()} itinerary ready. Choose WhatsApp or PDF.")
-            await query.message.reply_text(build_confirmation(new_data), parse_mode="Markdown")
-            await query.message.reply_text("Choose the output you want.", reply_markup=tour_output_keyboard())
-        except Exception as exc:
-            logger.exception("Tour detail enhancement failed")
-            await query.message.reply_text(f"‚ùå Could not update itinerary: {str(exc)[:700]}", reply_markup=main_keyboard())
-        return
-
-    if query.data == "tour_edit_current":
-        data = context.user_data.get("itinerary")
-        if not data:
-            await query.message.reply_text("No current itinerary is available.", reply_markup=main_keyboard())
-            return
-        context.user_data["editing_current_itinerary"] = True
-        await query.message.reply_text(
-            "üõ†Ô∏è *Modify & Regenerate*\n\nTell me naturally what you want changed. I will update the current draft only. After the updated draft is ready, you can again choose WhatsApp or PDF.",
-            parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    if query.data.startswith("tour_transit:"):
-        action=query.data.split(":",1)[1]
-        data=context.user_data.get("itinerary") or {}
-        if action=="cancel":
-            context.user_data.pop("awaiting_tour_transit_choice",None)
-            await safe_callback_edit(query,"‚ùå Transit selection cancelled.",reply_markup=draft_review_keyboard()); return
-        if action=="use":
-            context.user_data.pop("awaiting_tour_transit_choice",None)
-            data["transit_done_by_self"]=False; context.user_data["itinerary"]=data
-            await safe_callback_edit(query,"‚úÖ Detected transit will be used.")
-            await _continue_tour_pdf_after_transit(query.message,context); return
-        if action=="skip":
-            context.user_data.pop("awaiting_tour_transit_choice",None)
-            data["transit"]=[]; data["transit_done_by_self"]=True; context.user_data["itinerary"]=data
-            await safe_callback_edit(query,"‚úÖ Transit skipped. The box will show *Done by Self*.",parse_mode="Markdown")
-            await _continue_tour_pdf_after_transit(query.message,context); return
-        if action=="add":
-            context.user_data.pop("awaiting_tour_transit_choice",None)
-            context.user_data["awaiting_tour_transit_input"]=True
-            context.user_data["pending_tour_transit_files"]=[]
-            context.user_data["pending_tour_transit_text"]=""
-            await safe_callback_edit(query,
-                "‚úàÔ∏è *Add / Replace Transit*\n\n"
-                "Send one or multiple flight-ticket PDFs, screenshots, unstructured one-way/round-trip text, or any mixture.\n\n"
-                "I will split every sector, detect onward/connection/return, keep the full flight number, preserve terminal whenever supplied, "
-                "and show aircraft in brackets when supplied.\n\nWhen finished, tap *‚úÖ Done Transit*.",
-                parse_mode="Markdown")
-            await query.message.reply_text("Send the transit sources now.",reply_markup=tour_transit_input_keyboard()); return
-
-    if query.data.startswith('voice_edit:'):
-        reference=query.data.split(':',1)[1]
-        record=load_record(reference)
-        if not record:
-            await query.message.reply_text('‚ùå Saved document not found.', reply_markup=main_keyboard()); return
-        context.user_data['editing_reference']=reference
-        context.user_data['voice_edit_reference']=reference
-        kind=record.get('type','document')
-        label={'flight':'Air','bus':'Bus','hotel':'Hotel','package':'Tour'}.get(kind,'Document')
-        await safe_callback_edit(
-            query,
-            f'üéôÔ∏è *Voice / Text Edit*\n\nSend one normal *text message or voice note* with the changes you want in this {label} print. '
-            'No prefix or fixed format is required. I will understand the instruction and regenerate the same PDF.\n\n'
-            'Examples: `change passenger mobile to 9876543210`, `change room type to Deluxe`, or simply explain the change by voice.',
-            parse_mode='Markdown'
-        )
-        return
-
-    if query.data.startswith('autofit:'):
-        reference=query.data.split(':',1)[1]
-        try:
-            await auto_fit_saved_ticket(query, context, reference)
-        except Exception as exc:
-            logger.exception('Auto Fit callback failed')
-            await query.message.reply_text(f'‚ùå Auto Fit failed.\n\nReason: `{str(exc)[:800]}`', parse_mode='Markdown', reply_markup=main_keyboard())
-        return
-
-    if query.data.startswith('modify:') and query.data.count(':') == 1:
-        reference=query.data.split(':',1)[1]; record=load_record(reference)
-        if not record:
-            await query.message.reply_text('‚ùå Saved document not found.', reply_markup=main_keyboard()); return
-        if record.get('type') == 'package':
-            # One natural-language/voice edit entry for supported Tour fields can change
-            # hotels/day plans as well as mixed flight/train/bus transit. Costing labels
-            # (Adult/CWB/CNB/EB) are preserved locally after the AI edit.
-            context.user_data['editing_reference']=reference
-            context.user_data['voice_edit_reference']=reference
-            await safe_callback_edit(query,
-                'üõ†Ô∏è *Modify & Regenerate*\n\nSend one normal *text message or voice note* describing all changes. '
-                'You can mix hotel/day-plan changes, customer costing and any number of flight/train/bus transit sectors.\n\n'
-                'Examples:\n‚Ä¢ `Adult 74000, CWB 52000`\n‚Ä¢ `Change Munnar hotel to Amberdale 4 star`\n‚Ä¢ `Raipur to Nagpur by train 07:15, Nagpur to Goa flight at 14:20, return Goa-Mumbai-Delhi by flight and Delhi-Raipur by bus.`\n\n'
-                'No prefix or fixed format is required. I will understand the instruction and regenerate the same PDF.',
-                parse_mode='Markdown')
-            return
-        context.user_data.setdefault(f'modify:{reference}',{})
-        await safe_callback_edit(query,'üõ†Ô∏è Modify this PDF ‚Äî select what you want to change, then press Done ‚Ä¢ Make Again.',reply_markup=modify_keyboard(reference,record.get('type','package')))
-        return
-    if query.data.startswith('mod_font:'):
-        _,reference,delta=query.data.split(':',2)
-        pending=context.user_data.setdefault(f'modify:{reference}',{})
-        saved=load_record(reference) or {}
-        current=float(pending.get('font_scale') or saved.get('text_scale') or load_settings().get('text_scale',1.0))
-        pending['font_scale']=round(max(.70,min(1.35,current+float(delta))),2)
-        await safe_callback_edit(query,f"‚úÖ Document font size: {int(round(pending['font_scale']*100))}%",reply_markup=modify_keyboard(reference,saved.get('type','package'))); return
-    if query.data.startswith('mod_logo:'):
-        _,reference,delta=query.data.split(':',2)
-        pending=context.user_data.setdefault(f'modify:{reference}',{})
-        saved=load_record(reference) or {}
-        kind=saved.get('type','package')
-        current=float(pending.get('logo_scale') or saved.get('logo_scale') or get_logo_scale(kind))
-        pending['logo_scale']=round(max(.70,min(1.50,current+float(delta))),2)
-        await safe_callback_edit(query,f"‚úÖ Logo size: {int(round(pending['logo_scale']*100))}%",reply_markup=modify_keyboard(reference,kind)); return
-    if query.data.startswith('mod_clean:'):
-        reference=query.data.split(':',1)[1]; pending=context.user_data.setdefault(f'modify:{reference}',{}); pending['clean_agency']=not bool(pending.get('clean_agency',False))
-        label='ON ‚Äî agency details will be removed' if pending['clean_agency'] else 'OFF ‚Äî normal agency details restored'
-        await safe_callback_edit(query,f'üö´ Remove Agency Details: {label}',reply_markup=modify_keyboard(reference,(load_record(reference) or {}).get('type','package'))); return
-    if query.data.startswith('mod_size:'):
-        parts=query.data.split(':'); reference=parts[1]
-        if len(parts)==2:
-            await safe_callback_edit(query,'üìê Choose the new page size.',reply_markup=modify_size_keyboard(reference)); return
-        size=parts[2]; context.user_data.setdefault(f'modify:{reference}',{})['page_size']=size
-        await safe_callback_edit(query,f'‚úÖ Page size selected: {size}.',reply_markup=modify_keyboard(reference,(load_record(reference) or {}).get('type','package'))); return
-    if query.data.startswith('mod_footer_menu:'):
-        reference=query.data.split(':',1)[1]
-        await safe_callback_edit(query,'üßæ Choose the footer for this regenerated PDF.',reply_markup=modify_footer_keyboard(reference)); return
-    if query.data.startswith('mod_footer:'):
-        _,reference,mode=query.data.split(':',2)
-        context.user_data.setdefault(f'modify:{reference}',{})['footer_mode']=mode
-        label={'design':'Footer 1 (Old Design)','footer2':'Footer 2 (New Design)','bar':'Contact Bar'}[mode]
-        await safe_callback_edit(query,f'‚úÖ {label} selected.',reply_markup=modify_keyboard(reference,(load_record(reference) or {}).get('type','package'))); return
-    if query.data.startswith('mod_detail:'):
-        _,reference,detail=query.data.split(':',2)
-        context.user_data.setdefault(f'modify:{reference}',{})['detail']=detail
-        await safe_callback_edit(query,'‚úÖ Detailed Day Plan selected.',reply_markup=modify_keyboard(reference,'package')); return
-    if query.data.startswith('mod_last_page:'):
-        parts=query.data.split(':')
-        reference=parts[1]
-        if len(parts)==2:
-            await safe_callback_edit(query,'üìú Choose the Tour last page for this regeneration.',reply_markup=modify_last_page_keyboard(reference)); return
-        choice=parts[2]
-        context.user_data.setdefault(f'modify:{reference}',{})['tour_last_page']=choice
-        await safe_callback_edit(query,f'‚úÖ Last page selected: {terms_label(choice)}',reply_markup=modify_keyboard(reference,'package')); return
-
-    if query.data.startswith('mod_b2b:'):
-        reference=query.data.split(':',1)[1]
-        record=load_record(reference)
-        if not record:
-            await query.message.reply_text('‚ùå Saved Tour document not found.',reply_markup=main_keyboard()); return
-        await _direct_saved_b2b_print(query.message,context,reference,record,query=query)
-        return
-
-    if query.data.startswith('mod_mode:'):
-        _,reference,mode=query.data.split(':',2)
-        context.user_data.setdefault(f'modify:{reference}',{})['document_mode']=mode
-        label='Official Tour Quotation' if mode=='quotation' else 'Official Tour Voucher'
-        await safe_callback_edit(query,f'‚úÖ {label} selected.',reply_markup=modify_keyboard(reference,'package')); return
-
-    if query.data.startswith('mod_done:'):
-        reference=query.data.split(':',1)[1]
-        try:
-            await regenerate_saved_with_modifications(query,context,reference)
-        except Exception as exc:
-            logger.exception('Modify & Regenerate failed'); await query.message.reply_text(f'‚ùå Regeneration failed.\n\nReason: {str(exc)[:800]}',reply_markup=main_keyboard())
-        return
-    if query.data.startswith('mod_cancel:'):
-        reference=query.data.split(':',1)[1]; context.user_data.pop(f'modify:{reference}',None)
-        await safe_callback_edit(query,'‚ùå Changes cancelled.'); return
-
-    if query.data.startswith("tour_terms:"):
-        detail = context.user_data.get('pending_tour_pdf_detail') or 'basic'
-        no_cost = bool(context.user_data.get('pending_tour_pdf_no_cost', False))
-        data = context.user_data.get('itinerary')
-        if not data:
-            await query.message.reply_text('No itinerary data is available. Please start the Tour workflow again.', reply_markup=main_keyboard())
-            return
-        try:
-            if str(data.get('detail_level','')).lower() != detail:
-                data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail))
-                data['client_name'] = context.user_data.get('guest_name') or data.get('client_name','')
-                context.user_data['itinerary'] = data
-            await safe_callback_edit(query, '‚è≥ Generating the final Tour PDF with T&C NON GOOGLE...')
-            await generate_tour_pdf_final(query.message, context, data, detail, no_cost)
-            for k in ('pending_tour_pdf_detail','pending_tour_pdf_no_cost','pending_tour_page_size','pending_tour_footer_mode'):
-                context.user_data.pop(k,None)
-            await query.message.reply_text('‚úÖ Ready for the next request.', reply_markup=ready_keyboard())
-        except Exception as exc:
-            logger.exception('Tour PDF generation failed')
-            await query.message.reply_text(f'‚ùå Tour PDF generation failed.\n\nReason: {str(exc)[:800]}', reply_markup=main_keyboard())
-        return
-
-    if query.data.startswith('tour_special_notes:'):
-        choice=query.data.split(':',1)[1]
-        data=context.user_data.get('itinerary') or {}
-        if choice=='add':
-            data['special_notes']=context.user_data.get('pending_special_notes','')
-        else:
-            data['special_notes']=''
-        context.user_data['pending_special_notes_decided']=True
-        if data.get('package_costs'):
-            await safe_callback_edit(query,'‚úÖ Special Notes decision saved. Now choose how to handle the supplier cost.',reply_markup=tour_cost_keyboard())
-        else:
-            await safe_callback_edit(query,'‚úÖ Special Notes decision saved. Choose the final Tour output.',reply_markup=tour_output_keyboard())
-        return
-
-    if query.data.startswith('tour_custom_cost:'):
-        action_parts = query.data.split(':')
-        action = action_parts[1] if len(action_parts) > 1 else ''
-        if re.fullmatch(r'MTB\d+', action, re.I):
-            ref = action.upper()
-            rec = load_record(ref) or {}
-            data = _ensure_supplier_costs(rec.get('data') or {})
-            data = _normalize_guest_counts(data)
-            fields = _custom_cost_fields(data)
-            if not data.get('package_costs'):
-                await safe_callback_edit(query, '‚ùå No package cost is available for this itinerary.')
-                return
-            context.user_data['pending_custom_cost_reference'] = ref
-            context.user_data['pending_custom_cost_data'] = copy.deepcopy(data)
-            context.user_data['pending_custom_cost_fields'] = fields
-            context.user_data['pending_custom_cost_index'] = 0
-            context.user_data['pending_custom_cost_input'] = True
-            if fields:
-                key, field, label, count = fields[0]
-                await safe_callback_edit(query,
-                    f'üßæ *Custom Cost*\n\n'
-                    f'*{label}* ‚Äî {count} passenger(s)\n'
-                    f'Enter the direct per-person cost. Example: `1000`\n\n'
-                    f'The PDF cost box will calculate: `1000 √ó {count} = {1000*count:,}`.',
-                    reply_markup=custom_cost_keyboard(), parse_mode='Markdown')
-            else:
-                await safe_callback_edit(query,
-                    'üßæ *Custom Cost*\n\nNo Adult/Child/CWB/CNB/EB count is available. You can still set a direct cost if you add passenger counts first.',
-                    reply_markup=custom_cost_keyboard(), parse_mode='Markdown')
-            return
-        if action == 'done':
-            data = context.user_data.get('pending_custom_cost_data')
-            ref = context.user_data.get('pending_custom_cost_reference')
-            if not data or not ref:
-                await safe_callback_edit(query, '‚ùå Custom Cost session expired. Please open Custom Cost again.')
-                return
-            try:
-                data = _finalize_custom_cost(data)
-                rec = load_record(ref) or {}
-                rec['data'] = data
-                save_record(ref, rec)
-                context.user_data['itinerary'] = data
-                for k in ('pending_custom_cost_reference','pending_custom_cost_data','pending_custom_cost_fields','pending_custom_cost_index','pending_custom_cost_input'):
-                    context.user_data.pop(k, None)
-                # Reprint the same document immediately with the updated cost box.
-                detail = data.get('detail_level') or 'basic'
-                context.user_data['pending_tour_pdf_detail'] = detail
-                context.user_data['pending_tour_pdf_no_cost'] = False
-                context.user_data['pending_tour_document_mode'] = data.get('document_mode') or 'itinerary'
-                await safe_callback_edit(query, '‚òëÔ∏è *Custom Cost saved.*\n\n' + _custom_cost_summary(data) + '\n\n‚è≥ Regenerating the PDF...', parse_mode='Markdown')
-                await generate_tour_pdf_final(query.message, context, data, detail, False, reference=ref)
-            except Exception as exc:
-                logger.exception('Custom cost finalization failed')
-                await safe_callback_edit(query, f'‚ùå Could not save Custom Cost.\n\nReason: `{str(exc)[:700]}`', parse_mode='Markdown')
-            return
-        if action == 'cancel':
-            for k in ('pending_custom_cost_reference','pending_custom_cost_data','pending_custom_cost_fields','pending_custom_cost_index','pending_custom_cost_input'):
-                context.user_data.pop(k, None)
-            await safe_callback_edit(query, '‚ùå *Custom Cost cancelled.*\n\nNo cost was changed.', parse_mode='Markdown')
-            return
-
-    if query.data.startswith('tour_markup:'):
-        # Backward compatibility for old Telegram messages created by earlier builds.
-        # No markup session is started in V159.
-        for _legacy_key in (
-            'pending_tour_markup_print','pending_tour_markup_input','pending_tour_markup_mode',
-            'pending_tour_markup_snapshot','pending_tour_markup_candidate'
-        ):
-            context.user_data.pop(_legacy_key, None)
-        await safe_callback_edit(
-            query,
-            '‚ÑπÔ∏è *The old Tour markup system has been removed.*\n\n'
-            'Use *Modify & Regenerate* on the Tour PDF and tell me the final customer costing naturally, by text or voice.',
-            parse_mode='Markdown'
-        )
-        return
-
-    if query.data.startswith('tour_cost:'):
-        choice=query.data.split(':',1)[1]
-        data=_ensure_supplier_costs(context.user_data.get('itinerary') or {})
-        context.user_data['itinerary']=data
-        if choice=='none':
-            data['show_cost']=False
-            context.user_data['pending_tour_cost_decided']=True
-            await safe_callback_edit(query,'üñ®Ô∏è *Print Without Cost selected.*\n\nThe internal supplier cost will be hidden from the customer PDF.',parse_mode='Markdown',reply_markup=tour_output_keyboard())
-            return
-        if choice in ('markup_print','markup'):
-            await safe_callback_edit(query, '‚ÑπÔ∏è The old markup system has been removed. Use *Modify & Regenerate* and tell me the final customer cost naturally by text or voice.', parse_mode='Markdown')
-            return
-        context.user_data['pending_tour_cost_decided']=True
-        await safe_callback_edit(query,'‚úÖ Cost preference saved. Choose the final Tour output.',reply_markup=tour_output_keyboard())
-        return
-
-    if query.data.startswith("tour_output_mode:"):
-        parts = query.data.split(":")
-        detail = parts[1] if len(parts) > 1 else 'basic'
-        mode = parts[2] if len(parts) > 2 else 'quotation'
-        await safe_callback_edit(query, f"‚úÖ {detail.title()} PDF ‚Ä¢ {'Tour Quotation' if mode=='quotation' else 'Tour Voucher'} selected.", parse_mode='Markdown')
-        if _tour_v2_active(context):
-            # Stale buttons from older drafts stay safe: print directly and never reopen old Transit choices.
-            data=copy.deepcopy(context.user_data.get('itinerary') or {})
-            if not data:
-                await query.message.reply_text('‚ùå No current Tour draft is available.',reply_markup=main_keyboard()); return
-            if str(data.get('detail_level') or 'basic').lower()!=detail:
-                status=await query.message.reply_text(f'‚ú® Preparing the {detail} itinerary...')
-                old_name=str(data.get('client_name') or '')
-                data=await _run_ai_with_retry_status(query.message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail),status=status)
-                data['client_name']=old_name or str(data.get('client_name') or '')
-                data['detail_level']=detail
-                await safe_status_edit(status,query.message,f'‚úÖ {detail.title()} day plan ready.')
-            data['document_mode']=mode
-            context.user_data['itinerary']=data
-            context.user_data['pending_tour_document_mode']=mode
-            context.user_data['pending_tour_pdf_detail']=detail
-            no_cost=not bool(data.get('show_cost') and data.get('package_costs'))
-            context.user_data['pending_tour_pdf_no_cost']=no_cost
-            context.user_data['tour_v2_phase']='printing_direct'
-            ref,_=await generate_tour_pdf_final(query.message,context,data,detail,no_cost)
-            context.user_data['tour_v2_phase']='complete'
-            await query.message.reply_text('‚úÖ PDF delivered. Ready for a new upload or use the buttons on the PDF to modify it.',parse_mode='Markdown',reply_markup=main_keyboard())
-            return
-        await _prepare_tour_pdf_request(query.message, context, detail, mode)
-        return
-
-    if query.data.startswith("tour_output:"):
-        parts = query.data.split(":")
-        output = parts[1]
-        detail = parts[2]
-        if _tour_v2_active(context):
-            data=copy.deepcopy(context.user_data.get("itinerary") or {})
-            if not data:
-                await query.message.reply_text("No itinerary data is available. Please start the tour workflow again.", reply_markup=main_keyboard())
-                return
-            try:
-                if str(data.get("detail_level") or "basic").lower()!=detail:
-                    status=await query.message.reply_text(f"‚ú® Preparing the {detail} itinerary...")
-                    old_name=str(data.get("client_name") or "")
-                    data=await _run_ai_with_retry_status(query.message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail),status=status)
-                    data["client_name"]=old_name or str(data.get("client_name") or "")
-                    data["detail_level"]=detail
-                    await safe_status_edit(status,query.message,"‚úÖ Itinerary detail level ready.")
-                data["show_cost"]=bool(data.get("show_cost") and data.get("package_costs"))
-                context.user_data["itinerary"]=data
-                if output=="whatsapp":
-                    await safe_callback_edit(query, f"‚úÖ {detail.title()} WhatsApp selected. Generating now...")
-                    await reply_text_chunked(query.message,build_whatsapp_itinerary(data,detail),parse_mode="Markdown")
-                    await query.message.reply_text("‚úÖ WhatsApp itinerary generated. You can choose another format below.",reply_markup=_tour_v2_output_keyboard())
-                    return
-                if output=="pdf":
-                    requested_mode = str(context.user_data.get("smart_requested_document_mode") or "").lower()
-                    if requested_mode in ("quotation", "voucher"):
-                        await safe_callback_edit(
-                            query,
-                            f"üìÑ *{detail.title()} {'Tour Quotation' if requested_mode=='quotation' else 'Tour Voucher'} selected from your AI Assistant request.*\n\nGenerating now...",
-                            parse_mode="Markdown",
-                        )
-                        await _prepare_tour_pdf_request(query.message, context, detail, requested_mode)
-                    else:
-                        await safe_callback_edit(
-                            query,
-                            f"üìÑ *{detail.title()} PDF selected.*\n\nNow choose whether this should be a Tour Voucher or Tour Quotation.",
-                            parse_mode="Markdown", reply_markup=tour_pdf_mode_keyboard(detail)
-                        )
-                    return
-            except Exception as exc:
-                logger.exception("Tour V2 output failed")
-                await query.message.reply_text(f"‚ùå Tour output failed: {str(exc)[:700]}",reply_markup=main_keyboard())
-                return
-        document_mode = parts[3] if len(parts) > 3 else None
-        data = context.user_data.get("itinerary")
-        if not data:
-            await query.message.reply_text("No itinerary data is available. Please start the tour workflow again.", reply_markup=main_keyboard())
-            return
-        try:
-            if output == "pdf":
-                requested_mode = document_mode or str(context.user_data.get("smart_requested_document_mode") or "").lower()
-                if requested_mode in ('quotation','voucher'):
-                    await _prepare_tour_pdf_request(query.message, context, detail, requested_mode)
-                else:
-                    await safe_callback_edit(
-                        query,
-                        f"üìÑ *{detail.title()} PDF selected.*\n\nNow choose whether this should be a Tour Quotation or Tour Voucher.",
-                        parse_mode="Markdown", reply_markup=tour_pdf_mode_keyboard(detail)
-                    )
-                return
-            if str(data.get("detail_level", "")).lower() != detail:
-                old_name = str(data.get('client_name') or '').strip()
-                data = await _run_ai_with_retry_status(query.message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail))
-                data["client_name"] = old_name or str(data.get("client_name") or "").strip()
-                data["detail_level"] = detail
-                if data.get('b2b') or data.get('brand_neutral') or context.user_data.get('pending_b2b'):
-                    data = _apply_tour_document_mode_fields(
-                        data,
-                        context.user_data.get('pending_tour_document_mode') or data.get('document_mode') or 'itinerary',
-                        b2b=True,
-                    )
-                    context.user_data['pending_b2b'] = True
-                    context.user_data['pending_clean_agency'] = True
-                    context.user_data['pending_tour_last_page'] = 'b2b'
-                context.user_data["itinerary"] = data
-            if output == "whatsapp":
-                await reply_text_chunked(query.message, build_whatsapp_itinerary(data, detail), parse_mode="Markdown")
-                await query.message.reply_text("üì± WhatsApp itinerary sent. You can choose another format or make changes.", reply_markup=draft_review_keyboard())
-                return
-        except Exception as exc:
-            logger.exception("Tour output generation failed")
-            await query.message.reply_text(f"‚ùå Tour output failed: {str(exc)[:700]}", reply_markup=main_keyboard())
-        return
-
-    if query.data in ("generate", "generate_no_cost"):
-        data = context.user_data.get("itinerary")
-        if not data:
-            await safe_callback_edit(query, "No itinerary data is available. Please start again.")
-            return
-        data = dict(data)
-        detail = data.get('detail_level') or 'basic'
-        no_cost = query.data == 'generate_no_cost'
-        await safe_callback_edit(query, "‚è≥ Generating the final Tour PDF with the default T&C...")
-        try:
-            await generate_tour_pdf_final(query.message, context, data, detail, no_cost)
-            await query.message.reply_text('‚úÖ Ready for the next request.', reply_markup=ready_keyboard())
-        except Exception as exc:
-            logger.exception('Tour PDF generation failed')
-            await query.message.reply_text(f'‚ùå Tour PDF generation failed.\n\nReason: {str(exc)[:800]}', reply_markup=main_keyboard())
-        return
-
-    if query.data in ("footer_bar", "footer_design", "footer2", "print_clean", "footer_yes", "footer_no"):
-        await safe_callback_edit(query, '‚ÑπÔ∏è Footer is now controlled by /settings and by Modify & Regenerate after a PDF is generated.')
-        return
-
-    if query.data.startswith("fare_original:"):
-        _cancel_auto_print(context)
-        kind = query.data.split(":", 1)[1]
-        supplier_total = float(context.user_data.get("pending_fare_supplier_total", 0) or 0)
-        if supplier_total <= 0:
-            await safe_callback_edit(query,
-                "‚ùå No original supplier fare was found.\n\n"
-                "Use *Add Cost* or *Print Without Fare* instead.",
-                parse_mode="Markdown"
-            )
-            return
-        context.user_data[f"pending_{kind}_fare"] = supplier_total
-        context.user_data.pop("pending_fare_kind", None)
-        context.user_data["pending_footer_kind"] = kind
-        await safe_callback_edit(query, f"üí∞ *Original supplier fare selected: INR {supplier_total:,.2f}.*\n\nGenerating with the saved {kind.title()} footer setting...", parse_mode="Markdown")
-        await _print_ticket_final(query.message, context, kind, footer_mode=_default_footer_mode(kind))
-        return
-
-    if query.data.startswith("fare_add:"):
-        _cancel_auto_print(context)
-        kind=query.data.split(":",1)[1]
-        context.user_data["pending_fare_kind"]=kind
-        supplier_total=float(context.user_data.get("pending_fare_supplier_total", 0) or 0)
-        if kind=='hotel':
-            if supplier_total > 0:
-                prompt=(f"üè® *Supplier hotel total: INR {supplier_total:,.0f}.*\n\n"
-                        "Enter Hotel customer costing as: `3500 per room per night`\n`room 4200 and EB 1200 per night`\n`total 25000`\n\nNo prefix is required. I will calculate rooms √ó nights and EB √ó nights automatically. A direct total is also accepted.")
-            else:
-                prompt=("üè® *Add Hotel Cost*\n\nEnter: `3500 per room per night`\n`room 4200 and EB 1200 per night`\n`total 25000`\n\nNo prefix is required. I will calculate rooms √ó nights and EB √ó nights automatically. A direct total is also accepted.")
-        elif supplier_total > 0:
-            prompt=(f"üí∞ *Supplier fare: INR {supplier_total:,.0f}.*\n\n"
-                    "Write the customer cost naturally ‚Äî *no prefix is required*.\n`pp`, `per pax`, `per person` and `each` mean your selling fare per pax; use `+` or `markup` for an explicit markup.\n\n"
-                    "Examples:\n"
-                    "`7615 pp` ‚Üí selling fare INR 7,615 √ó Adult/Child pax\n`403 pp` ‚Üí smart markup when it is below supplier PP\n`+403 per person` ‚Üí explicit markup INR 403 √ó Adult/Child pax\n`68535 total` ‚Üí final booking total INR 68,535\n"
-                    "`add markup 300 per pax`\n`403 per pax including infant` ‚Üí include INF too\n"
-                    "`markup 1200 total`\n"
-                    "`15000 total`\n"
-                    "`make total 15000`\n"
-                    "`15000`")
-        else:
-            prompt=("üí∞ *No supplier fare is available.*\n\n"
-                    "Write the final customer total naturally ‚Äî no prefix required.\n\n"
-                    "Examples: `15000`, `15000 total`, `make total 15000`.\n"
-                    "Per-person markup needs an original supplier fare.")
-        await safe_callback_edit(query, prompt,parse_mode='Markdown')
-        return
-
-    if query.data.startswith("fare_none:"):
-        _cancel_auto_print(context)
-        kind=query.data.split(":",1)[1]
-        context.user_data[f"pending_{kind}_fare"]=None
-        context.user_data.pop("pending_fare_kind", None)
-        await safe_callback_edit(query, 'üñ®Ô∏è *Fare will not be printed.*\n\nGenerating with the saved footer setting...', parse_mode='Markdown')
-        context.user_data["pending_footer_kind"] = kind
-        await _print_ticket_final(query.message, context, kind, footer_mode=_default_footer_mode(kind))
-        return
-
-
-
-
-def _footer_setting_label(mode):
-    return {'design':'Footer 1 (Old Design)','footer2':'Footer 2 (New Design)','bar':'Contact Bar'}.get(mode, 'Footer 2 (New Design)')
-
-def settings_footer_keyboard(kind):
-    current=get_default_footer(kind)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(('‚úÖ ' if current=='design' else '')+'Footer 1 ‚Ä¢ Old Design',callback_data=f'settings:footer:{kind}:design')],
-        [InlineKeyboardButton(('‚úÖ ' if current=='footer2' else '')+'Footer 2 ‚Ä¢ New Design',callback_data=f'settings:footer:{kind}:footer2')],
-        [InlineKeyboardButton(('‚úÖ ' if current=='bar' else '')+'Contact Bar',callback_data=f'settings:footer:{kind}:bar')],
-        [InlineKeyboardButton('‚¨ÖÔ∏è Back to Settings',callback_data='settings:open')],
-    ])
-
-def settings_tour_last_page_keyboard():
-    current=get_tour_last_page()
-    opts=[('tc_non_google','üìú T&C NON GOOGLE'),('without_footer','üìÑ Without Footer')]
-    rows=[]
-    for key,label in opts:
-        rows.append([InlineKeyboardButton(('‚úÖ ' if current==key else '')+label,callback_data=f'settings:tour_last_page:{key}')])
-    rows.append([InlineKeyboardButton('‚¨ÖÔ∏è Back to Settings',callback_data='settings:open')])
-    return InlineKeyboardMarkup(rows)
-
-def settings_logo_keyboard(kind):
-    current=get_logo_scale(kind)
-    label={'flight':'Air','bus':'Bus','hotel':'Hotel','package':'Tour'}[kind]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton('‚ûñ Logo Size',callback_data=f'settings:logo:{kind}:-0.10'), InlineKeyboardButton(f'{int(round(current*100))}%',callback_data='settings:noop'), InlineKeyboardButton('Logo Size ‚ûï',callback_data=f'settings:logo:{kind}:0.10')],
-        [InlineKeyboardButton('‚¨ÖÔ∏è Back to Settings',callback_data='settings:open')],
-    ])
-
-
-def settings_keyboard():
-    s=load_settings()
-    def mark(key,label): return f"{'‚úÖ' if s['buttons'].get(key,True) else '‚ùå'} {label}"
-    fd=s.get('footer_defaults',{})
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton('üî§ Font: '+s['font'],callback_data='settings:fonts')],
-        [InlineKeyboardButton('‚ûñ Text Size',callback_data='settings:size:-0.05'),InlineKeyboardButton(f"üî† {int(round(s['text_scale']*100))}%",callback_data='settings:noop'),InlineKeyboardButton('‚ûï Text Size',callback_data='settings:size:0.05')],
-        [InlineKeyboardButton('‚úàÔ∏è Air Footer: '+_footer_setting_label(fd.get('flight','footer2')),callback_data='settings:footer_menu:flight')],
-        [InlineKeyboardButton('üöå Bus Footer: '+_footer_setting_label(fd.get('bus','footer2')),callback_data='settings:footer_menu:bus')],
-        [InlineKeyboardButton('üè® Hotel Footer: '+_footer_setting_label(fd.get('hotel','footer2')),callback_data='settings:footer_menu:hotel')],
-        [InlineKeyboardButton('üó∫Ô∏è Tour Footer: '+_footer_setting_label(fd.get('package','footer2')),callback_data='settings:footer_menu:package')],
-        [InlineKeyboardButton(f"‚úàÔ∏è Air Logo: {int(round(get_logo_scale('flight')*100))}%",callback_data='settings:logo_menu:flight'),InlineKeyboardButton(f"üöå Bus Logo: {int(round(get_logo_scale('bus')*100))}%",callback_data='settings:logo_menu:bus')],
-        [InlineKeyboardButton(f"üè® Hotel Logo: {int(round(get_logo_scale('hotel')*100))}%",callback_data='settings:logo_menu:hotel'),InlineKeyboardButton(f"üó∫Ô∏è Tour Logo: {int(round(get_logo_scale('package')*100))}%",callback_data='settings:logo_menu:package')],
-        [InlineKeyboardButton(mark('make_changes','Smart Changes'),callback_data='settings:toggle:make_changes')],
-        [InlineKeyboardButton(mark('add_cost','Add Cost'),callback_data='settings:toggle:add_cost'),InlineKeyboardButton(mark('print_without_fare','Without Fare'),callback_data='settings:toggle:print_without_fare')],
-        [InlineKeyboardButton(mark('print_original_fare','Original Fare'),callback_data='settings:toggle:print_original_fare'),InlineKeyboardButton(mark('page_size_controls','Page Sizes'),callback_data='settings:toggle:page_size_controls')],
-        [InlineKeyboardButton(mark('watermark','Watermark'),callback_data='settings:toggle:watermark')],
-        [InlineKeyboardButton('‚óÄÔ∏è Opacity',callback_data='settings:wm_opacity:-0.01'),InlineKeyboardButton(f"{int(round(s['watermark_opacity']*100))}%",callback_data='settings:noop'),InlineKeyboardButton('Opacity ‚ñ∂Ô∏è',callback_data='settings:wm_opacity:0.01')],
-        [InlineKeyboardButton('‚óÄÔ∏è Scale',callback_data='settings:wm_scale:-0.10'),InlineKeyboardButton(f"{int(round(s['watermark_scale']*100))}%",callback_data='settings:noop'),InlineKeyboardButton('Scale ‚ñ∂Ô∏è',callback_data='settings:wm_scale:0.10')],
-        [InlineKeyboardButton('üìú Tour Last Page: '+terms_label(get_tour_last_page()),callback_data='settings:tour_last_page_menu')],
-        [InlineKeyboardButton(mark('main_tour','Tour'),callback_data='settings:toggle:main_tour'),InlineKeyboardButton(mark('main_air','Air'),callback_data='settings:toggle:main_air')],
-        [InlineKeyboardButton(mark('main_bus','Bus'),callback_data='settings:toggle:main_bus'),InlineKeyboardButton(mark('main_hotel','Hotel'),callback_data='settings:toggle:main_hotel')],
-        [InlineKeyboardButton(mark('main_ai','AI Assistant'),callback_data='settings:toggle:main_ai')],
-        [InlineKeyboardButton(mark('main_settings','Settings Button'),callback_data='settings:toggle:main_settings')],
-        [InlineKeyboardButton('‚ôªÔ∏è Reset Settings',callback_data='settings:reset')],
-    ])
-
-def settings_font_keyboard():
-    current=load_settings()['font']
-    rows=[[InlineKeyboardButton(('‚úÖ ' if name==current else '')+name,callback_data=f'settings:font:{name}')] for name in FONT_OPTIONS]
-    rows.append([InlineKeyboardButton('‚¨ÖÔ∏è Back to Settings',callback_data='settings:open')])
-    return InlineKeyboardMarkup(rows)
-
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update): return
-    s=load_settings(); fd=s.get('footer_defaults',{})
-    await update.message.reply_text(
-        '‚öôÔ∏è *MyTourBazar Print Settings*\n\n'
-        f"Font: *{s['font']}*\nText size: *{int(round(s['text_scale']*100))}%*\n"
-        f"‚úàÔ∏è Air Footer: *{_footer_setting_label(fd.get('flight','footer2'))}*\n"
-        f"üöå Bus Footer: *{_footer_setting_label(fd.get('bus','footer2'))}*\n"
-        f"üè® Hotel Footer: *{_footer_setting_label(fd.get('hotel','footer2'))}*\n"
-        f"üó∫Ô∏è Tour Footer: *{_footer_setting_label(fd.get('package','footer2'))}*\n"
-        f"Logo sizes: Air {int(round(get_logo_scale('flight')*100))}% | Bus {int(round(get_logo_scale('bus')*100))}% | Hotel {int(round(get_logo_scale('hotel')*100))}% | Tour {int(round(get_logo_scale('package')*100))}%\n"
-        f"Watermark: *{'ON' if s['buttons'].get('watermark') else 'OFF'}* | Opacity: *{int(round(s['watermark_opacity']*100))}%* | Scale: *{int(round(s['watermark_scale']*100))}%*\n"
-        f"Tour last page: *{terms_label(get_tour_last_page())}*\n",parse_mode='Markdown',reply_markup=settings_keyboard())
-
-async def settings_callback(query, context):
-    if query.data=='settings:noop': await query.answer(); return
-    if query.data=='settings:open': await query.edit_message_text('‚öôÔ∏è *MyTourBazar Print Settings*',parse_mode='Markdown',reply_markup=settings_keyboard()); return
-    if query.data=='settings:tour_last_page_menu':
-        await query.edit_message_text('üìú *Tour Last Page Setting*\n\nChoose which page is appended after the Tour itinerary by default.',parse_mode='Markdown',reply_markup=settings_tour_last_page_keyboard()); return
-    if query.data.startswith('settings:tour_last_page:'):
-        choice=query.data.split(':',2)[2]
-        set_tour_last_page(choice)
-        await query.edit_message_text(f'‚úÖ Tour last page changed to *{terms_label(choice)}*.',parse_mode='Markdown',reply_markup=settings_tour_last_page_keyboard()); return
-    if query.data.startswith('settings:footer_menu:'):
-        kind=query.data.split(':',2)[2]
-        label={'flight':'Air','bus':'Bus','hotel':'Hotel','package':'Tour'}[kind]
-        await query.edit_message_text(f'üßæ *{label} Footer Setting*\n\nChoose the footer used for all future {label} prints.',parse_mode='Markdown',reply_markup=settings_footer_keyboard(kind)); return
-    if query.data.startswith('settings:footer:'):
-        _,_,kind,mode=query.data.split(':',3)
-        set_default_footer(kind,mode)
-        await query.edit_message_text(f'‚úÖ {kind.title()} footer changed to *{_footer_setting_label(mode)}*.',parse_mode='Markdown',reply_markup=settings_footer_keyboard(kind)); return
-    if query.data.startswith('settings:logo_menu:'):
-        kind=query.data.split(':',2)[2]; label={'flight':'Air','bus':'Bus','hotel':'Hotel','package':'Tour'}[kind]
-        await query.edit_message_text(f'üñºÔ∏è *{label} Logo Size*\n\nUse + / ‚àí for all future {label} prints.',parse_mode='Markdown',reply_markup=settings_logo_keyboard(kind)); return
-    if query.data.startswith('settings:logo:'):
-        _,_,kind,delta=query.data.split(':',3); ss=adjust_logo_scale(kind,float(delta)); await query.edit_message_text(f"‚úÖ {kind.title()} logo size: *{int(round(ss['logo_scales'][kind]*100))}%*",parse_mode='Markdown',reply_markup=settings_logo_keyboard(kind)); return
-    if query.data=='settings:fonts': await query.edit_message_text('üî§ *Choose print font*',parse_mode='Markdown',reply_markup=settings_font_keyboard()); return
-    if query.data.startswith('settings:font:'):
-        name=query.data.split(':',2)[2]; set_font(name); await query.edit_message_text(f'‚úÖ Print font changed to *{name}*.',parse_mode='Markdown',reply_markup=settings_keyboard()); return
-    if query.data.startswith('settings:size:'):
-        delta=float(query.data.split(':',2)[2]); ss=adjust_text_scale(delta); await query.edit_message_text(f"‚úÖ Text size is now *{int(round(ss['text_scale']*100))}%*.",parse_mode='Markdown',reply_markup=settings_keyboard()); return
-    if query.data.startswith('settings:wm_opacity:'):
-        delta=float(query.data.split(':',2)[2]); ss=load_settings(); ss['watermark_opacity']=round(max(.01,min(.20,float(ss.get('watermark_opacity',.04))+delta)),2); save_settings(ss); await query.edit_message_text(f"‚úÖ Watermark opacity: *{int(round(ss['watermark_opacity']*100))}%*",parse_mode='Markdown',reply_markup=settings_keyboard()); return
-    if query.data.startswith('settings:wm_scale:'):
-        delta=float(query.data.split(':',2)[2]); ss=load_settings(); ss['watermark_scale']=round(max(.5,min(2.0,float(ss.get('watermark_scale',1.5))+delta)),2); save_settings(ss); await query.edit_message_text(f"‚úÖ Watermark scale: *{int(round(ss['watermark_scale']*100))}%*",parse_mode='Markdown',reply_markup=settings_keyboard()); return
-    if query.data.startswith('settings:toggle:'):
-        key=query.data.split(':',2)[2]; toggle_button(key); await query.edit_message_text('‚úÖ Setting updated.',reply_markup=settings_keyboard()); return
-    if query.data=='settings:reset': reset_settings(); await query.edit_message_text('‚ôªÔ∏è Settings reset to defaults. Footer 2 is the default for all services.',reply_markup=settings_keyboard()); return
-
-
-async def set_logo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-
-    context.user_data["waiting_for_logo"] = True
-    await update.message.reply_text(
-        "üñºÔ∏è Send your MyTourBazar logo as an image now."
-    )
-
-
-async def receive_logo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-
-    if not context.user_data.get("waiting_for_logo"):
-        return
-
-    photo = update.message.photo[-1]
-    tg_file = await context.bot.get_file(photo.file_id)
-    await tg_file.download_to_drive(USER_LOGO_PATH)
-    global LOGO_PATH
-    LOGO_PATH = USER_LOGO_PATH
-    context.user_data["waiting_for_logo"] = False
-
-    await update.message.reply_text(
-        "‚úÖ Logo saved successfully.",
-        reply_markup=main_keyboard()
-    )
-
-
-async def receive_extra_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-
-    text = (update.message.text or "").strip()
-
-    if context.user_data.get("post_hotel_cost_reference"):
-        await _process_post_generated_hotel_costing(update.message,context,text); return
-
-    if context.user_data.get("post_cost_reference"):
-        await _process_post_generated_costing(update.message,context,text); return
-
-    if context.user_data.get("post_transit_reference"):
-        if re.fullmatch(r"(?i)\s*(?:ok\s*)?(?:no\s+transit|no\s+journey|none|skip|cancel\s+transit)\s*", text or ''):
-            context.user_data.pop('post_transit_reference',None)
-            context.user_data.pop('post_transit_pending',None)
-            await update.message.reply_text('‚úÖ No transit added. Your Tour is still ready to use.',reply_markup=main_keyboard())
-            return
-        await _process_post_generated_transit_text(update.message,context,text); return
-
-    if _tour_v2_active(context):
-        phase=context.user_data.get("tour_v2_phase")
-        if phase=="awaiting_edited_final":
-            await _tour_v2_process_edited_final(update.message,context,text); return
-        if phase=="missing_details":
-            await _tour_v2_apply_missing_reply(update.message,context,text); return
-        if phase in ("onward","return","connection"):
-            skip_labels={"onward":"‚è≠Ô∏è No Onward Journey","return":"‚è≠Ô∏è No Return Journey","connection":"‚è≠Ô∏è No Connecting Journey"}
-            if text=="‚ùå Cancel": return await cancel(update,context)
-            if text==skip_labels[phase]:
-                if phase=="onward": await _tour_v2_ask_return(update.message,context)
-                elif phase=="return": await _tour_v2_ask_connection(update.message,context)
-                else: await _tour_v2_show_outputs(update.message,context)
-                return
-            if text:
-                await _tour_v2_extract_journey(update.message,context,phase,source_text=text); return
-        if phase=="costing":
-            await _tour_v2_finish_selected_output(update.message,context,text); return
-
-    if context.user_data.get("awaiting_tour_transit_input"):
-        if text=="‚ùå Cancel":
-            for k in ("awaiting_tour_transit_input","pending_tour_transit_files","pending_tour_transit_text"):
-                context.user_data.pop(k,None)
-            await update.message.reply_text("‚ùå Transit entry cancelled.",reply_markup=draft_review_keyboard()); return
-        if text=="‚è≠Ô∏è Skip Transit":
-            data=context.user_data.get("itinerary") or {}
-            data["transit"]=[]; data["transit_done_by_self"]=True; context.user_data["itinerary"]=data
-            for k in ("awaiting_tour_transit_input","pending_tour_transit_files","pending_tour_transit_text"):
-                context.user_data.pop(k,None)
-            await update.message.reply_text("‚úÖ Transit skipped. The box will show *Done by Self*.",parse_mode="Markdown",reply_markup=ReplyKeyboardRemove())
-            await _continue_tour_pdf_after_transit(update.message,context); return
-        if text=="‚úÖ Done Transit":
-            await _process_pending_tour_transit(update.message,context); return
-        if text:
-            context.user_data["pending_tour_transit_text"]=(str(context.user_data.get("pending_tour_transit_text") or "")+"\n"+text).strip()
-            await update.message.reply_text("üìù Transit text received. Send more or tap *‚úÖ Done Transit*.",parse_mode="Markdown",reply_markup=tour_transit_input_keyboard()); return
-
-    if context.user_data.get('awaiting_tour_print_name'):
-        if text == '‚ùå Cancel':
-            context.user_data.pop('awaiting_tour_print_name', None)
-            context.user_data.pop('pending_tour_pdf_request', None)
-            await update.message.reply_text('‚ùå Tour PDF print cancelled. The draft is still available.', reply_markup=main_keyboard())
-            return
-        data = context.user_data.get('itinerary') or {}
-        if text == '‚è≠Ô∏è Print Without Name':
-            data['client_name'] = ''
-        else:
-            if not text:
-                await update.message.reply_text('Please enter the Guest / Client Name, or tap ‚è≠Ô∏è Print Without Name.', reply_markup=pending_tour_name_keyboard())
-                return
-            data['client_name'] = text
-            context.user_data['guest_name'] = text
-            await update.message.reply_text(f'‚úÖ Guest name added: *{text}*', parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
-        context.user_data['itinerary'] = data
-        context.user_data.pop('awaiting_tour_print_name', None)
-        await _finish_pending_tour_pdf(update.message, context)
-        return
-
-    if context.user_data.get("awaiting_edit_ref"):
-        await _begin_edit(update, context, text)
-        return
-    if context.user_data.get("editing_current_itinerary"):
-        await perform_draft_edit(update, context, text)
-        return
-    if context.user_data.get("editing_reference"):
-        await perform_saved_edit(update, context, text)
-        return
-    if context.user_data.get('pending_custom_cost_input'):
-        text = (update.message.text or '').strip()
-        fields = context.user_data.get('pending_custom_cost_fields') or []
-        idx = int(context.user_data.get('pending_custom_cost_index') or 0)
-        data = context.user_data.get('pending_custom_cost_data')
-        if not data or idx >= len(fields):
-            await update.message.reply_text('Tap ‚òëÔ∏è Done to finish Custom Cost, or ‚ùå Cancel.')
-            return
-        raw = text.replace('‚Çπ','').replace(',','').strip()
-        if not re.fullmatch(r'\d+(?:\.\d+)?', raw):
-            await update.message.reply_text('‚ùå Enter only the amount, for example `1000`.', parse_mode='Markdown', reply_markup=custom_cost_keyboard())
-            return
-        amount=float(raw)
-        key, field, label, count = fields[idx]
-        data = _apply_custom_cost_field(data, field, amount)
-        context.user_data['pending_custom_cost_data'] = data
-        idx += 1
-        context.user_data['pending_custom_cost_index'] = idx
-        if idx < len(fields):
-            _, _, next_label, next_count = fields[idx]
-            await update.message.reply_text(
-                f'‚úÖ {label}: *{_money(amount)} √ó {count} = {_money(amount*count)}*\n\n'
-                f'*{next_label}* ‚Äî {next_count} passenger(s)\n'
-                f'Enter the direct per-person cost. Example: `1000`.',
-                parse_mode='Markdown', reply_markup=custom_cost_keyboard())
-        else:
-            await update.message.reply_text(
-                '‚úÖ All direct rates entered.\n\n' + _custom_cost_summary(data) + '\n\nTap *‚òëÔ∏è Done* to put these amounts into the cost box and regenerate the PDF.',
-                parse_mode='Markdown', reply_markup=custom_cost_keyboard())
-        return
-    # V159: no Tour markup text session. Any Tour cost change goes through the
-    # saved-reference Modify & Regenerate path as a direct customer selling rate.
-
-    if context.user_data.get("pending_fare_kind"):
-        kind=context.user_data.get("pending_fare_kind")
-        await _apply_pending_fare_input(update.message,context,kind,text)
-        return
-
-
-    if text == "‚úçÔ∏è Flight Text" and context.user_data.get("awaiting_flight"):
-        await update.message.reply_text(
-            "‚úçÔ∏è Send the flight / train details as text. No special formatting is required. "
-            "Send onward and return details together or separately, then tap *‚úÖ Done*.",
-            reply_markup=ReplyKeyboardMarkup([["‚úçÔ∏è Flight Text"], ["‚úàÔ∏è Flight Screenshot"], ["‚úÖ Done"]], resize_keyboard=True)
-        )
-        return
-
-    if text == "‚úàÔ∏è Flight Screenshot" and context.user_data.get("awaiting_flight"):
-        await update.message.reply_text(
-            "‚úàÔ∏è Send the flight screenshot now. You can send multiple screenshots, then tap *‚úÖ Done*.",
-            reply_markup=ReplyKeyboardMarkup([["‚úçÔ∏è Flight Text"], ["‚úàÔ∏è Flight Screenshot"], ["‚úÖ Done"]], resize_keyboard=True)
-        )
-        return
-
-    if context.user_data.get("awaiting_flight"):
-        value = (update.message.text or "").strip()
-        if value == "‚úÖ Done":
-            context.user_data["awaiting_flight"] = False
-            await process_sources(update, context)
-            return
-        if value:
-            context.user_data["flight_text"] = (context.user_data.get("flight_text", "") + "\n" + value).strip()
-            context.user_data["awaiting_flight"] = True
-            await update.message.reply_text(
-                "‚úàÔ∏è Flight text received. Send another flight screenshot/text, or tap *‚úÖ Done*.",
-                reply_markup=confirmation_keyboard()
-            )
-        return
-
-    mode = context.user_data.get("awaiting_extra")
-    if not mode:
-        # Direct supplier text is accepted even when the owner did not first open
-        # AI Assistant. This restores the older V100 convenience: paste supplier
-        # material and the bot automatically identifies Tour/Air/Bus/Hotel.
-        if _looks_like_supplier_material(text) and not context.user_data.get('smart_mode'):
-            _cancel_source_auto_process(context)
-            context.user_data['smart_mode']=True
-            context.user_data['smart_text']=text
-            context.user_data['smart_files']=[]
-            await smart_process(update, context)
-            return
-        # Outside a dedicated workflow, let the AI recognize what the user means.
-        if context.user_data.get("smart_mode"):
-            await smart_text(update, context)
-        else:
-            await smart_text(update, context)
-        return
-    value = (update.message.text or "").strip()
-    if not value:
-        return
-    context.user_data.setdefault("extra_inclusions", [])
-    context.user_data.setdefault("extra_exclusions", [])
-    key = "extra_inclusions" if mode == "inclusion" else "extra_exclusions"
-    context.user_data[key].append(value)
-    context.user_data["awaiting_extra"] = None
-
-    data = context.user_data.get("itinerary", {})
-    data.setdefault("inclusions", [])
-    data.setdefault("exclusions", [])
-    target = data["inclusions"] if mode == "inclusion" else data["exclusions"]
-    if value not in target:
-        target.append(value)
-    context.user_data["itinerary"] = data
-
-    await update.message.reply_text(
-        build_confirmation(data),
-        parse_mode="Markdown",
-        reply_markup=confirmation_keyboard()
-    )
-
-
-async def receive_flight_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-    if not context.user_data.get("awaiting_flight"):
-        return
-
-    try:
-        photo = update.message.photo[-1]
-        tg_file = await context.bot.get_file(photo.file_id)
-        filename = TEMP_DIR / f"flight_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
-        await tg_file.download_to_drive(filename)
-        context.user_data.setdefault("flight_files", []).append(str(filename))
-        context.user_data["awaiting_flight"] = True
-
-        await update.message.reply_text(
-            "‚úàÔ∏è Flight screenshot received. Send another flight screenshot/text, or tap *Done* when finished.",
-            reply_markup=ReplyKeyboardMarkup([["‚úçÔ∏è Flight Text"], ["‚úàÔ∏è Flight Screenshot"], ["‚úÖ Done"]], resize_keyboard=True)
-        )
-    except Exception as exc:
-        logger.exception("Flight screenshot failed")
-        await update.message.reply_text(f"‚ùå Could not process the flight screenshot: {exc}")
-
-
-async def receive_global_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route explicit workflow states first; otherwise a normal upload is always NEW work."""
-    if context.user_data.get("post_transit_reference"):
-        await update.message.reply_text("Type each flight/train sector on a new line. No Onward/Return prefix is required; I will infer the journey sequence.",reply_markup=ReplyKeyboardRemove())
-        return
-
-    if _tour_v2_active(context) and context.user_data.get("tour_v2_phase") in ("onward","return","connection"):
-        phase=context.user_data.get("tour_v2_phase")
-        try:
-            photo=update.message.photo[-1]; tg_file=await context.bot.get_file(photo.file_id)
-            path=TEMP_DIR / f"tour_v2_{phase}_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
-            await tg_file.download_to_drive(path)
-            await _tour_v2_extract_journey(update.message,context,phase,file_path=path)
-        except Exception as exc:
-            await update.message.reply_text(f"‚ùå Could not read journey screenshot: {str(exc)[:500]}")
-        return
-    if context.user_data.get("awaiting_tour_transit_input"):
-        try:
-            photo=update.message.photo[-1]; tg_file=await context.bot.get_file(photo.file_id)
-            path=TEMP_DIR / f"tour_transit_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
-            await tg_file.download_to_drive(path)
-            context.user_data.setdefault("pending_tour_transit_files",[]).append(str(path))
-            await update.message.reply_text("üì∏ Transit screenshot received. Send more or tap *‚úÖ Done Transit*.",parse_mode="Markdown",reply_markup=tour_transit_input_keyboard())
-        except Exception as exc:
-            await update.message.reply_text(f"‚ùå Could not save transit screenshot: {str(exc)[:500]}",reply_markup=tour_transit_input_keyboard())
-        return
-    if context.user_data.get("waiting_for_logo"):
-        return await receive_logo(update, context)
-    if context.user_data.get("awaiting_flight"):
-        return await receive_flight_photo(update, context)
-    # V165: normal file/image drop after a completed print is always a NEW job.
-    # Existing direct/Auto Creation batches are the only states allowed to accumulate files.
-    if not context.user_data.get('_direct_drop_mode') and not context.user_data.get('auto_creation'):
-        _cancel_auto_print(context)
-        _cancel_source_auto_process(context)
-        context.user_data.clear()
-    context.user_data["smart_mode"] = True
-    context.user_data["_direct_drop_mode"] = True
-    context.user_data.setdefault("smart_files", [])
-    return await smart_photo(update, context)
-
-
-async def receive_global_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route explicit workflow states first; otherwise a normal upload is always NEW work."""
-    if context.user_data.get("post_transit_reference"):
-        await update.message.reply_text("Type each flight/train sector on a new line. No Onward/Return prefix is required; I will infer the journey sequence.",reply_markup=ReplyKeyboardRemove())
-        return
-
-    if _tour_v2_active(context) and context.user_data.get("tour_v2_phase") in ("onward","return","connection"):
-        phase=context.user_data.get("tour_v2_phase")
-        doc=update.message.document; name=doc.file_name or "journey.pdf"; mime=(doc.mime_type or "").lower()
-        if not (name.lower().endswith(".pdf") or mime=="application/pdf"):
-            await update.message.reply_text("Please send a PDF, screenshot or normal text."); return
-        try:
-            tg_file=await context.bot.get_file(doc.file_id)
-            safe="".join(c if c.isalnum() or c in "._-" else "_" for c in name)
-            path=TEMP_DIR / f"tour_v2_{phase}_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}_{safe}"
-            await tg_file.download_to_drive(path)
-            await _tour_v2_extract_journey(update.message,context,phase,file_path=path)
-        except Exception as exc:
-            await update.message.reply_text(f"‚ùå Could not read journey PDF: {str(exc)[:500]}")
-        return
-    if context.user_data.get("awaiting_tour_transit_input"):
-        doc=update.message.document; name=doc.file_name or "transit.pdf"; mime=(doc.mime_type or "").lower()
-        if not (name.lower().endswith(".pdf") or mime=="application/pdf"):
-            await update.message.reply_text("Please send a flight-ticket PDF, screenshot or text.",reply_markup=tour_transit_input_keyboard()); return
-        try:
-            tg_file=await context.bot.get_file(doc.file_id)
-            safe="".join(c if c.isalnum() or c in "._-" else "_" for c in name)
-            path=TEMP_DIR / f"tour_transit_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}_{safe}"
-            await tg_file.download_to_drive(path)
-            context.user_data.setdefault("pending_tour_transit_files",[]).append(str(path))
-            n=len(context.user_data.get("pending_tour_transit_files") or [])
-            await update.message.reply_text(f"üìÑ Transit PDF received ({n}). Send more or tap *‚úÖ Done Transit*.",parse_mode="Markdown",reply_markup=tour_transit_input_keyboard())
-        except Exception as exc:
-            await update.message.reply_text(f"‚ùå Could not save transit PDF: {str(exc)[:500]}",reply_markup=tour_transit_input_keyboard())
-        return
-    if not context.user_data.get('_direct_drop_mode') and not context.user_data.get('auto_creation'):
-        _cancel_auto_print(context)
-        _cancel_source_auto_process(context)
-        context.user_data.clear()
-    context.user_data["smart_mode"] = True
-    context.user_data["_direct_drop_mode"] = True
-    context.user_data.setdefault("smart_files", [])
-    return await smart_document(update, context)
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _cancel_source_auto_process(context)
-    _cancel_auto_print(context)
-    for key in ('_source_processing','smart_mode','awaiting_edit_ref','editing_reference','editing_current_itinerary','pending_tour_markup_print','pending_fare_kind'):
-        context.user_data.pop(key, None)
-    context.user_data.clear()
-    await update.message.reply_text("‚ùå Cancelled. Current workflow cleared.", reply_markup=main_keyboard())
-    return ConversationHandler.END
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    if isinstance(context.error, NetworkError):
-        logger.warning("Temporary Telegram network interruption; polling will reconnect automatically: %s", context.error)
-        return
-    logger.exception("Unhandled exception", exc_info=context.error)
-
-
-
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing in .env")
-    logger.info(configuration_summary())
-
-    request = HTTPXRequest(connect_timeout=20, read_timeout=60, write_timeout=60, pool_timeout=20)
-    polling_request = HTTPXRequest(connect_timeout=20, read_timeout=45, write_timeout=30, pool_timeout=20)
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(request)
-        .get_updates_request(polling_request)
-        .concurrent_updates(False)
-        .build()
-    )
-
-    voucher_conversation = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^üè® Hotel Print$"), hotel_voucher_start)],
-        states={
-            HOTEL_VOUCHER_INPUT: [
-                MessageHandler(filters.PHOTO, hotel_voucher_photo),
-                MessageHandler(filters.Document.PDF, hotel_voucher_document),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, hotel_voucher_text),
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(r"^‚ùå Cancel$"), cancel)],
-        allow_reentry=True,
-    )
-
-    flight_ticket_conversation = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^‚úàÔ∏è Air Print$"), flight_ticket_start)],
-        states={
-            FLIGHT_TICKET_INPUT:[MessageHandler(filters.PHOTO,flight_ticket_photo),MessageHandler(filters.Document.PDF,flight_ticket_document),MessageHandler(filters.TEXT & ~filters.COMMAND,flight_ticket_text)],
-            FLIGHT_FARE_INPUT:[MessageHandler(filters.TEXT & ~filters.COMMAND,flight_ticket_fare)],
-        },
-        fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(r"^‚ùå Cancel$"),cancel)],allow_reentry=True)
-
-    bus_ticket_conversation = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^üöå Bus Print$"), bus_ticket_start)],
-        states={
-            BUS_TICKET_INPUT:[MessageHandler(filters.PHOTO,bus_ticket_photo),MessageHandler(filters.Document.PDF,bus_ticket_document),MessageHandler(filters.TEXT & ~filters.COMMAND,bus_ticket_text)],
-            BUS_FARE_INPUT:[MessageHandler(filters.TEXT & ~filters.COMMAND,bus_ticket_fare)]
-        },
-        fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(r"^‚ùå Cancel$"),cancel)],allow_reentry=True)
-
-    smart_conversation = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex(r"^ü§ñ AI Assistant / New Request$"), smart_ai_start),
-            MessageHandler(filters.Regex(r"^ü§ñ Auto Creation$"), auto_creation_start),
-        ],
-        states={
-            SMART_INPUT: [
-                MessageHandler(filters.PHOTO, smart_photo),
-                MessageHandler(filters.Document.PDF, smart_document),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, smart_text),
-            ],
-            WAITING_GUEST_NAME: [
-                MessageHandler(filters.PHOTO, receive_tour_source_without_guest),
-                MessageHandler(filters.Document.PDF, receive_tour_source_without_guest),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_guest_name),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(r"^‚ùå Cancel$"), cancel)],
-        allow_reentry=True,
-    )
-
-    conversation = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex(r"^(?:üó∫Ô∏è Tour Itinerary|üó∫Ô∏è Tour Guide)$"), new_itinerary),
-            CommandHandler("new", new_itinerary),
-        ],
-        states={
-            WAITING_GUEST_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_guest_name),
-            ],
-            WAITING_SOURCE: [
-                MessageHandler(filters.PHOTO, receive_photo),
-                MessageHandler(filters.Document.PDF, receive_document),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex(r"^‚ùå Cancel$"), cancel),
-        ],
-        allow_reentry=True,
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop_bot_workflow))
-    app.add_handler(MessageHandler(filters.Regex(r"^‚ñ∂Ô∏è /START$"), start), group=-2)
-    app.add_handler(MessageHandler(filters.Regex(r"^‚èπÔ∏è /STOP$"), stop_bot_workflow), group=-2)
-    app.add_handler(CommandHandler(["settings", "setting"], settings_command))
-    # Settings must win over every active ConversationHandler state. Otherwise a
-    # pressed Settings reply-keyboard button can be consumed as supplier text and
-    # accidentally start itinerary processing.
-    async def _settings_menu_guard(update, context):
-        await settings_command(update, context)
-        raise ApplicationHandlerStop
-
-    app.add_handler(MessageHandler(filters.Regex(r"^‚öôÔ∏è Settings$"), _settings_menu_guard), group=-2)
-
-    # MUST run before every ConversationHandler. This makes Telegram's Reply action
-    # work for fare prompts and generated-reference messages, regardless of which
-    # workflow is currently active. Non-reply messages are untouched.
-    # V160: all normal text passes this lightweight guard before any ConversationHandler.
-    # It only consumes the update when a Modify & Regenerate session (or a bot-message
-    # reply) is active; otherwise it returns and normal menu/source routing continues.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_reference_edit), group=-1)
-
-    # Register ALL inline callbacks, including Tour output buttons, before the
-    # workflow handlers. This ensures every visible Tour button has a live route.
-    app.add_handler(CallbackQueryHandler(
-        callback_handler,
-        pattern=r"^(settings:.*|tour_terms:.*|tour_special_notes:.*|tour_cost:.*|tour_markup:.*|tour_custom_cost:.*|tour_output:.*|tour_output_mode:.*|tour_transit:.*|post_transit:.*|post_transit_make:.*|post_transit_cost:.*|post_cost:.*|hotel_cost:.*|tour_edit_current$|draft_edit$|draft_done$|generate|generate_no_cost|reenter|cancel|add_inclusion|add_exclusion|add_flight|add_flight_text|fare_add:.*|fare_none:.*|fare_original:.*|size:.*|footer_bar|footer_design|footer2|print_clean|footer_yes|footer_no|edit_generated:.*|voice_edit:.*|autofit:.*|modify:.*|mod_size:.*|mod_font:.*|mod_logo:.*|mod_clean:.*|mod_footer_menu:.*|mod_footer:.*|mod_detail:.*|mod_last_page:.*|mod_b2b:.*|mod_mode:.*|mod_done:.*|mod_cancel:.*)$"
-    ), group=-1)
-
-    app.add_handler(voucher_conversation)
-    app.add_handler(flight_ticket_conversation)
-    app.add_handler(bus_ticket_conversation)
-    app.add_handler(smart_conversation)
-    app.add_handler(conversation)
-    app.add_handler(MessageHandler(filters.Regex(r"^üñºÔ∏è Set Logo$"), set_logo))
-    app.add_handler(MessageHandler(filters.VOICE, receive_voice_edit), group=-1)
-    app.add_handler(MessageHandler(filters.PHOTO, receive_global_photo))
-    app.add_handler(MessageHandler(filters.Document.PDF, receive_global_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_reference_edit))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_extra_text))
-    app.add_handler(MessageHandler(filters.Regex(r"^‚ùå Cancel$"), cancel))
-    app.add_error_handler(error_handler)
-
-    logger.info("MyTourBazar local workflow bot is running")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+Y™Áäx-ÆÈ‹j◊ù¢Îi∫⁄+äßj[hëÈ‹¢ÈÌ◊éı”‘Ëµ©h∫⁄n∂XßzÕZ[\‹ù‹¬ö[\‹ùŸŸ⁄[ô¬ö[\‹ù\ﬁ[ò⁄[¬ôúõ€H]Xà[\‹ù]ôúõ€H]][YH[\‹ù]][YBö[\‹ù[YBö[\‹ù⁄][ö[\‹ù€‹Bö[\‹ùÿ¬ö[\‹ùôBö[\‹ù\\¬ôúõ€H\õXãú\úŸH[\‹ù][›BÇôúõ€H›[ùà[\‹ùÿYŸ›[ùÇôúõ€H\à[\‹ùîôXY\ãï‹ö]\Çôúõ€H[Y‹ò[H[\‹ù
+à\]Kô\RŸ^Xõÿ\ôX\ö›\ô\RŸ^Xõÿ\ôô[[›ôKà[õ[ôRŸ^Xõÿ\ôù]€ã[õ[ôRŸ^Xõÿ\ôX\ö›\äBôúõ€H[Y‹ò[Kô\úõ‹à[\‹ùòYô\]Y\›ô]€‹ö—\úõ‹Çôúõ€H[Y‹ò[Kúô\]Y\›[\‹ùô\]Y\›ôúõ€H[Y‹ò[Kô^[\‹ù
+à\Xÿ][€ã\Xÿ][€í[ô\î›‹€€[X[ô[ô\ãY\‹ÿYŸR[ô\ãÿ[òX⁄‘]Y\ûR[ô\ãà€€ùô\úÿ][€í[ô\ã€€ù^\\Àö[\ú¬äBÇôúõ€H^òX›‹à[\‹ù^òX›⁄][ô\ò\ûWŸúõ€W‹\ùÀ^òX››ò[ú⁄]Ÿúõ€W‹\ù¬ôúõ€H[\]H[\‹ùŸ[ô\ò]W‹Çôúõ€H›[›õ›X⁄\à[\‹ù^òX›⁄›[›õ›X⁄\ãŸ[ô\ò]W⁄›[›õ›X⁄\Çôúõ€HõY⁄Ÿ^òX›‹à[\‹ù^òX›ŸõY⁄›X⁄Ÿ]ôúõ€HõY⁄‹ö[ù[\‹ùŸ[ô\ò]WŸõY⁄›X⁄Ÿ]ôúõ€Hÿ]\õX\ö◊€›ô\õ^H[\‹ùY›ÿ]\õX\ö◊›◊‹Çôúõ€Hù\◊›X⁄Ÿ][\‹ù^òX›ÿù\◊›X⁄Ÿ]Ÿ[ô\ò]Wÿù\◊›X⁄Ÿ]ôúõ€HY]‹à[\‹ù\WŸY]ôúõ€H€X\ùÿ\‹⁄\›[ù[\‹ù€\‹⁄YûH\»ZWÿ€\‹⁄YûK⁄]\»ZWÿ⁄][ö[òŸW‹X⁄ÿYŸW⁄][ô\ò\ûKYŸ[ù‹[ãŸ[ô\ò]W‹X⁄ÿYŸWŸúõ€WÿúöYYÇôúõ€HôYô\ô[òŸW€X[òYŸ\à[\‹ù‹ôX]W‹ôYô\ô[òŸKÿ]ôW‹ôX€‹ôÿY‹ôX€‹ô\›‹ôX€‹ôÀ\]W‹ôX€‹ô[\‹ùŸ^\›[ô◊‹ú¬ôúõ€Hõ€›\ó€›ô\õ^H[\‹ùYŸõ€›\ó›◊‹Çôúõ€Hõ€›\óÿò\ó€›ô\õ^H[\‹ùYÿ€€ùX›ÿò\ó›◊‹Çôúõ€Hõ€›\åó€›ô\õ^H[\‹ùYŸõ€›\åó›◊‹Çôúõ€Hö[ù‹Ÿ][ô‹»[\‹ùÿY‹Ÿ][ô‹Àÿ]ôW‹Ÿ][ô‹ÀŸ]Ÿõ€ùYù\››^‹ÿÿ[KYù\›€Ÿ€◊‹ÿÿ[KŸ]€Ÿ€◊‹ÿÿ[KŸŸ€Wÿù]€ãô\Ÿ]‹Ÿ][ô‹Àì”ï”‘S”îÀù]€óŸ[òXõYŸ]ŸYò][›\õ\ÀŸ]ŸYò][Ÿõ€›\ãŸ]ŸYò][Ÿõ€›\ãŸ]››\ó€\›‹YŸKŸ]››\ó€\›‹YŸBôúõ€H\ôõ‹õX[òŸW›][»[\‹ùô\\ôW‹›\Y\óŸõ‹óÿZK\úŸW›ò[ú⁄]Ÿö[\◊€ÿÿ[\W€Z\‹⁄[ô◊ÿXÿ€€[[Ÿ][€ó€ÿÿ[Bôúõ€Hõ⁄XŸWŸY][\‹ùò[úÿ‹öXôW›õ⁄XŸW€õ›Bôúõ€HZW‹õ›öY\à[\‹ù€€ôöY›\ò][€ó‹›[[X\ûBÇà»çMNà––Sì”’Tà”’Tê—Bà»Hõ€›\àÿ[à”ìH€€YHúõ€H\»õ›	‹»›€à\‹Ÿ]»õ€\ãÇêì’—TàH‹Àú]ô\õò[YJ‹Àú]òXú‹]
+◊Ÿö[W◊ JBêT‘—U◊—TàH‹Àú]öõ⁄[äì’—Tãò\‹Ÿ]»äBëì”’Tó“SPQ—HH‹Àú]öõ⁄[äT‘—U◊—Tãõ^]›\òò^ò\óŸõ€›\ãúô»äBÇôYàŸ]€ÿÿ[Ÿõ€›\ó‹]
+
+NÇà]H‹Àú]õõ‹õ\]
+ì”’Tó“SPQ—JBàYàõ›‹Àú]ö\Ÿö[J]
+NÇàòZ\ŸHö[Sõ›õ›[ô\úõ‹äàëõ€›\à\ù€‹ö»õ›õ›[ôà^X›Y^X›Nàà
+»]à
+Bàô]\õà]Çà»KKHUàRTìSëH—”»SìSëHSíSê—SQSïKKBôúõ€H]Xà[\‹ù]\»”Uî]ö[\‹ùôH\»”UúôBÇó”Uó–RTìSëW”—”◊—TàH”Uî]
+◊Ÿö[W◊ Kúô\€€ôJ
+Kú\ô[ù»ò\‹Ÿ]»à»òZ\õ[ôW€Ÿ€‹»ÇÇôYà€]óÿZ\õ[ôW€Ÿ€◊ÿÿ[ôY]\ Z\õ[ôW›^
+NÇà»H
+Z\õ[ôW›^‹ààäKú›ö\
+
+Kõ›Ÿ\ä
+Bà»H”UúôKú›Xäàñ◊òK^åNWJ»ãó»ã Kú›ö\
+ó»äBà[X\Ÿ\»H¬àçôHéà»ö[ôY€»ãçôHãö[ôY€◊ÿZ\àóKàö[ôY€»éà»ö[ôY€»ãçôHãö[ôY€◊ÿZ\àóKàòZHéà»òZ\ó⁄[ôXHãòZ\ö[ôXHãòZHóKàòZ\ó⁄[ôXHéà»òZ\ó⁄[ôXHãòZ\ö[ôXHãòZHóKàö^éà»òZ\ó⁄[ôXWŸ^ô\‹»ãòZ\ö[ôXY^ô\‹»ãö^óKàòZ\ó⁄[ôXWŸ^ô\‹»éà»òZ\ó⁄[ôXWŸ^ô\‹»ãòZ\ö[ôXY^ô\‹»ãö^óKàúŸ»éà»ú‹XŸZô]ãúŸ»óKàú‹XŸZô]éà»ú‹XŸZô]ãúŸ»óKàú\éà»òZÿ\ÿWÿZ\àãòZÿ\ÿHãú\óKàòZÿ\ÿHéà»òZÿ\ÿWÿZ\àãòZÿ\ÿHãú\óKàùZ»éà»ùö\›\òHãùZ»óKàùö\›\òHéà»ùö\›\òHãùZ»óKàôZ»éà»ô[Z\ò]\»ãôZ»óKàô[Z\ò]\»éà»ô[Z\ò]\»ãôZ»óKàú\àéà»úX]\óÿZ\ùÿ^\»ãúX]\àãú\àóKàúX]\àéà»úX]\óÿZ\ùÿ^\»ãúX]\àãú\àóKàú‹Héà»ú⁄[ôÿ\‹ôWÿZ\õ[ô\»ãú⁄[ôÿ\‹ôHãú‹HóKàòZWŸ^éà»òZ\ó⁄[ôXWŸ^ô\‹»ãòZ\ö[ôXY^ô\‹»ãö^óKàBàò[»H[X\Ÿ\ÀôŸ]
+À◊JH
+»‹◊Bà›]H◊Bàõ‹àà[àò[ŒÇàõ‹à^[à
+ãúô»ããùŸXúããöú»ããöúY»äNÇà›]ò\[ô
+à
+»^
+Bàô]\õà\›
+X›ôúõ€ZŸ^\ ›]
+JBÇôYà]óŸö[ôÿZ\õ[ôW€Ÿ€ Z\õ[ôW›^
+NÇàààëö[ôHô\›ÿÿ[Z\õ[ôHŸ€»ûHZ\õ[ôHò[YH‹àõY⁄€ŸKàààÇàYàõ›”Uó–RTìSëW”—”◊—Tãô^\› 
+NÇàô]\õàõ€ôBàÿ[ôY]\»H€]óÿZ\õ[ôW€Ÿ€◊ÿÿ[ôY]\ Z\õ[ôW›^
+Bàö[\»H‹õò[YKõ›Ÿ\ä
+Nàõ‹à[à”Uó–RTìSëW”—”◊—Tãö]\ô\ä
+HYàö\◊Ÿö[J
+_Bàõ‹àò[YH[àÿ[ôY]\ŒÇàYàò[YKõ›Ÿ\ä
+H[àö[\ŒÇàô]\õà›äö[\÷€ò[YKõ›Ÿ\ä
+WJBà»õ^XõHò[òX⁄Œà€€\\ôHõ‹õX[^ôYò[Y\ÀÇàõ‹õX[^ôYH”UúôKú›Xäàñ◊òK^åNWHãàã
+Z\õ[ôW›^‹ààäKõ›Ÿ\ä
+JBàYàõ‹õX[^ôYÇàõ‹à[àö[\Àùò[Y\ 
+NÇà›[HH”UúôKú›Xäàñ◊òK^åNWHãàãú›[Kõ›Ÿ\ä
+JBàYà›[H[ô
+›[H[àõ‹õX[^ôY‹àõ‹õX[^ôY[à›[JNÇàô]\õà›ä
+Bàô]\õàõ€ôBÇôYà]óÿZ\õ[ôW€Ÿ€◊⁄[
+Z\õ[ôW›^[Sõ€ôJNÇàààîô]\õàH\ôŸ\ãô\ùXÿ[HŸ[ù\ôY[õ[ôHŸ€»õ‹àUëTñHõY⁄õ›ÀàààÇà]H]óŸö[ôÿZ\õ[ôW€Ÿ€ Z\õ[ôW›^
+BàYàõ›]Çàô]\õààÇà[\‹ùò\ŸMç\»”Uòò\ŸMçà^H”Uî]
+]
+Kú›Yôö^õ›Ÿ\ä
+BàZ[YHHö[XYŸK‹ô»àYà^OHãúô»à[ŸH
+ö[XYŸK›ŸXúàYà^OHãùŸXúà[ŸHö[XYŸK⁄úY»äBà]HH”Uòò\ŸMçòçç[ò€ŸJ”Uî]
+]
+KúôXYÿû]\ 
+JKôX€ŸJò\ÿ⁄ZHäBàXô[H[‹àZ\õ[ôW›^‹àêZ\õ[ôHÇà»\ôŸ\à[àHô]ö[›\»ô\ú⁄[€à[ôŸ[ù\ôY[àHõY⁄Y]Z[Ÿ[Çàô]\õà
+àâœ]à€\‹œHõ]ãXZ\õ[ôK[Ÿ€À]‹ò\èâ¬àâœ[Y»€\‹œHõ]ãXZ\õ[ôK[Ÿ€»à‹òœHô]Nû€Z[Y_Nÿò\ŸMçŸ]_Hà	¬àâÿ[Hû€Xô[Hà]OHû€Xô[Hèâ¬àâœŸ]èâ¬à
+Bà»KKHSëUàRTìSëH—”»SìSëHSíSê—SQSïKKBÇÇõÿYŸ›[ùä
+BÇêì’’“—SàH‹ÀôŸ][ùäêì’’“—SàãàäKú›ö\
+
+Bà»€€\]Xö[]H\ô›[Y[ù»ô]Z[ôYûHH€‹öŸõ›»ù[ò›[€úÀàõ›öY\àõ›][ô¬à»]Ÿ[à]ô\»[àZW‹õ›öY\ãúH[ôô[XZ[ú»ÿÿ[⁄[àRW‘ì’íQTè[ÿÿ[ÇêRW–TW“—VHH‹ÀôŸ][ùäñ“Tì◊–TW“—VHãàäKú›ö\
+
+H‹à‹ÀôŸ][ùäë‘ì‘W–TW“—VHãàäKú›ö\
+
+H‹àõ€ôBêRW”S—SH‹ÀôŸ][ùäñ“Tì◊’V”S—SãàäKú›ö\
+
+H‹à‹ÀôŸ][ùäë‘ì‘W”S—SãàäKú›ö\
+
+H‹àò]]»ÇÇêQRSó’T—Tó“Q»H¬à[ù
+ú›ö\
+
+JHõ‹à[à‹ÀôŸ][ùäêQRSó’T—Tó“Q»ãàäKú‹]
+ãäBàYàú›ö\
+
+Kö\ŸY⁄]
+
+BüBÇêêT—W—TàH]
+◊Ÿö[W◊ Kúô\€€ôJ
+Kú\ô[ùëUW—TàHêT—W—Tà»ô]HÇë—SëTêUQ—TàHUW—Tà»ôŸ[ô\ò]YÇïST—TàHUW—Tà»ö[ò€€Z[ô»ÇëUW—TãõZŸ\ä^\›€⁄œUùYJBë—SëTêUQ—TãõZŸ\ä^\›€⁄œUùYJBïST—TãõZŸ\ä^\›€⁄œUùYJBà»Yò][^U›\êò^ò\àŸ€»›\YY⁄]Hõ›Çà»HŸ€»\ÿYY]\àõ›Y⁄<'ÂØ;Ó#»Ÿ]Ÿ€»›ô\úöY\»\»õ‹àH›\úô[ùù[ãÇì—”◊‘UHUW—Tà»õŸ€◊ŸYò][úô»ÇïT—Tó”—”◊‘UHUW—Tà»õŸ€Àúô»ÇêT‘—U◊—TàHêT—W—Tà»ò\‹Ÿ]»ÇêT‘—U◊—TãõZŸ\ä^\›€⁄œUùYJBïTìTÃó‘ó‘UHUW—Tà»ïTìT◊–””ëUS”îÀúàÇêåêó’TìT◊‘ó‘UHUW—Tà»êåêãúàÇï’Tó’“U’U—ì”’Tó‘ó‘UHUW—Tà»ù⁄]›]Ÿõ€›\ãúàÇï’Tó”ì”ó—””—”W’TìT◊‘ó‘UHUW—Tà»ï	ê»ì”à””—”KúàÇö[\‹ùŸ^\›[ô◊‹ú —SëTêUQ—TäBÇÇôYà\[ô‹ó‹YŸ\ ò\ŸW‹ã\[ô^‹ã›]]‹äNÇàààìY\ôŸHHŸ[ô\ò]YX⁄ÿYŸH][ô\ò\ûHõ€›ŸYûHH›\YY\[ô^ãàààÇà‹ö]\àHï‹ö]\ä
+Bàõ‹à€›\òŸH[à
+ò\ŸW‹ã\[ô^‹äNÇàôXY\àHîôXY\ä›ä€›\òŸJJBàõ‹àYŸH[àôXY\ãúYŸ\ŒÇà‹ö]\ãòY‹YŸJYŸJBà⁄]‹[ä›]]‹ãùÿàäH\»öÇà‹ö]\ãù‹ö]Jö
+BÇÇó–åêó–îêSë‘UTìàHôKò€€\[Jààä⁄JJŒúÿ[\–^]›\òò^ò\óò€€_››◊õ^]›\òò^ò\óò€€_^]›\òò^ò\óò€€_^]›\òò^ò\ü^W ù›\ó òò^ò\ü^]›\òò^ò\äHÇäBÇÇôYà‹€X\ù‹ô\]Y\›Yÿåòä^
+NÇàààïùYH€õH⁄[àH›€ô\à^X⁄]H\⁄‹»õ‹àHåêà»⁄]K[Xô[›\à›]]àààÇà›»H›ä^‹ààäKõ›Ÿ\ä
+Bàô]\õàõ€€
+ôKúŸX\ò⁄
+ààóäŒòó åó òüù\⁄[ô\‹◊ ñÀHO›◊ ñÀHOÿù\⁄[ô\‹ﬂ⁄]W ñÀHO€Xô[YŸ[òﬁW ñÀHO€ô]]ò[[òúò[ôY
+Wàãà›ÀàôKíKà
+JBÇÇôYà⁄\◊ÿåòó››\ä]OSõ€ôK€€ù^Sõ€ôKôX€‹ôSõ€ôJNÇà]HH]H‹àﬂBàôX€‹ôHôX€‹ô‹àﬂBàYàõ€€
+]KôŸ]
+òåòàäH‹à]KôŸ]
+òúò[ô€ô]]ò[äJNÇàô]\õàùYBàYàõ€€
+ôX€‹ôôŸ]
+òåòàäJNÇàô]\õàùYBàYà€€ù^\»õ›õ€ôH[ôõ€€
+€€ù^ù\Ÿ\óŸ]KôŸ]
+ú[ô[ô◊ÿåòàäJNÇàô]\õàùYBàô]\õàò[ŸBÇÇôYàÿåòó‹ô\XŸW›^
+ò[YJNÇàààîô[[›ôH]ô\ûH^U›\êò^ò\àúò[ôôYô\ô[òŸHúõ€Håêã]ö\⁄XõH^àààÇà^H›äò[YH‹ààäBà»€€ùX›\›[Húò[ô›ö[ô‹»]\›õ›ôX€€YHX[õ‹õYYK[XZ[ÀŸ€XZ[úÀÇà^HôKú›Xäàä⁄JWúÿ[\–^]›\òò^ò\óò€€Wàãõ›\à€€\[ûHã^
+Bà^HôKú›Xäàä⁄JWäŒù››◊äO€^]›\òò^ò\óò€€Wàãõ›\à€€\[ûHã^
+Bà^HôKú›Xäàä⁄JP^]›\òò^ò\óàãõ›\à€€\[ûHã^
+Bà^HôKú›Xäàä⁄JWõ^W ù›\ó òò^ò\óàãõ›\à€€\[ûHã^
+Bà^HôKú›Xäàä⁄JWõ^]›\òò^ò\óàãõ›\à€€\[ûHã^
+Bàô]\õà^ÇÇôYàÿåòó€ô]]ò[^ôWŸ]J]K[ŸOSõ€ôJNÇàààëY\X€‹H›\à]H[ôXZŸH]ô\ûH›\›€Y\ã]ö\⁄XõH›ö[ô»åêà⁄]K[Xô[àààÇàYàÿ‹ùXäÿöäNÇàYà\⁄[ú›[òŸJÿöãX›
+NÇàô]\õà⁄Œàÿ‹ùXääHõ‹àÀà[àÿöãö][\ 
+_BàYà\⁄[ú›[òŸJÿöã\›
+NÇàô]\õà‹ÿ‹ùXääHõ‹àà[àÿöóBàYà\⁄[ú›[òŸJÿöã\JNÇàô]\õà\Jÿ‹ùXääHõ‹àà[àÿöäBàYà\⁄[ú›[òŸJÿöã›äNÇàô]\õàÿåòó‹ô\XŸW›^
+ÿöäBàô]\õàÿöÇÇàHÿ‹ùXä€‹KôY\€‹J]H‹àﬂJJBà»òåòàóHHùYBà»òúò[ô€ô]]ò[óHHùYBà»òYŸ[òﬁW‹ô[[›ôYóHHùYBàYà[ŸNÇà»ôÿ›[Y[ù€[ŸHóHH›ä[ŸJKõ›Ÿ\ä
+Bàô]\õàÇÇôYàÿåòóŸ‹ôY][ô ]K[ŸJNÇà›Y\›H›ä
+]H‹àﬂJKôŸ]
+ò€Y[ù€ò[YHäH‹àë›Y\›äKú›ö\
+
+Bà[ŸHH›ä[ŸH‹àö][ô\ò\ûHäKõ›Ÿ\ä
+BàYà[ŸHOHú][›][€àéÇàô]\õà
+ààëX\àŸ›Y\›Kóë‹ôY][ô‹»úõ€H›\à€€\[ûHHŸH\ôH[Y⁄Y»ô\Ÿ[ù\»ŸôöX⁄X[Çàù›\à][›][€àô\\ôY\‹X⁄X[Hõ‹à[›\àò]ô[ô\]Z\ô[Y[ùÀàHõ€›⁄[ô»õ‹‹ÿ[Çàú›[[X\ö^ô\»H[õôY\›[ò][€úÀXÿ€€[[Ÿ][€ãò[ú‹‹ù][€ã⁄Y⁄ŸYZ[ô»^\öY[òŸ\ÀÇàö[ò€\⁄[€ú»[ô^€\⁄[€ú»õ‹à[›\à€€ú⁄Y\ò][€ãàŸH€⁄»õ‹ùÿ\ô»\úò[ô⁄[ô»H€€Yõ‹ùXõHÇàò[ôY[[‹òXõHõ›\õô^Hõ‹à[›H[ô[›\àò[Z[KóóîX\ŸHô]öY]»H][ô\ò\ûH[ôX⁄ÿYŸHÇàô]Z[»ÿ\ôYù[K[ôôY[úôYH»€€ùX››\à€€\[ûHõ‹à[ûH€\öYöXÿ][€à‹à[Y[ôY[ùôYõ‹ôH€€ôö\õX][€ãàÇà
+BàYà[ŸHOHùõ›X⁄\àéÇàô]\õà
+ààëX\àŸ›Y\›Kóë‹ôY][ô‹»úõ€H›\à€€\[ûHH[ö»[›Hõ‹à⁄€‹⁄[ô»›\à€€\[ûHõ‹à[›\àõ›\õô^KàÇàîX\ŸHö[ôô[›»[›\àŸôöX⁄X[›\àõ›X⁄\à€€ùZ[ö[ô»H€€ôö\õYYò]ô[[ãXÿ€€[[Ÿ][€àÇàúÿ⁄Y[KŸ\ùöXŸ\»[ô^K]⁄\ŸH\úò[ôŸ[Y[ùÀà⁄[ôHŸY\\»õ›X⁄\à]òZ[XõH\ö[ô»[›\àÇàöõ›\õô^H[ôô]öY]»H[ò€YYŸ\ùöXŸ\»[ôò]ô[[ú›ùX›[€ú»ôYõ‹ôH\\ù\ôKóóàÇàì›\à€€\[ûH⁄\⁄\»[›HH€[€›€€Yõ‹ùXõH[ôY[[‹òXõHö\àÇà
+Bàô]\õà
+ààëX\àŸ›Y\›Kóë‹ôY][ô‹»úõ€H›\à€€\[ûHHX\ŸHö[ôô[›»[›\àÿ\ôYù[H[õôY^K]⁄\ŸHÇàùò]ô[][ô\ò\ûK[ò€Y[ô»Xÿ€€[[Ÿ][€ãò[ú‹‹ù][€ã⁄Y⁄ŸYZ[ô»^\öY[òŸ\À[ò€\⁄[€ú»[ôÇàô^€\⁄[€ú»õ‹àH€[€›[ô€€Yõ‹ùXõHõ›\õô^KàÇà
+BÇÇôYà‹ÿ[ö]^ôWÿåòó›\õ\◊‹ä€›\òŸW‹ã›]]‹äNÇàààê‹ôX]HH[\‹ò\ûHåêà\õ\»à⁄]õ»^U›\êò^ò\à^ÇÇà\»\»òZ[X€‹ŸYàYàHö\⁄XõKŸ^òX›XõH^U›\êò^ò\àôYô\ô[òŸHô[XZ[úÀàHåêàö[ù\»›‹Y[ú›XYŸàXZ⁄[ô»Húò[ô[ù»H⁄]K[Xô[ãÇàààÇà€›\òŸW‹àH]
+€›\òŸW‹äBà›]]‹àH]
+›]]‹äBàûNÇà[\‹ùö]à»S]Tà\»[ôXYH\ŸYûHH^U›\êò^ò\àõ››X⁄ÀÇà^Ÿ\^Ÿ\[€à\»^ŒÇàòZ\ŸHù[ù[YQ\úõ‹äàêåêà\õ\»ÿ[ö]^ö[ô»ôYY»S]TãàôYù\⁄[ô»»\[ô[à[úÿ[ö]^ôYåêà\õ\»YŸKàÇà
+Húõ€H^¬Çàÿ»Hö]ãõ‹[ä›ä€›\òŸW‹äJBà»€ôÀÿ€€ùX›õ‹õ\»ö\ú›[àúò[ô[ò[YHò\öX[ùÀÇàô\XŸ[Y[ù»H¬à
+úÿ[\–^]›\òò^ò\ãò€€Hãõ›\à€€\[ûHäKà
+ù››Àõ^]›\òò^ò\ãò€€Hãõ›\à€€\[ûHäKà
+õ^]›\òò^ò\ãò€€Hãõ›\à€€\[ûHäKà
+ê^]›\òò^ò\àãõ›\à€€\[ûHäKà
+ìVH’TàêVêTàãõ›\à€€\[ûHäKà
+ì^H›\àò^ò\àãõ›\à€€\[ûHäKà
+ìVU’TêêVêTàãõ›\à€€\[ûHäKà
+ì^U›\êò^ò\àãõ›\à€€\[ûHäKà
+õ^]›\òò^ò\àãõ›\à€€\[ûHäKàBÇàõ‹àYŸH[àÿŒÇàõ›[ôH◊Bàÿÿ›\YYH◊Bàõ‹àôYYKô\XŸ[Y[ù[àô\XŸ[Y[ùŒÇàõ‹àôX›[àYŸKúŸX\ò⁄Ÿõ‹äôYYJNÇà»]õ⁄Y›ô\õ\[ô»ô\XŸ[Y[ùôX›[ô€\»⁄[à€ôH€ô»⁄Ÿ[Çà»[€»€€ùZ[ú»H⁄‹ù\àúò[ô⁄Ÿ[ãÇàYà[ûJôX›ö[ù\úŸX› ô]äHõ‹àô]à[àÿÿ›\YY
+NÇà€€ù[ùYBàÿÿ›\YYò\[ô
+ôX›
+Bàõ›[ôò\[ô
+
+ôX›ô\XŸ[Y[ù
+JBàYŸKòY‹ôYX›ÿ[õõ›
+ôX›ö[JKKJJBàYàõ›[ôÇàYŸKò\W‹ôYX›[€ú 
+Bàõ‹àôX›ô\XŸ[Y[ù[àõ›[ôÇàõ€ù⁄^ôHHX^
+ãåZ[äLKåôX›öZY⁄
+àçÃäJBàYŸKö[úŸ\ù›^õﬁ
+àôX›àô\XŸ[Y[ùàõ€ù⁄^ôOYõ€ù⁄^ôKàõ€ùò[YOHö[àãà€€‹èJ
+Kà[Y€èLà
+BÇàÿÀúÿ]ôJ›ä›]]‹äKÿ\òòYŸOMYõ]OUùYJBàÿÀò€‹ŸJ
+BÇàô\öYûHHö]ãõ‹[ä›ä›]]‹äJBà^òX›YHóàãöõ⁄[äYŸKôŸ]›^
+ù^äHõ‹àYŸH[àô\öYûJBàô\öYûKò€‹ŸJ
+BàYà–åêó–îêSë‘UTìãúŸX\ò⁄
+^òX›Y
+NÇà›]]‹ãù[õ[ö Z\‹⁄[ô◊€⁄œUùYJBàòZ\ŸHù[ù[YQ\úõ‹äàêåêà\õ\»›[€€ùZ[àH^U›\êò^ò\àôYô\ô[òŸHYù\àÿ[ö]^ö[ôÀàÇàïHàÿ\»›‹Y»õ›X›⁄]K[Xô[úò[ô[ôÀàÇà
+Bàô]\õà›]]‹ÇÇÇôYà\õ\◊‹ó‹]
+⁄⁄XŸOSõ€ôJNÇà⁄⁄XŸHH⁄⁄XŸH‹àŸ]››\ó€\›‹YŸJ
+Bàô]\õà¬à	›⁄]›]Ÿõ€›\âŒà’Tó’“U’U—ì”’Tó‘ó‘Uà	›◊€õ€óŸ€€Ÿ€IŒà’Tó”ì”ó—””—”W’TìT◊‘ó‘UàKôŸ]
+⁄⁄XŸK’Tó”ì”ó—””—”W’TìT◊‘ó‘U
+BÇôYà\õ\◊€Xô[
+⁄⁄XŸOSõ€ôJNÇàô]\õà¬à	›⁄]›]Ÿõ€›\âŒà	’⁄]›]õ€›\âÀà	›◊€õ€óŸ€€Ÿ€IŒà	’	ê»ì”à””—”IÀà	ÿåòâŒà	–åêâÀàKôŸ]
+⁄⁄XŸH‹àŸ]››\ó€\›‹YŸJ
+K	’	ê»ì”à””—”I BÇôYà›\ó›\õ\◊⁄Ÿ^Xõÿ\ô
+
+NÇàô]\õà[õ[ôRŸ^Xõÿ\ôX\ö›\
+÷“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'‰Á\ŸH	ê»ì”à””—”IÀÿ[òX⁄◊Ÿ]OI››\ó›\õ\Œõõ€óŸ€€Ÿ€I WWJBÇôYà\[ô‹Ÿ[X›Y›\õ\ ò\ŸW‹ã\õ\◊ÿ⁄⁄XŸOSõ€ôK›]]‹èSõ€ôJNÇàYà›]]‹à\»õ€ôNÇà›]]‹àH\õ\◊ÿ⁄⁄XŸBà⁄⁄XŸHH\õ\◊ÿ⁄⁄XŸH‹àŸ]››\ó€\›‹YŸJ
+Bà[\‹ò\ûWÿåòó›\õ\»Hõ€ôBàYà⁄⁄XŸHOH	ÿåòâŒÇà\õ\◊‹]Håêó’TìT◊‘ó‘Uà[ŸNÇà\õ\◊‹]H\õ\◊‹ó‹]
+⁄⁄XŸJBàYàõ›\õ\◊‹]ô^\› 
+NÇàòZ\ŸHö[Sõ›õ›[ô\úõ‹äâ’›\à\›\YŸHö[Hõ›õ›[ôà›\õ\◊‹]I BàûNÇàYà⁄⁄XŸHOH	ÿåòâŒÇà[\‹ò\ûWÿåòó›\õ\»H—SëTêUQ—Tà»àóÿåòó›\õ\◊ÿ€X[óﬁ⁄[ù
+[YKù[YJ
+JåL
+_KúàÇà\õ\◊‹]H‹ÿ[ö]^ôWÿåòó›\õ\◊‹ä\õ\◊‹][\‹ò\ûWÿåòó›\õ\ Bà\[ô‹ó‹YŸ\ ò\ŸW‹ã\õ\◊‹]›]]‹äBàô]\õà]
+›]]‹äBàö[ò[NÇàYà[\‹ò\ûWÿåòó›\õ\»\»õ›õ€ôNÇà[\‹ò\ûWÿåòó›\õ\Àù[õ[ö Z\‹⁄[ô◊€⁄œUùYJBÇÇôYàÿ\WŸõ€›\ó€[ŸJ[ú]‹ã›]]‹ã[ŸJNÇàYà[ŸHOH	ÿò\âŒÇàYÿ€€ùX›ÿò\ó›◊‹ä[ú]‹ã›]]‹äBà[Yà[ŸHOH	Ÿ\⁄Y€âŒÇàYŸõ€›\ó›◊‹ä[ú]‹ã›]]‹äBà[Yà[ŸHOH	Ÿõ€›\åâŒÇàYŸõ€›\åó›◊‹ä[ú]‹ã›]]‹äBà[ŸNÇà⁄][ò€‹Yö[J[ú]‹ã›]]‹äBÇÇï–RUSë◊—’QT’”êSQHHBï–RUSë◊‘”’Tê—HHÇï–RUSë◊—VêW“Sê”T“S”àH¬ï–RUSë◊—VêW—V”T“S”àHï–RUSë◊—ìQ““SPQ—HHBí’S’ì’P“Tó“SîUHLëìQ“’P“—U“SîUHåëìQ“—êTëW“SîUHåBêïT◊’P“—U“SîUHÃêïT◊—êTëW“SîUHÃBëQU‘ëQó“SîUHëQU“Sî’ïP’S”àHBî”PTï“SîUHLêUU◊‘íSï‘—P””ë»HBÇõŸŸ⁄[ôÀòò\⁄X–€€ôöY àõ‹õX]HâJ\ÿ›[YJ\»	J]ô[ò[YJ\»	Jò[YJ\»	JY\‹ÿYŸJ\»ãà]ô[[ŸŸ⁄[ôÀíSëìÀäBõŸŸŸ\àHŸŸ⁄[ôÀôŸ]ŸŸŸ\äõ^]›\òò^ò\óÿõ›äBÇÇò€\‹»ô\PX›[€ëö[\äö[\úÀìY\‹ÿYŸQö[\äNÇàààîõ›]Hô\Y\»»õ›Y\‹ÿYŸ\»õ›Y⁄HY]ÿ€€[X[ôõ›]\àö\ú›ÇÇàYàHô\YY]»Y\‹ÿYŸH€€ùZ[ú»[àUàôYô\ô[òŸH]ôX€€Y\»Hÿ›[Y[ùY]ÇàYà]\»Hò\ôHõ€\]ôX€€Y\»ò\ôH[ú]à›\ù⁄\ŸHHõ‹õX[€€ùô\úÿ][€í[ô\Çà›[ôXŸZ]ô\»HY\‹ÿYŸK€»ô\Z[ô»»€‹öŸõ›»õ€\»ô[XZ[ú»ù[H\ÿXõKÇàààÇàò[YHHîô\PX›[€ëö[\àÇÇàYàö[\äŸ[ãY\‹ÿYŸJNÇàô\YYHŸ]]äY\‹ÿYŸKúô\W›◊€Y\‹ÿYŸHãõ€ôJBàYàõ›ô\YYÇàô]\õàò[ŸBàŸ[ô\àHŸ]]äô\YYôúõ€W›\Ÿ\àãõ€ôJBàô]\õàõ€€
+Ÿ[ô\à[ôŸ]]äŸ[ô\ãö\◊ÿõ›ãò[ŸJJBÇÇîëTW–P’S”ó—íSTàHô\PX›[€ëö[\ä
+BÇÇò\ﬁ[ò»YàÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK^
+äö›ÿ\ô‹ NÇàààîÿYô[H\]HHÿ[òX⁄…‹»‹öY⁄[ò][ô»Y\‹ÿYŸKÇÇàÿ[òX⁄»ù]€ú»ÿ[àôH]X⁄Y»›ÀŸÿ›[Y[ù€YYXHY\‹ÿYŸ\ÀÇà[Y‹ò[I‹»Y]Y\‹ÿYŸU^€õHY]»^Y\‹ÿYŸ\À€»ò[òX⁄»»Bàúô\⁄ô\H⁄[àH‹öY⁄[ò][ô»Y\‹ÿYŸH\»õ»^ÿÿ\[€ãÇàààÇàY\‹ÿYŸHHŸ]]ä]Y\ûKõY\‹ÿYŸHãõ€ôJBàYàY\‹ÿYŸH\»õ€ôNÇàô]\õàõ€ôBà^H›ä^‹àîõÿŸ\‹⁄[ôÀããàäBà^\›[ô◊›^HŸ]]äY\‹ÿYŸKù^ãõ€ôJBà^\›[ô◊ÿÿ\[€àHŸ]]äY\‹ÿYŸKòÿ\[€àãõ€ôJBàYàõ›^\›[ô◊›^[ôõ›^\›[ô◊ÿÿ\[€éÇàô]\õà]ÿZ]Y\‹ÿYŸKúô\W›^
+^
+äö›ÿ\ô‹ BàûNÇàô]\õà]ÿZ]Y\‹ÿYŸKôY]›^
+^
+äö›ÿ\ô‹ Bà^Ÿ\òYô\]Y\›\»^ŒÇàôX\€€àH›ä^ Kõ›Ÿ\ä
+BàYà[ûJ[àôX\€€àõ‹à[à
+àù\ôH\»õ»^[àHY\‹ÿYŸH»Y]ãàõY\‹ÿYŸHÿ[â›ôHY]YãàõY\‹ÿYŸH»Y]õ›õ›[ôãàõY\‹ÿYŸH\»õ›[ŸYöYYãà
+JNÇàô]\õà]ÿZ]Y\‹ÿYŸKúô\W›^
+^
+äö›ÿ\ô‹ BàŸŸŸ\ãùÿ\õö[ô êÿ[òX⁄»Y\‹ÿYŸHY]òZ[Yà	\»ã^ Bàô]\õà]ÿZ]Y\‹ÿYŸKúô\W›^
+^
+äö›ÿ\ô‹ Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãùÿ\õö[ô ï[ô^X›Yÿ[òX⁄»Y\‹ÿYŸHY]òZ[\ôNà	\»ã^ BàûNÇàô]\õà]ÿZ]Y\‹ÿYŸKúô\W›^
+^
+äö›ÿ\ô‹ Bà^Ÿ\^Ÿ\[€éÇàŸŸŸ\ãô^Ÿ\[€äê€›[õ›Ÿ[ôÿ[òX⁄»ò[òX⁄»Y\‹ÿYŸHäBàô]\õàõ€ôBÇÇò\ﬁ[ò»YàÿYôW‹›]\◊ŸY]
+›]\◊€Y\‹ÿYŸK⁄]€Y\‹ÿYŸK^
+äö›ÿ\ô‹ NÇàààëY]”ëHõ›[›€ôY›]\»Y\‹ÿYŸH[àXŸKàô]ô\à‹ôX]HHò[òX⁄»Y\‹ÿYŸKÇÇà\»\»[Xô\ò][H›öX›õ‹à€‹öŸõ›»õŸ‹ô\‹ŒàHòZ[YY]]\›õ›‹ôX]BàHŸX€€ôõŸ‹ô\‹»Y\‹ÿYŸK›\ù⁄\ŸHH⁄]ôX€€Y\»H›ôX[HŸà\Xÿ]Bà›]\»Y\‹ÿYŸ\Àà[Y‹ò[H\õZ]»Y][ô»Y\‹ÿYŸ\»Ÿ[ùûHHõ›]Ÿ[ãÇàààÇà^H›ä^‹àîõÿŸ\‹⁄[ôÀããàäBàYà›]\◊€Y\‹ÿYŸH\»õ€ôNÇàô]\õàõ€ôBÇà»[ÿ^\»Yô\‹»H‹öY⁄[ò[õ›Y\‹ÿYŸHûH⁄]⁄Y€Y\‹ÿYŸW⁄Yà\»]õ⁄Y¬à»Xÿ⁄Y[ù[HY][ô»H\Ÿ\â‹»\ÿYYÿ›[Y[ù‹àH›[HY\‹ÿYŸHÿöôX›Çà⁄]⁄YHŸ]]ä›]\◊€Y\‹ÿYŸKò⁄]⁄Yãõ€ôJH‹àŸ]]ä⁄]€Y\‹ÿYŸKò⁄]⁄Yãõ€ôJBàY\‹ÿYŸW⁄YHŸ]]ä›]\◊€Y\‹ÿYŸKõY\‹ÿYŸW⁄Yãõ€ôJBàYà⁄]⁄Y\»õ€ôH‹àY\‹ÿYŸW⁄Y\»õ€ôNÇàŸŸŸ\ãùÿ\õö[ô î›]\»Y\‹ÿYŸH\»õ»⁄]€Y\‹ÿYŸHY»õŸ‹ô\‹»\]H⁄⁄\YäBàô]\õà›]\◊€Y\‹ÿYŸBÇàûNÇà]ÿZ]⁄]€Y\‹ÿYŸKôŸ]ÿõ›
+
+KôY]€Y\‹ÿYŸW›^
+à⁄]⁄YX⁄]⁄YY\‹ÿYŸW⁄Y[Y\‹ÿYŸW⁄Y^]^
+äö›ÿ\ô‹¬à
+Bà^Ÿ\òYô\]Y\›\»^ŒÇàôX\€€àH›ä^ Kõ›Ÿ\ä
+BàYàõY\‹ÿYŸH\»õ›[ŸYöYYàõ›[àôX\€€éÇàŸŸŸ\ãùÿ\õö[ô ê€›[õ›Y]⁄[ô€H›]\»Y\‹ÿYŸH	\À…\Œà	\»ã⁄]⁄YY\‹ÿYŸW⁄Y^ Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãùÿ\õö[ô ï[ô^X›Y⁄[ô€H›]\»Y]òZ[\ôH	\À…\Œà	\»ã⁄]⁄YY\‹ÿYŸW⁄Y^ Bàô]\õà›]\◊€Y\‹ÿYŸBÇÇôYà‹ÿYôWŸö[[ò[YW‹\ù
+ò[YKò[òX⁄œHëÿ›[Y[ùäNÇàò[YHH›äò[YH‹ààäKú›ö\
+
+Bàò[YHHò[YKúô\XŸJã»ããHäKúô\XŸJóããHäBàò[YHHàãöõ⁄[ä»YàÀö\ÿ[ù[J
+H‹à»[ààóÀIä
+Hà[ŸHó»àõ‹à»[àò[YJBàò[YHHó»ãöõ⁄[äò[YKú‹]
+
+JBàò[YHHò[YKú›ö\
+ãóÀH»äBàô]\õàò[YH‹àò[òX⁄¬ÇÇôYàŸ[Jò[YKò[òX⁄œHåäNÇà[\‹ùôBà^H›äò[YH‹ààäBà[€ùœ^€Kõ›Ÿ\ä
+NöHõ‹àKH[à[ù[Y\ò]J»íò[àãëôXàãìX\àãê\àãìX^Hãíù[àãíù[ãê]Y»ãîŸ\ãìÿ›ãìõ›àãëX»óKJ_Bà]\õúœV¬ààóäÃKüJV◊ÀÀWJ –KVòK^ó^ÃÀ_JV◊ÀÀWJ ÃãJWàãààóäÃKüJV◊ÀÀWJ ÃKüJV◊ÀÀWJ ÃãJWàãààóäÕJKJÃKüJKJÃKüJWàãàBàõ‹à][à]\õúŒÇàO\ôKúŸX\ò⁄
+]^ôKíJBàYàõ›Nà€€ù[ùYBàûNÇàYàKô‹õ›\
+äKö\ÿ[J
+NÇà^OZ[ù
+Kô‹õ›\
+JJN»[€ù[[€ù÷€Kô‹õ›\
+äVŒå◊Kõ›Ÿ\ä
+WBà[Yà[äKô‹õ›\
+JJOOMÇà[€ùZ[ù
+Kô‹õ›\
+äJN»^OZ[ù
+Kô‹õ›\
+ JBà[ŸNÇà^OZ[ù
+Kô‹õ›\
+JJN»[€ùZ[ù
+Kô‹õ›\
+äJBàô]\õààûŸ^Nåô^€[€ùåôHÇà^Ÿ\^Ÿ\[€éà\‹¬àô]\õàò[òX⁄¬ÇÇôYàÿZ\ú‹ùÿ€ŸJò[YJNÇà[\‹ùôBà^\›äò[YH‹ààäBàO\ôKúŸX\ò⁄
+àó
+
+–KVòK^ó^ÃﬂJW
+Hã^
+BàYàNàô]\õàKô‹õ›\
+JKù\\ä
+Bà€Ÿ\œ\ôKôö[ô[
+àóñ–KVòK^ó^ÃﬂWàã^
+Bàô]\õà€Ÿ\÷ÀLWKù\\ä
+HYà€Ÿ\»[ŸHñÇÇÇôYàŸ€[Jò[YKò[òX⁄œHë]HäNÇàààî⁄‹ùÿ›[Y[ù]Hõ‹àö[[ò[Y\Œà”SKàààÇà€€\X›WŸ[Jò[YKàäBàYà€€\X›[ô[ä€€\X›
+OOM[ô€€\X›ö\ŸY⁄]
+
+NÇàô]\õà€€\X›ŒåóH
+»ó»à
+»€€\X›ÃéóBàô]\õàò[òX⁄¬ÇÇôYà€õ‹õX[›]Jò[YJNÇàò]œ\›äò[YH‹ààäKú›ö\
+
+Kúô\XŸJãàãàäBà›œ\ò]Àõ›Ÿ\ä
+BàX\[ôœ^¬àõ\àéàì\àãõ\ú»éàì\ú»ãõ\»éàì\»ãõZ\‹»éàìZ\‹»ãàõX\›\àéàìX\›\àãõ\›àéàì\›àãõ\›éàì\›àãàôàéàëàãúõŸàéàîõŸàãàBàô]\õàX\[ôÀôŸ]
+›Àò] BÇÇôYà‹‹]›]WŸö\ú›€ò[YJò[YK^X⁄]›]OHàäNÇàààîô]\õàH⁄‹ùö[[ò[YHY[ù]H›X⁄\»\ãP[Z]»\úÀSôZH»ò]ö[ãàààÇàò]œ\ôKú›Xäàó »ãàã›äò[YH‹ààäKú›ö\
+
+JBà]OW€õ‹õX[›]J^X⁄]›]JBàò[YO\ò]¬Çà»ô[[›ôH€ôH‹à[‹ôHô\X]YXY[ô»€õ‹öYöX‹»úõ€HHò[YKÇà€õ‹öYöX◊‹ôO\àóä\ü\úﬂ\ﬂZ\‹ﬂX\›\ü\›ü\›üõŸäWè◊ »Çà⁄[HùYNÇàO\ôKõX]⁄
+€õ‹öYöX◊‹ôKò[YKôKíJBàYàõ›NÇàúôXZ¬àYàõ›]NÇà]OW€õ‹õX[›]JKô‹õ›\
+JJBàò[YO\ôKú›Xä€õ‹öYöX◊‹ôKàãò[YK€›[ùLKõY‹œ\ôKíJKú›ö\
+
+BÇà»ö\ú›\ŸYù[\ú€€ò[ò[YH€õKÇà»ê[Z]⁄\õXHàOà[Z]à»ê[Z]	àò[Z[HàOà[Z]àö\ú›HàÇàõ‹à⁄Ÿ[à[àôKú‹]
+àñ◊À…ä◊J»ãò[YJNÇà⁄Ÿ[è]⁄Ÿ[ãú›ö\
+àóÀHäBàYà⁄Ÿ[éÇàö\ú›]⁄Ÿ[ÇàúôXZ¬àö\ú›W‹ÿYôWŸö[[ò[YW‹\ù
+ö\ú›‹àë›Y\›ãë›Y\›äBÇàYà]NÇàô]\õààû◊‹ÿYôWŸö[[ò[YW‹\ù
+]J_K^Ÿö\ú›HÇàô]\õàö\ú›ÇÇôYàŸö[[ò[YW‹\ú€€ó‹⁄‹ù
+\ú€€äNÇà\ú€€è\\ú€€à‹àﬂBàô]\õà‹‹]›]WŸö\ú›€ò[YJà\ú€€ãôŸ]
+õò[YHäH‹à\ú€€ãôŸ]
+ôù[€ò[YHäH‹àë›Y\›ãà\ú€€ãôŸ]
+ù]HäH‹à\ú€€ãôŸ]
+ú\‹Ÿ[ôŸ\ó›]HäH‹ààãà
+BÇÇôYà››\óÿ€Y[ù‹⁄‹ù
+]JNÇàô]\õà‹‹]›]WŸö\ú›€ò[YJà
+]H‹àﬂJKôŸ]
+ò€Y[ù€ò[YHäH‹à
+]H‹àﬂJKôŸ]
+ô›Y\›€ò[YHäH‹àë›Y\›ãà
+]H‹àﬂJKôŸ]
+ò€Y[ù›]HäH‹à
+]H‹àﬂJKôŸ]
+ô›Y\››]HäH‹ààãà
+BÇÇôYà››\óŸ\ò][€ó‹⁄‹ù
+]JNÇàààìõ‹õX[^ôH›\à\ò][€à»çQ›[H⁄]›]XZ⁄[ô»Hö[[ò[YH€ôÀàààÇà]OY]H‹àﬂBàÿ[ôY]\œV¬à]KôŸ]
+ô\ò][€àäKà]KôŸ]
+ù›\ó›]HäKà]KôŸ]
+ùò]ô[Ÿ]\»äKàBà^Hàãöõ⁄[ä›ä‹ààäHõ‹à[àÿ[ôY]\ BÇà»çQ»öY⁄»H^\»»H^\»öY⁄ÀÇà]\õúœV¬ààóä
+ W äŒõüöY⁄öY⁄ W ñÀ ◊IàJó ä
+ W äŒô^_^\ Wàãààóä
+ W äŒô^_^\ W ñÀ ◊IàJó ä
+ W äŒõüöY⁄öY⁄ WàãàBàO\ôKúŸX\ò⁄
+]\õú÷ÃK^ôKíJBàYàNÇàô]\õààû⁄[ù
+Kô‹õ›\
+JJ_Sû⁄[ù
+Kô‹õ›\
+äJ_QÇàO\ôKúŸX\ò⁄
+]\õú÷ÃWK^ôKíJBàYàNÇàô]\õààû⁄[ù
+Kô‹õ›\
+äJ_Sû⁄[ù
+Kô‹õ›\
+JJ_QÇÇà»Yà€õHöY⁄ÀŸ^\»\»õ›öYY\ŸHH›[ô\ô›\àô[][€ãÇà[è\ôKúŸX\ò⁄
+àóä
+ W äŒõüöY⁄öY⁄ Wàã^ôKíJBàY\ôKúŸX\ò⁄
+àóä
+ W äŒô^_^\ Wàã^ôKíJBàYà[à[ôYÇàô]\õààû⁄[ù
+[ãô‹õ›\
+JJ_Sû⁄[ù
+Yô‹õ›\
+JJ_QÇàYà[éÇàèZ[ù
+[ãô‹õ›\
+JJBàô]\õààû€üSû€äÃ_QÇàYàYÇàZ[ù
+Yô‹õ›\
+JJBàô]\õààû€X^
+LJ_SûŸQÇÇàô]\õàï›\àÇÇÇôYà››\óŸÿ›[Y[ù›\J]JNÇà[ŸO\›ä
+]H‹àﬂJKôŸ]
+ôÿ›[Y[ù€[ŸHäH‹àö][ô\ò\ûHäKú›ö\
+
+Kõ›Ÿ\ä
+BàYàú][›à[à[ŸNÇàô]\õàî][›][€àÇàYàùõ›X⁄à[à[ŸNÇàô]\õàïõ›X⁄\àÇàô]\õàí][ô\ò\ûHÇÇÇôYà››\óŸ]Z[›\J]JNÇà]Z[\›ä
+]H‹àﬂJKôŸ]
+ô]Z[€]ô[äH‹àòò\⁄X»äKú›ö\
+
+Kõ›Ÿ\ä
+Bàô]\õàë]Z[YàYà]Z[OHô]Z[Yà[ŸHêò\⁄X»ÇÇÇôYà‹X⁄ÿYŸWŸö[[ò[YJ]JNÇàààë\›[ò][€óÕçQ”\ãP[Z]—]Z[Y‘][›][€ãúàààÇà\›[ò][€èW‹ÿYôWŸö[[ò[YW‹\ù
+à
+]H‹àﬂJKôŸ]
+ô\›[ò][€àäH‹à
+]H‹àﬂJKôŸ]
+ù›\ó›]HäH‹àï›\àãàï›\àãà
+Bà\ò][€èW››\óŸ\ò][€ó‹⁄‹ù
+]JBà€Y[ùW››\óÿ€Y[ù‹⁄‹ù
+]JBà]Z[W››\óŸ]Z[›\J]JBàÿ◊›\OW››\óŸÿ›[Y[ù›\J]JBàô]\õààûŸ\›[ò][€üWﬁŸ\ò][€üWﬁÿ€Y[ùWﬁŸ]Z[WﬁŸÿ◊›\_KúàÇÇÇôYà›]WŸõ‹ó‹\ú€€ä\ú€€äNÇà\ú€€àH\ú€€à‹àﬂBà]HH›ä\ú€€ãôŸ]
+ù]HäH‹à\ú€€ãôŸ]
+ú\‹Ÿ[ôŸ\ó›]HäH‹ààäKú›ö\
+
+BàYà]NÇàô]\õà]Kúô\XŸJãàãàäBàò[YHH›ä\ú€€ãôŸ]
+õò[YHäH‹à\ú€€ãôŸ]
+ôù[€ò[YHäH‹ààäKú›ö\
+
+BàHHôKõX]⁄
+àóä\ü\úﬂ\ﬂZ\‹ﬂX\›\ü\›ü⁄[[ôò[ù
+Wè◊ »ãò[YKôKíJBàô]\õàKô‹õ›\
+JHYàH[ŸHàÇÇôYàŸù[€ò[YW›⁄]›]›]J\ú€€äNÇà\ú€€àH\ú€€à‹àﬂBàò[YHH›ä\ú€€ãôŸ]
+õò[YHäH‹à\ú€€ãôŸ]
+ôù[€ò[YHäH‹ààäKú›ö\
+
+Bà€õ‹öYöX»HàóäŒì\ü\úﬂ\ﬂZ\‹ﬂX\›\ü\›üüõŸü⁄[[ôò[ù
+Wè◊ »Çà⁄[HôKõX]⁄
+€õ‹öYöXÀò[YKõY‹œ\ôKíJNÇàò[YHHôKú›Xä€õ‹öYöXÀàãò[YK€›[ùLKõY‹œ\ôKíJKú›ö\
+
+Bàô]\õàò[YH‹àë›Y\›ÇÇôYàŸö[[ò[YW‹\ú€€ä\ú€€äNÇà»Ÿ\õ‹à€€\]Xö[]H⁄][ûH€\à[ù\õò[ÿ[ÀÇàô]\õàŸö[[ò[YW‹\ú€€ó‹⁄‹ù
+\ú€€äBÇÇôYàŸö\ú›Ÿ]W›ò[YJ]KŸ^\ NÇà]OY]H‹àﬂBàõ‹àŸ^H[àŸ^\ŒÇàò[YOY]KôŸ]
+Ÿ^JBàYàò[YH\»õ›õ€ôH[ô›äò[YJKú›ö\
+
+NÇàô]\õàò[YBàô]\õààÇÇÇôYà€ô\›YŸö\ú›
+]K€€ùZ[ô\ó⁄Ÿ^\ NÇà]OY]H‹àﬂBàõ‹àŸ^H[à€€ùZ[ô\ó⁄Ÿ^\ŒÇà][\œY]KôŸ]
+Ÿ^JBàYà\⁄[ú›[òŸJ][\À\›
+H[ô][\»[ô\⁄[ú›[òŸJ][\÷ÃKX›
+NÇàô]\õà][\÷ÃBàYà\⁄[ú›[òŸJ][\ÀX›
+NÇàô]\õà][\¬àô]\õàﬂBÇÇôYàŸÿ›[Y[ùŸ]J]KŸ^\Àô\›Y⁄Ÿ^\œJ
+JNÇàò[YOWŸö\ú›Ÿ]W›ò[YJ]KŸ^\ BàYàò[YNÇàô]\õàŸ€[Jò[YJBàô\›YW€ô\›YŸö\ú›
+]Kô\›Y⁄Ÿ^\ Bàò[YOWŸö\ú›Ÿ]W›ò[YJô\›YŸ^\ Bàô]\õàŸ€[Jò[YJBÇÇôYàŸõY⁄‹õ›]WŸö[[ò[YW‹\ù
+]JNÇàŸY‹œJ]H‹àﬂJKôŸ]
+úŸY€Y[ù»äH‹à◊BàYàõ›ŸY‹ŒÇàô]\õàëTPTîàÇÇàYà€ŸJŸYÀ\UùYJNÇàYà\Çàò]œ\ŸYÀôŸ]
+ô\ÿ€ŸHäH‹àŸYÀôŸ]
+ô\\ù\ôWÿ€ŸHäBàZ\ú‹ù\ŸYÀôŸ]
+ô\ÿZ\ú‹ùäH‹àŸYÀôŸ]
+ô\\ù\ôWÿZ\ú‹ùäH‹àŸYÀôŸ]
+ô\ÿ⁄]HäBà[ŸNÇàò]œ\ŸYÀôŸ]
+ò\úóÿ€ŸHäH‹àŸYÀôŸ]
+ò\úö]ò[ÿ€ŸHäBàZ\ú‹ù\ŸYÀôŸ]
+ò\úóÿZ\ú‹ùäH‹àŸYÀôŸ]
+ò\úö]ò[ÿZ\ú‹ùäH‹àŸYÀôŸ]
+ò\úóÿ⁄]HäBàò]œ\›äò]»‹ààäKú›ö\
+
+Kù\\ä
+BàYàôKôù[X]⁄
+àñ–KVó^ÃﬂHãò] NÇàô]\õàò]¬àô]\õàÿZ\ú‹ùÿ€ŸJZ\ú‹ù
+BÇà‹öY⁄[èX€ŸJŸY‹÷ÃKùYJBàö[ò[X€ŸJŸY‹÷ÀLWKò[ŸJBÇà»õ›[ôö\à⁄›»X›X[\›[ò][€àò]\à[à[à[ö[ù[îãTîãÇàYàö[ò[O[‹öY⁄[à[ô[äŸY‹ OèLéÇàõ›]OV€‹öY⁄[óH
+»ÿ€ŸJÀò[ŸJHõ‹à»[àŸY‹◊Bà»ZY\⁄[ù\»õ‹õX[HH\õò\õ›[ô\›[ò][€àõ‹à\ôX›ÿ€€õôX›[ô»ïÇà\›[ò][€è\õ›]V€[äõ›]JKÀÃóHYà[äõ›]JOèL»[ŸH€ŸJŸY‹÷ÃKò[ŸJBàYà\›[ò][€à[ô\›[ò][€àO[‹öY⁄[éÇàô]\õààû€‹öY⁄[üK^Ÿ\›[ò][€üW‘ïÇÇàô]\õààû€‹öY⁄[üK^Ÿö[ò[HÇÇÇôYàŸõY⁄Ÿö[[ò[YJ]JNÇà\‹Ÿ[ôŸ\úœJ]H‹àﬂJKôŸ]
+ú\‹Ÿ[ôŸ\ú»äH‹à◊Bà\ú€€è\\‹Ÿ[ôŸ\ú÷ÃHYà\‹Ÿ[ôŸ\ú»[ŸH¬àõò[YHéä]H‹àﬂJKôŸ]
+ô›Y\›€ò[YHäH‹àë›Y\›ãàù]Héä]H‹àﬂJKôŸ]
+ô›Y\››]HäH‹ààãàBà›Y\›WŸö[[ò[YW‹\ú€€ó‹⁄‹ù
+\ú€€äBàõ›]OWŸõY⁄‹õ›]WŸö[[ò[YW‹\ù
+]JBàŸY‹œJ]H‹àﬂJKôŸ]
+úŸY€Y[ù»äH‹à◊Bàö\ú›‹ŸYœ\ŸY‹÷ÃHYàŸY‹»[ŸHﬂBà]OWŸ€[Jàö\ú›‹ŸYÀôŸ]
+ô\Ÿ]HäBà‹àö\ú›‹ŸYÀôŸ]
+ô\\ù\ôWŸ]HäBà‹à
+]H‹àﬂJKôŸ]
+ùò]ô[Ÿ]HäBà‹à
+]H‹àﬂJKôŸ]
+öõ›\õô^WŸ]HäBà‹à
+]H‹àﬂJKôŸ]
+ô]HäBà
+Bàô]\õààû‹õ›]_WﬁŸ›Y\›WﬁŸ]_W“][ô\ò\ûKúàÇÇÇôYàÿù\◊Ÿö[[ò[YJ]JNÇà]OY]H‹àﬂBà\‹Ÿ[ôŸ\úœY]KôŸ]
+ú\‹Ÿ[ôŸ\ú»äH‹à◊Bà\ú€€è\\‹Ÿ[ôŸ\ú÷ÃHYà\‹Ÿ[ôŸ\ú»[ŸH¬àõò[YHéô]KôŸ]
+ô›Y\›€ò[YHäH‹à]KôŸ]
+ú\‹Ÿ[ôŸ\ó€ò[YHäH‹àë›Y\›ãàù]Héô]KôŸ]
+ô›Y\››]HäH‹à]KôŸ]
+ú\‹Ÿ[ôŸ\ó›]HäH‹ààãàBà›Y\›WŸö[[ò[YW‹\ú€€ó‹⁄‹ù
+\ú€€äBÇàô\›YW€ô\›YŸö\ú›
+]K
+úŸY€Y[ù»ãöõ›\õô^\»ãùö\»äJBà\WŸö\ú›Ÿ]W›ò[YJ]K
+àô\ÿ⁄]Hãô\\ù\ôWÿ⁄]Hãôúõ€Wÿ⁄]Hãõ‹öY⁄[óÿ⁄]Hãòõÿ\ô[ô◊ÿ⁄]Hãôúõ€Hãõ‹öY⁄[àÇà
+JH‹àŸö\ú›Ÿ]W›ò[YJô\›Y
+àô\ÿ⁄]Hãô\\ù\ôWÿ⁄]Hãôúõ€Wÿ⁄]Hãõ‹öY⁄[óÿ⁄]Hãòõÿ\ô[ô◊ÿ⁄]Hãôúõ€Hãõ‹öY⁄[àÇà
+JBà\úèWŸö\ú›Ÿ]W›ò[YJ]K
+àò\úóÿ⁄]Hãò\úö]ò[ÿ⁄]Hãù◊ÿ⁄]Hãô\›[ò][€óÿ⁄]Hãôõ‹[ô◊ÿ⁄]Hãù»ãô\›[ò][€àÇà
+JH‹àŸö\ú›Ÿ]W›ò[YJô\›Y
+àò\úóÿ⁄]Hãò\úö]ò[ÿ⁄]Hãù◊ÿ⁄]Hãô\›[ò][€óÿ⁄]Hãôõ‹[ô◊ÿ⁄]Hãù»ãô\›[ò][€àÇà
+JBÇà\W‹ÿYôWŸö[[ò[YW‹\ù
+\‹àë\\ù\ôHãë\\ù\ôHäBà\úèW‹ÿYôWŸö[[ò[YW‹\ù
+\úà‹àê\úö]ò[ãê\úö]ò[äBÇà]OWŸÿ›[Y[ùŸ]Jà]Kà
+öõ›\õô^WŸ]Hãùò]ô[Ÿ]Hãô\\ù\ôWŸ]Hãô\Ÿ]Hãòõÿ\ô[ô◊Ÿ]Hãòù\◊Ÿ]Hãô]HäKà
+úŸY€Y[ù»ãöõ›\õô^\»ãùö\»äKà
+Bàô]\õààûŸ\K^ÿ\úüWﬁŸ›Y\›WﬁŸ]_W“][ô\ò\ûKúàÇÇÇôYà⁄›[Ÿö[[ò[YJ]JNÇà]OY]H‹àﬂBà›Y\›€ÿöè^¬àõò[YHéô]KôŸ]
+ô›Y\›€ò[YHäH‹à]KôŸ]
+ú\‹Ÿ[ôŸ\ó€ò[YHäH‹àë›Y\›ãàù]Héô]KôŸ]
+ô›Y\››]HäH‹à]KôŸ]
+ù]HäH‹à]KôŸ]
+ú\‹Ÿ[ôŸ\ó›]HäH‹ààãàBà›Y\›WŸö[[ò[YW‹\ú€€ó‹⁄‹ù
+›Y\›€ÿöäBà⁄]OW‹ÿYôWŸö[[ò[YW‹\ù
+]KôŸ]
+ö›[ÿ⁄]HäH‹à]KôŸ]
+ò⁄]HäH‹àê⁄]Hãê⁄]HäBà]OWŸ€[Jà]KôŸ]
+ò⁄X⁄◊⁄[àäBà‹à]KôŸ]
+ò⁄X⁄⁄[àäBà‹à]KôŸ]
+ò⁄X⁄◊⁄[óŸ]HäBà‹à]KôŸ]
+ò\úö]ò[Ÿ]HäBà‹à]KôŸ]
+ô]HäBà
+Bàô]\õààûÿ⁄]_WﬁŸ›Y\›WﬁŸ]_W’õ›X⁄\ãúàÇÇÇôYà\◊ÿ[›ŸY
+\]Nà\]JHOàõ€€Çàô]\õàõ›QRSó’T—Tó“Q»‹à\]KôYôôX›]ôW›\Ÿ\ãöY[àQRSó’T—Tó“Q¬ÇÇôYàXZ[ó⁄Ÿ^Xõÿ\ô
+
+NÇàõ›‹œV◊BàYàù]€óŸ[òXõY
+õXZ[ó››\àäH‹àù]€óŸ[òXõY
+õXZ[óÿZ\àäNÇàõ›œV◊BàYàù]€óŸ[òXõY
+õXZ[ó››\àäNàõ›Àò\[ô
+º'ÂÓªÓ#»›\à›ZYHäBàYàù]€óŸ[òXõY
+õXZ[óÿZ\àäNàõ›Àò\[ô
+∏ß";Ó#»Z\àö[ùäBàõ›‹Àò\[ô
+õ› BàYàù]€óŸ[òXõY
+õXZ[óÿù\»äH‹àù]€óŸ[òXõY
+õXZ[ó⁄›[äNÇàõ›œV◊BàYàù]€óŸ[òXõY
+õXZ[óÿù\»äNàõ›Àò\[ô
+º'Ê£ù\»ö[ùäBàYàù]€óŸ[òXõY
+õXZ[ó⁄›[äNàõ›Àò\[ô
+º'„Í›[ö[ùäBàõ›‹Àò\[ô
+õ› Bàõ›‹Àò\[ô
+»º'È%à]]»‹ôX][€àóJBàYàù]€óŸ[òXõY
+õXZ[óÿZHäNÇàõ›‹Àò\[ô
+»º'È%àRH\‹⁄\›[ù»ô]»ô\]Y\›óJBà»åMåàÿ]ôY\ôYô\ô[òŸHúõ›‹⁄[ô»\»[ù[ù[€ò[HY[ãàŸ[ô\ò]Yÿ›[Y[ù¬à»\ôHY]Y€õHúõ€HZ\à›€à[ŸYûH	àôYŸ[ô\ò]H»õ⁄XŸKU^Y]ù]€úÀÇàYàù]€óŸ[òXõY
+õXZ[ó‹Ÿ][ô‹»äNÇàõ›‹Àò\[ô
+»∏¶¶{Ó#»Ÿ][ô‹»óJBàõ›‹Àò\[ô
+»∏ßcÿ[òŸ[óJBàô]\õàô\RŸ^Xõÿ\ôX\ö›\
+õ›‹Àô\⁄^ôW⁄Ÿ^Xõÿ\ôUùYJBÇÇôYàŸ[ô\ò]YŸÿ›[Y[ù⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸK⁄[ôSõ€ôJNÇàõ›‹»H◊BàYà⁄[ôOH	‹X⁄ÿYŸIŒÇà»åMMéàô\›‹ôHHõ›ô[à›\àö[ù€€ùõ€»\ôX›H[ô\àHãÇà»⁄[ôŸ\»\ôH›YŸYõ›Y⁄H^\›[ô»[Ÿ àÿ[òX⁄‹»[ô\YYûH€ôKÇàYàù]€óŸ[òXõY
+	‹YŸW‹⁄^ôWÿ€€ùõ€… NÇàõ›‹Àò\[ô
+¬à[õ[ôRŸ^Xõÿ\ôù]€ä	¸'‰‰YŸH⁄^ôIÀÿ[òX⁄◊Ÿ]OYâ€[Ÿ‹⁄^ôNû‹ôYô\ô[òŸ_I Kà[õ[ôRŸ^Xõÿ\ôù]€ä	¸'ÈÔàõ€›\âÀÿ[òX⁄◊Ÿ]OYâ€[ŸŸõ€›\ó€Y[ùNû‹ôYô\ô[òŸ_I BàJBàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¯¶®H]]»⁄^ôIÀÿ[òX⁄◊Ÿ]OYâÿ]]Ÿö]û‹ôYô\ô[òŸ_I WJBàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'„ËàåêâÀÿ[òX⁄◊Ÿ]OYâ€[Ÿÿåòéû‹ôYô\ô[òŸ_I WJBàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¯ß!H€ôH8†(àXZŸHYÿZ[âÀÿ[òX⁄◊Ÿ]OYâ€[ŸŸ€ôNû‹ôYô\ô[òŸ_I WJBàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'ÊË;Ó#»[ŸYûH	àôYŸ[ô\ò]IÀÿ[òX⁄◊Ÿ]OYâ€[ŸYûNû‹ôYô\ô[òŸ_I WJBà[Yà⁄[ô[à
+	ŸõY⁄	À	ÿù\…À	⁄›[	 NÇàYàù]€óŸ[òXõY
+	€XZŸWÿ⁄[ôŸ\… NÇàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'„¶{Ó#»õ⁄XŸH»^Y]	Àÿ[òX⁄◊Ÿ]OYâ›õ⁄XŸWŸY]û‹ôYô\ô[òŸ_I WJBàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¯¶®H]ZX⁄»]]»ö]	Àÿ[òX⁄◊Ÿ]OYâÿ]]Ÿö]û‹ôYô\ô[òŸ_I WJBàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'ÊË;Ó#»[ŸYûH	àôYŸ[ô\ò]IÀÿ[òX⁄◊Ÿ]OYâ€[ŸYûNû‹ôYô\ô[òŸ_I WJBà[ŸNÇàYàù]€óŸ[òXõY
+	€XZŸWÿ⁄[ôŸ\… NÇàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'È%à€X\ùXZŸH⁄[ôŸ\…Àÿ[òX⁄◊Ÿ]OYâŸY]ŸŸ[ô\ò]Yû‹ôYô\ô[òŸ_I WJBàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'ÊË;Ó#»[ŸYûH	àôYŸ[ô\ò]IÀÿ[òX⁄◊Ÿ]OYâ€[ŸYûNû‹ôYô\ô[òŸ_I WJBàô]\õà[õ[ôRŸ^Xõÿ\ôX\ö›\
+õ›‹ BÇôYàôXYW⁄Ÿ^Xõÿ\ô
+
+NÇàô]\õàXZ[ó⁄Ÿ^Xõÿ\ô
+
+BÇÇÇôYàŸ\‹^WŸö[[ò[YJò[YKX^€[èMäNÇàò[YHH›äò[YH‹àëÿ›[Y[ùäBàYà[äò[YJHHX^€[éÇàô]\õàò[YBàô]\õàò[YVŒõX^€[ãL◊H
+»ãããàÇÇÇôYà‹ôX€‹ôÿÿ\[€äôYô\ô[òŸKôYö^^òOHàäNÇà»åMåàôYô\ô[òŸHQ»›^H[ù\õò[àH›€ô\àY]»Hÿ›[Y[ùúõ€HBà»ù]€ú»]X⁄Y»]ã€»\ôH\»õ»ôYY»^‹ŸHUû[à⁄]Çà^H›äôYö^‹ààäBàYà^òNÇà^
+œHàóûŸ^ò_HÇàô]\õà^ÇÇà»KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBà»Y\]ôHö[ùŸY]€€ùõ€¬à»KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBîQ—W‘“VëW”‘S”î»H
+êMHãêMãì]\àãìYÿ[ãêL»äBÇôYà€õ‹õX[^ôW‹YŸW‹⁄^ôJò[YJNÇàò]»HôKú›Xäàñ◊òK^åNWHãàã›äò[YH‹ààäKõ›Ÿ\ä
+JBà[X\Ÿ\»H¬àòMHéàêMHãòMéàêMãòL»éàêL»ãàõ]\àéàì]\àãù\€]\àéàì]\àãàõYÿ[éàìYÿ[ãù\€Yÿ[éàìYÿ[ãàò]]»éàò]]»ãò]]€X]X»éàò]]»ãàBàô]\õà[X\Ÿ\ÀôŸ]
+ò]ÀàäBÇôYà⁄›[Ÿ]W›ò[YJò[YJNÇàò]œ\ôKú›Xäâ ⁄JJ
+J›ôô
+WâÀâ◊IÀ›äò[YH‹à	… JBàò]œ\ôKú›Xäâ÷ÀIÀ	»	Àò] Bàò]œ\ôKú›Xäâ◊ …À	»	Àò] Kú›ö\
+
+Bàõ‹õX]œJà	…Y	Xà	VIÀ	…Y	Pà	VIÀ	…VKI[KIY	À	…YI[KIVIÀ	…Y…[K…VIÀà	…Y	Xà	^IÀ	…Y	Pà	^IÀ	…YIXãIVIÀ	…YIPãIVI¬à
+Bà»^òX›H]H⁄Ÿ[àúõ€HXô[À›[Y\»\õ›[ô]Çàÿ[ôY]\œV‹ò]◊BàO\ôKúŸX\ò⁄
+â ⁄JWäÃKüW ÷–KVòK^ó^ÃÀ_W ◊ÃãJWâÀò] BàYàNàÿ[ôY]\Àö[úŸ\ù
+Kô‹õ›\
+JJBàO\ôKúŸX\ò⁄
+â◊äÕKWÃKüKWÃKüJWâÀò] BàYàNàÿ[ôY]\Àö[úŸ\ù
+Kô‹õ›\
+JJBàO\ôKúŸX\ò⁄
+â◊äÃKüVÀÀWWÃKüVÀÀWWÃãJWâÀò] BàYàNàÿ[ôY]\Àö[úŸ\ù
+Kô‹õ›\
+JJBàõ‹àÿ[ô[àÿ[ôY]\ŒÇàõ‹àõ][àõ‹õX]ŒÇàûNàô]\õà]][YKú›ú[YJÿ[ôõ]
+Bà^Ÿ\^Ÿ\[€éà\‹¬àô]\õàõ€ôBÇÇôYà⁄›[€öY⁄ÿ€›[ù
+]K^X⁄]Sõ€ôJNÇàYà^X⁄]ÇàûNÇàèZ[ù
+õÿ]
+^X⁄]
+JBàYàèåàô]\õàÇà^Ÿ\^Ÿ\[€éà\‹¬àò]œ\›ä
+]H‹àﬂJKôŸ]
+	€öY⁄… H‹à	… BàO\ôKúŸX\ò⁄
+â 
+ IÀò] BàYàH[ô[ù
+Kô‹õ›\
+JJOåÇàô]\õà[ù
+Kô‹õ›\
+JJBà⁄OW⁄›[Ÿ]W›ò[YJ
+]H‹àﬂJKôŸ]
+	ÿ⁄X⁄◊⁄[â JBà€œW⁄›[Ÿ]W›ò[YJ
+]H‹àﬂJKôŸ]
+	ÿ⁄X⁄◊€›]	 JBàYà⁄H[ô€ŒÇà^\œJ€ÀX⁄JKô^\¬àYà^\œåàô]\õà^\¬àô]\õàÇÇôYà⁄›[‹õ€€Wÿ€›[ù
+]K^X⁄]Sõ€ôJNÇàYà^X⁄]ÇàûNÇàèZ[ù
+õÿ]
+^X⁄]
+JBàYàèåàô]\õàÇà^Ÿ\^Ÿ\[€éà\‹¬àûNÇàèZ[ù
+õÿ]
+
+]H‹àﬂJKôŸ]
+	‹õ€€Wÿ€›[ù	 H‹à
+JBàYàèåàô]\õàÇà^Ÿ\^Ÿ\[€éà\‹¬àò]œI»	Àöõ⁄[ä›ä
+]H‹àﬂJKôŸ]
+ H‹à	… Hõ‹à»[à
+	‹õ€€W›\IÀ	€ÿÿ›\[òﬁW‹›[[X\ûI JBàO\ôKúŸX\ò⁄
+â ⁄JWä
+ W äŒúõ€€_õ€€\ WâÀò] Bàô]\õà[ù
+Kô‹õ›\
+JJHYàH[ŸHBÇÇôYà⁄›[Ÿ^òWÿôYÿ€›[ù
+]K^X⁄]Sõ€ôJNÇàYà^X⁄]\»õ›õ€ôNÇàûNÇàèZ[ù
+õÿ]
+^X⁄]
+JBàYàèèLàô]\õàÇà^Ÿ\^Ÿ\[€éà\‹¬àûNÇàèZ[ù
+õÿ]
+
+]H‹àﬂJKôŸ]
+	Ÿ^òWÿôYÿ€›[ù	 H‹à
+JBàYàèèL[ôèåàô]\õàÇà^Ÿ\^Ÿ\[€éà\‹¬àò]œI»	Àöõ⁄[ä›ä
+]H‹àﬂJKôŸ]
+ H‹à	… Hõ‹à»[à
+	‹õ€€W›\IÀ	€ÿÿ›\[òﬁW‹›[[X\ûI JBà»›\Y\àõ›X⁄\ú»Ÿù[àÿ[ÿÿ›\[ù»Xõ›ôHHõ‹õX[õ€€Hÿ\X⁄]Bà»ô^òH\ú€€ú»à[ú›XYŸà^X⁄]H‹ö][ô»ô^òHôY»ãàõ‹à›[à»›\›€Y\à€‹›[ô»‹ŸH\ôHH⁄\ôŸXXõHPà[ö]ÀÇàO\ôKúŸX\ò⁄
+â ⁄JWäŒö[ò€Y\œ◊ äO 
+ W äŒô^òW äŒòôYœﬂX]ô\‹Ÿ\œﬂ\ú€€úœﬂ^
+_XäWâÀò] Bàô]\õà[ù
+Kô‹õ›\
+JJHYàH[ŸHÇÇôYà‹\úŸW⁄›[ÿ€‹›⁄[ú]
+ò[YK›\Y\ó››[L]OSõ€ôJNÇàààìò]\ò[›[€‹›[ô»⁄]õ€€K€öY⁄[ôPã€öY⁄ÿ[›[][€ãàààÇàò]œ\›äò[YH‹à	… Kú›ö\
+
+Kúô\XŸJ	¯†ÆIÀ	»	 Kúô\XŸJ	À	À	… Bà›œ\ôKú›Xäâ◊ …À	»	Àò]Àõ›Ÿ\ä
+JKú›ö\
+
+BàYàõ››ŒÇàòZ\ŸHò[YQ\úõ‹ä	’‹ö]HHõ€€K€öY⁄ò]KPã€öY⁄ò]K‹àö[ò[›[›[ò]\ò[Kâ BÇàYà[[›[ù
+]\õú NÇàõ‹à][à]\õúŒÇàO\ôKúŸX\ò⁄
+]›ÀôKíJBàYàNàô]\õàõÿ]
+Kô‹õ›\
+JJBàô]\õàõ€ôBÇà^X⁄]€öY⁄œX[[›[ù
+‹â◊ä
+ W õöY⁄œ◊â◊JBà^X⁄]‹õ€€\œX[[›[ù
+‹â◊ä
+ W úõ€€\œ◊â◊JBà»ŸY\Pà]X[ù]HŸ\\ò]Húõ€H]»ò]Kà[àúõ€€HXàMLãà»\»Hõ€€Hò]x†%õ›^òHôYÀÇà^X⁄]ŸXóÿ€›[ùX[[›[ù
+¬àâ◊äŒôXü^òW äŒòôYôYﬂX]ô\‹ﬂX]ô\‹Ÿ\ JW äŒò€›[ù]_]X[ù]JWñ◊åNW^ÃJ
+ IÀàâ◊ä
+ W ô^òW äŒòôYﬂX]ô\‹Ÿ\ WâÀàâ◊ä
+ W ôXúœ◊ äŒê
+WâÀàJBÇàöY⁄œW⁄›[€öY⁄ÿ€›[ù
+]K^X⁄]€öY⁄ Bàõ€€\œW⁄›[‹õ€€Wÿ€›[ù
+]K^X⁄]‹õ€€\ Bà^òWÿôYœW⁄›[Ÿ^òWÿôYÿ€›[ù
+]K^X⁄]ŸXóÿ€›[ù
+BÇàö[ò[››[X[[›[ù
+¬àâ◊äŒõXZŸW  Œö]  O››[Ÿ]  ŒùW  O››[ö[ò[ äŒö›[ äO Œò€‹››[[[›[ù
+_‹ò[ô ù›[›[ äŒö›[ äO Œò€‹›[[›[ù
+O Wñ◊åNW^ÃåJÃNWJ ŒóñÃNWJ O IÀàâ ÃNWJ ŒóñÃNWJ O W äŒôö[ò[‹ò[ô ù›[›[
+WâÀàJBÇà»X\ö›\[ô›XYŸH\»]X›YôYõ‹ôH\ôX›ò]H\ú⁄[ôÀÇàX\ö›\›€‹ôXõ€€
+ôKúŸX\ò⁄
+â ⁄JWó ñ ÀW_äŒòYX\ö›\X\ö◊ ù\[ò‹ôX\Ÿ_\ﬂôYXŸ_\‹ﬂZ[ù\ﬂYX›
+WâÀ› JBàX\ö›\ÿ[[›[ùX[[›[ù
+‹â ⁄JJŒóó ñ ÀWW üäŒòYX\ö›\X\ö◊ ù\[ò‹ôX\Ÿ_\ﬂôYXŸ_\‹ﬂZ[ù\ﬂYX›
+Wñ◊åNW^ÃM_JJÃNWJ ŒóñÃNWJ O I◊JBàZ[ù\œXõ€€
+ôKúŸX\ò⁄
+â ⁄JWó ã_äŒúôYXŸ_\‹ﬂZ[ù\ﬂYX›
+WâÀ› JBà\ó‹õ€€W€öY⁄Xõ€€
+ôKúŸX\ò⁄
+â ⁄JWäŒú\ó úõ€€W äŒú\ü O◊ õöY⁄õ€€W ã◊ õöY⁄\ó õöY⁄ ú\ó úõ€€JWâÀ› JBÇà^\›[ôœJ]H‹àﬂJKôŸ]
+	ÿ›\›€Y\ó⁄›[ÿ€‹›	 H‹àﬂBÇàò]W‹ÿ€‹OI‹õ€€I¬àYàX\ö›\›€‹ô[ôX\ö›\ÿ[[›[ù\»õ›õ€ôNÇàYà\ó‹õ€€W€öY⁄ÇàYàöY⁄œLÇàòZ\ŸHò[YQ\úõ‹ä	“H€›[õ›]\õZ[ôHHù[Xô\àŸàöY⁄»úõ€H⁄X⁄ÀZ[ãÿ⁄X⁄À[›]à[ò€YHHöY⁄»‹à[ù\àHö[ò[›[â Bàò\ŸW‹ò]OYõÿ]
+^\›[ôÀôŸ]
+	‹õ€€W‹ò]W‹\ó€öY⁄	 H‹à^\›[ôÀôŸ]
+	‹\ó‹õ€€I H‹à
+BàYàò\ŸW‹ò]OL[ôõÿ]
+›\Y\ó››[‹à
+OåÇàò\ŸW‹ò]OYõÿ]
+›\Y\ó››[
+K X^
+Kõ€€\ JõöY⁄ BàYàò\ŸW‹ò]OLÇàòZ\ŸHò[YQ\úõ‹ä	‘\ã\õ€€K€öY⁄X\ö›\ôYY»[à^\›[ô»›\Y\ãÿ›\›€Y\àò\ŸKà[ù\àHô]»õ€€Hò]H\ôX›H[ú›XYâ Bàõ€€W‹ò]OXò\ŸW‹ò]K[X\ö›\ÿ[[›[ùYàZ[ù\»[ŸHò\ŸW‹ò]J€X\ö›\ÿ[[›[ùàXó‹ò]OYõÿ]
+^\›[ôÀôŸ]
+	ŸXó‹ò]W‹\ó€öY⁄	 H‹à^\›[ôÀôŸ]
+	ŸXâ H‹à
+Bà[ŸNÇàò\ŸOYõÿ]
+^\›[ôÀôŸ]
+	››[	 H‹à›\Y\ó››[‹à
+BàYàò\ŸOLÇàòZ\ŸHò[YQ\úõ‹ä	–H›[X\ö›\ôYY»[à^\›[ô»›[à[ù\àHö[ò[›[\ôX›Kâ Bà›[Xò\ŸK[X\ö›\ÿ[[›[ùYàZ[ù\»[ŸHò\ŸJ€X\ö›\ÿ[[›[ùàô]\õà¬à	‹\ó‹õ€€IŒìõ€ôK	ŸXâŒìõ€ôK	‹õ€€W‹ò]W‹\ó€öY⁄	Œìõ€ôK	ŸXó‹ò]W‹\ó€öY⁄	Œìõ€ôKà	‹õ€€\…Œúõ€€\À	€öY⁄…ŒõöY⁄À	Ÿ^òWÿôY…Œô^òWÿôYÀà	‹õ€€W››[	Œìõ€ôK	ŸXó››[	Œìõ€ôK	››[	Œù›[	ÿ›\úô[òﬁIŒâ“SîâÀ	€[ŸIŒâŸ\ôX›››[	¬àBà[ŸNÇàõ€€W‹ò]OX[[›[ù
+¬àâ◊äŒúõ€€W äŒúò]_€‹›öXŸJOﬂ\ó úõ€€JWñ◊åNW^ÃåJÃNWJ ŒóñÃNWJ O IÀàâ ÃNWJ ŒóñÃNWJ O W äŒú\ó äO‹õ€€JŒó äŒú\ü W õöY⁄
+O◊âÀàâ ÃNWJ ŒóñÃNWJ O W äŒúõ€€W ã◊ õöY⁄
+WâÀàJBà»HZ[àöY⁄H[[›[ùYX[ú»H€€\]H›[õ€⁄⁄[ô»\àöY⁄à]à»\»][\YYûHöY⁄»€õN»[à^X⁄]ú\àõ€€Hàò]H€€ù[ùY\¬à»»][\HûHõ€€\»\»ôYõ‹ôKÇàYàõ€€W‹ò]H\»õ€ôNÇàõ€€W‹ò]OX[[›[ù
+¬àâ ÃNWJ ŒóñÃNWJ O W äŒãﬂ\üõ‹äW õöY⁄âÀàâ◊äŒôõ‹ü\äW äŒôXX⁄ äO€öY⁄ñ◊åNW^ÃåJÃNWJ ŒóñÃNWJ O IÀàâ◊õöY⁄
+ŒõJO◊ äŒúò]_€‹›[[›[ùöXŸJO◊ñ◊åNW^ÃåJÃNWJ ŒóñÃNWJ O IÀàJBàYàõ€€W‹ò]H\»õ›õ€ôNàò]W‹ÿ€‹OI⁄›[	¬àXó‹ò]OX[[›[ù
+¬àâ◊äŒôXü^òW äŒòôYX]ô\‹ JJŒó äŒúò]_€‹›öXŸJJO◊ñ◊åNW^ÃåJÃNWJ ŒóñÃNWJ O IÀàâ ÃNWJ ŒóñÃNWJ O W äŒú\ó äO ŒôXü^òW äŒòôYX]ô\‹ JJŒó äŒú\ü W õöY⁄
+O◊âÀàJBÇà»[à^X⁄]ö[ò[›[⁄[ú»⁄[àõ»\ã[öY⁄ò]H\»ôZ[ô»›\YYÇàYàö[ò[››[\»õ›õ€ôH[ôõ€€W‹ò]H\»õ€ôH[ôXó‹ò]H\»õ€ôH[ôõ›X\ö›\›€‹ôÇàô]\õà¬à	‹\ó‹õ€€IŒìõ€ôK	ŸXâŒìõ€ôK	‹õ€€W‹ò]W‹\ó€öY⁄	Œìõ€ôK	ŸXó‹ò]W‹\ó€öY⁄	Œìõ€ôKà	‹õ€€\…Œúõ€€\À	€öY⁄…ŒõöY⁄À	Ÿ^òWÿôY…Œô^òWÿôYÀà	‹õ€€W››[	Œìõ€ôK	ŸXó››[	Œìõ€ôK	››[	Œôö[ò[››[	ÿ›\úô[òﬁIŒâ“SîâÀ	€[ŸIŒâŸ\ôX›››[	¬àBÇà»Z[àù[Xô\àHö[ò[›[ŸY\[ô»H€X\ﬁHôZ]ö[‹ãÇàYàõ€€W‹ò]H\»õ€ôH[ôXó‹ò]H\»õ€ôNÇàù[\œ\ôKôö[ô[
+â ÃNWJ ŒóñÃNWJ O IÀ› BàYà[äù[\ OOLH[ôõ›ôKúŸX\ò⁄
+â ⁄JWäŒúõ€€_öY⁄Xü^òW òôY
+WâÀ› NÇà›[Yõÿ]
+ù[\÷ÃJBàô]\õà¬à	‹\ó‹õ€€IŒìõ€ôK	ŸXâŒìõ€ôK	‹õ€€W‹ò]W‹\ó€öY⁄	Œìõ€ôK	ŸXó‹ò]W‹\ó€öY⁄	Œìõ€ôKà	‹õ€€\…Œúõ€€\À	€öY⁄…ŒõöY⁄À	Ÿ^òWÿôY…Œô^òWÿôYÀà	‹õ€€W››[	Œìõ€ôK	ŸXó››[	Œìõ€ôK	››[	Œù›[	ÿ›\úô[òﬁIŒâ“SîâÀ	€[ŸIŒâŸ\ôX›››[	¬àBàòZ\ŸHò[YQ\úõ‹ä	“H€›[õ›[ô\ú›[ôH›[ò]Kà^[\NàÕL\àõ€€H\àöY⁄PàLå\àöY⁄‹à›[çLâ BÇàYàöY⁄œLÇàòZ\ŸHò[YQ\úõ‹ä	“H€›[õ›]\õZ[ôHöY⁄»úõ€HH›[⁄X⁄ÀZ[ãÿ⁄X⁄À[›]àYHù[Xô\àŸàöY⁄»‹à[ù\àHö[ò[›[â Bàõ€€\œ[X^
+Kõ€€\ BàYàXó‹ò]H\»õ›õ€ôH[ô^òWÿôYœLÇà^òWÿôYœLBÇàö[Y‹õ€€\œLHYàò]W‹ÿ€‹OOI⁄›[	»[ŸHõ€€\¬àõ€€W››[Jõÿ]
+õ€€W‹ò]H‹à
+Jòö[Y‹õ€€\ õöY⁄ BàXó››[Jõÿ]
+Xó‹ò]H‹à
+Jô^òWÿôY õöY⁄ Bà›[\õ€€W››[
+ŸXó››[àô]\õà¬à	‹\ó‹õ€€IŒúõ€€W‹ò]K	ŸXâŒôXó‹ò]Kà	‹õ€€W‹ò]W‹\ó€öY⁄	Œúõ€€W‹ò]K	ŸXó‹ò]W‹\ó€öY⁄	ŒôXó‹ò]Kà	‹õ€€\…Œòö[Y‹õ€€\À	‹€›\òŸW‹õ€€\…Œúõ€€\À	€öY⁄…ŒõöY⁄À	Ÿ^òWÿôY…Œô^òWÿôYÀà	‹õ€€W››[	Œúõ€€W››[	ŸXó››[	ŒôXó››[	››[	Œù›[à	ÿ›\úô[òﬁIŒâ“SîâÀ	€[ŸIŒâÿÿ[›[]Y	À	‹ò]W‹ÿ€‹IŒúò]W‹ÿ€‹BàBÇÇôYà⁄›[ÿ€‹›ÿ€€ôö\õX][€ä€‹›
+NÇàœX€‹›‹àﬂBà›[Yõÿ]
+ÀôŸ]
+	››[	 H‹à
+BàYàÀôŸ]
+	€[ŸI OOIŸ\ôX›››[	»‹àÀôŸ]
+	‹õ€€W‹ò]W‹\ó€öY⁄	 H\»õ€ôNÇàô]\õàà∏ß!H
+í›[€‹›[ô\ú›€Ÿäàö[ò[›[›[€‹›8°§à
+íSîà››[ãåüJàÇàõ€€\œZ[ù
+ÀôŸ]
+	‹õ€€\… H‹àJN»öY⁄œZ[ù
+ÀôŸ]
+	€öY⁄… H‹à
+Bàõ€€W‹ò]OYõÿ]
+ÀôŸ]
+	‹õ€€W‹ò]W‹\ó€öY⁄	 H‹à
+N»õ€€W››[Yõÿ]
+ÀôŸ]
+	‹õ€€W››[	 H‹à
+Bàò]W€Xô[I“›[»öY⁄	»YàÀôŸ]
+	‹ò]W‹ÿ€‹I OOI⁄›[	»[ŸH	‘õ€€I¬à[ô\œV¬à∏ß!H
+í›[€‹›[ô\ú›€Ÿäàãà
+àû‹ò]W€Xô[NàSîà‹õ€€W‹ò]NãåüH0Â»€öY⁄ﬂHöY⁄
+ HH
+íSîà‹õ€€W››[ãåüJàÇàYàÀôŸ]
+	‹ò]W‹ÿ€‹I OOI⁄›[	»[ŸBààû‹ò]W€Xô[NàSîà‹õ€€W‹ò]NãåüH0Â»‹õ€€\ﬂHõ€€J H0Â»€öY⁄ﬂHöY⁄
+ HH
+íSîà‹õ€€W››[ãåüJàäKàBàYàõÿ]
+ÀôŸ]
+	ŸXó‹ò]W‹\ó€öY⁄	 H‹à
+OåÇàXó‹ò]OYõÿ]
+ÀôŸ]
+	ŸXó‹ò]W‹\ó€öY⁄	 H‹à
+N»Xóÿ€›[ùZ[ù
+ÀôŸ]
+	Ÿ^òWÿôY… H‹à
+N»Xó››[Yõÿ]
+ÀôŸ]
+	ŸXó››[	 H‹à
+Bà[ô\Àò\[ô
+àë^òHôYàSîàŸXó‹ò]NãåüH0Â»ŸXóÿ€›[ùHPà0Â»€öY⁄ﬂHöY⁄
+ HH
+íSîàŸXó››[ãåüJàäBà[ô\Àò\[ô
+àäï›[›[€‹›àSîà››[ãåüJàäBàô]\õàóàãöõ⁄[ä[ô\ BÇÇò\ﬁ[ò»Yàÿ\W‹[ô[ô◊Ÿò\ôW⁄[ú]
+Y\‹ÿYŸK€€ù^⁄[ô[ú›ùX›[€äNÇàààê\H€ôHZ\ã–ù\À“›[Y€‹›ô\Húõ€HZ]\à^‹àõ⁄XŸKàààÇàYà⁄[ôõ›[à
+	ŸõY⁄	À	ÿù\…À	⁄›[	 NÇàô]\õàò[ŸBàÿÿ[òŸ[ÿ]]◊‹ö[ù
+€€ù^
+Bà]W⁄Ÿ^OYâ‹[ô[ô◊ﬁ⁄⁄[ôWŸ]I¬àYàõ›€€ù^ù\Ÿ\óŸ]KôŸ]
+]W⁄Ÿ^JNÇà€€ù^ù\Ÿ\óŸ]Kú‹
+	‹[ô[ô◊Ÿò\ôW⁄⁄[ô	Àõ€ôJBà]ÿZ]Y\‹ÿYŸKúô\W›^
+àâ¯ßcH⁄⁄[ôù]J
+_H€‹›Ÿ\‹⁄[€à^\ôYà‹[à⁄⁄[ôù]J
+_Hö[ù[ôŸ[ôH›\Y\àö[HYÿZ[ãâÀàô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+Kà
+Bàô]\õàùYBà›\Y\ó››[Yõÿ]
+€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊Ÿò\ôW‹›\Y\ó››[	À
+H‹à
+BàûNÇàYà⁄[ôOI⁄›[	ŒÇà]OX€‹KôY\€‹J€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊⁄›[Ÿ]I H‹àﬂJBà›[ÿ€‹›W‹\úŸW⁄›[ÿ€‹›⁄[ú]
+[ú›ùX›[€ã›\Y\ó››[]JBà]V…ÿ›\›€Y\ó⁄›[ÿ€‹›	◊OZ›[ÿ€‹›à€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊⁄›[Ÿ]I◊OZ]Bàò\ôOYõÿ]
+›[ÿ€‹›ôŸ]
+	››[	 H‹à
+H‹àõ€ôBà[ŸNÇà€›\òŸWŸ]OX€€ù^ù\Ÿ\óŸ]KôŸ]
+]W⁄Ÿ^JH‹àﬂBà[ò€YW⁄[ôò[ùœWŸò\ôW⁄[ò€YW⁄[ôò[ù [ú›ùX›[€äBà^ÿ€›[ùWŸò\ôW‹^ÿ€›[ù
+€›\òŸWŸ]K[ò€YW⁄[ôò[ùœZ[ò€YW⁄[ôò[ù Bàò\ôOW‹\úŸW€X\ö›\⁄[ú]
+[ú›ùX›[€ã›\Y\ó››[^ÿ€›[ù
+Bà^Ÿ\ò[YQ\úõ‹à\»^ŒÇà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊Ÿò\ôW⁄⁄[ô	◊OZ⁄[ôà[ùJ	ÿÕL\àöY⁄õ€€Hå[ôPàLå\àöY⁄‹à›[çL	¬àYà⁄[ôOI⁄›[	»[ŸH	ÿÕåMH
+Õ»‹àéLÕH›[	 Bà]ÿZ]Y\‹ÿYŸKúô\W›^
+â¯ßcŸ^ﬂWóë^[\\Œà⁄[ùIÀ\úŸW€[ŸOI”X\öŸ›€â Bàô]\õàùYBÇà€€ù^ù\Ÿ\óŸ]Kú‹
+	‹[ô[ô◊Ÿò\ôW⁄⁄[ô	Àõ€ôJBà€€ù^ù\Ÿ\óŸ]VŸâ‹[ô[ô◊ﬁ⁄⁄[ôWŸò\ôI◊OYò\ôBàYà⁄[ô[à
+	ŸõY⁄	À	ÿù\… NÇà]ÿZ]Y\‹ÿYŸKúô\W›^
+Ÿò\ôWÿ€‹›ÿ€€ôö\õX][€ä[ú›ùX›[€ã›\Y\ó››[ò\ôK^ÿ€›[ù
+K\úŸW€[ŸOI”X\öŸ›€â Bà[ŸNÇà]ÿZ]Y\‹ÿYŸKúô\W›^
+⁄›[ÿ€‹›ÿ€€ôö\õX][€ä›[ÿ€‹›
+K\úŸW€[ŸOI”X\öŸ›€â BàûNÇà]ÿZ]\⁄◊Ÿõ€›\óÿ⁄⁄XŸJY\‹ÿYŸK€€ù^⁄[ô
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä	‘àŸ[ô\ò][€àúõ€HY€‹›òZ[Y	 Bà]ÿZ]Y\‹ÿYŸKúô\W›^
+àâ¯ßcàŸ[ô\ò][€àòZ[YóóîôX\€€éà‹›ä^ VŒé_X	Àà\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+Kà
+Bàô]\õàùYBÇÇÇôYà‹\úŸW€X\ö›\⁄[ú]
+ò[YK›\Y\ó››[L^ÿ€›[ùLJNÇàààìò]\ò[Z\ã–ù\»›\›€Y\ãYò\ôH\úŸ\ãÇÇà’”ëTàïSHì‘àTãTVSîUÇà›\Y\àH›\Y\à›[»[Y⁄XõH^ÇàÕåMH»ÕåMH\à^»ÕåMH\à\ú€€ò»ÕåMHXX⁄àOà\⁄\ôY—SSë»ò\ôH\à^⁄[àH[[›[ù\»]ÿXõ›ôH›\Y\ààOàö[ò[›[HŸ[[ô»0Â»[Y⁄XõH^Çà»⁄]õ»ôYö^⁄[à»\»ô[›»›\Y\ààOà€X\ù[ù\úô]][€àHX\ö›\Sîà»\à[Y⁄XõH^Çà
+Õ»»X\ö›\»»Y»\à^àOà^X⁄]X\ö›\\à[Y⁄XõH^ÇàLå»ôYXŸHå\à^àOà^X⁄]ôYX›[€à\à[Y⁄XõH^ÇàéLÕH›[»Z[àéLÕXàOàö[ò[õ€⁄⁄[ô»›[àààÇàò]»H›äò[YH‹ààäKú›ö\
+
+Kúô\XŸJããàäBà›»Hò]Àõ›Ÿ\ä
+Kúô\XŸJ∏†ÆHãàäBà›»HôKú›Xäàä⁄JWäŒö[úüú◊è Wàãàã› BàYàõ››Àú›ö\
+
+NÇàòZ\ŸHò[YQ\úõ‹äï‹ö]HHö[ò[›[‹à\ã\^Ÿ[[ô»ò\ôHò]\ò[KàäBÇàù[Xô\ú»HôKôö[ô[
+àäœV–KVòK^óJJÃNWJ ŒóñÃNWJ O Hã› BàYàõ›ù[Xô\úŒÇàòZ\ŸHò[YQ\úõ‹äíH€›[õ›ö[ô[à[[›[ù[à]ô\KàäBà[[›[ùHõÿ]
+ù[Xô\ú÷ÃJBÇà^ÿ€›[ùHX^
+K[ù
+^ÿ€›[ù‹àJJBà\ó‹\ú€€àHõ€€
+ôKúŸX\ò⁄
+àä⁄JJŒóú\ó äŒú\ú€€ü^\‹Ÿ[ôŸ\äWüôXX⁄ü
+œV–KVòK^óJ\äHã› JBàZ[ù\»Hõ€€
+ôKúŸX\ò⁄
+àä⁄JWó ã_äŒúôYXŸ_\‹ﬂZ[ù\ﬂYX›\ÿ€›[ù
+Wàã› JBà\»Hõ€€
+ôKúŸX\ò⁄
+àä⁄JWó ó
+ﬂäŒòY\ﬂ[ò‹ôX\Ÿ_X\ö›\X\ö◊ ù\
+Wàã› JBà^X⁄]‹Ÿ[[ô»Hõ€€
+ôKúŸX\ò⁄
+ààä⁄JWäŒúŸ[
+Œö[ô Oﬂ›\›€Y\ó äŒôò\ô_ò]_öXŸJ_Çààôö[ò[ äŒôò\ô_ò]_öXŸJ_XZŸW  Œö]  OﬂŸ]  Œö]  O Œù◊  O Wàãà›Àà
+JBàö[ò[⁄[ùHõ€€
+ôKúŸX\ò⁄
+ààä⁄JWäŒôö[ò[ äŒôò\ô_›[[[›[ù
+_›\›€Y\ó äŒôò\ô_›[[[›[ù
+_ÇààõXZŸW  Œö]  O››[Ÿ]  ŒùW  O››[\ôX› ››[›[ ÿ[[›[ù›[ Ÿò\ôJWàãà›Àà
+JBÇàò\ŸHHõÿ]
+›\Y\ó››[‹à
+BÇàYà\ó‹\ú€€éÇàYàò\ŸHHÇàô]\õàõÿ]
+[[›[ù
+à^ÿ€›[ù
+BÇà›\Y\ó‹Hò\ŸH»^ÿ€›[ùÇàYà\»‹àZ[ù\ŒÇà»^X⁄]X\ö›\‹ôYX›[€à[ÿ^\»⁄[úÀÇà[HH[[›[ù
+à^ÿ€›[ùàò\ôHHò\ŸHH[HYàZ[ù\»[ŸHò\ŸH
+»[Bà[Yà^X⁄]‹Ÿ[[ôŒÇà»^X⁄]Hô\]Y\›Y›\›€Y\ã‹Ÿ[[ô»Çàò\ôHH[[›[ù
+à^ÿ€›[ùà[Yà[[›[ùèH›\Y\ó‹Çà»Z[àÕåMH⁄[à›\Y\à\»ÃåLéÇà»›€ô\à\»⁄]ö[ô»H\⁄\ôY›\›€Y\àŸ[[ô»Çàò\ôHH[[›[ù
+à^ÿ€›[ùà[ŸNÇà»€X\ù⁄‹ù[ôàHZ[à[[›[ùX]\öX[Hô[›»›\Y\à\¬à»ôX]Y\»X\ö›\\à^à^[\H›\Y\àÃåLãô\H»Çàò\ôHHò\ŸH
+»
+[[›[ù
+à^ÿ€›[ù
+BÇà[Yà\»‹àZ[ù\ŒÇàYàò\ŸHHÇàòZ\ŸHò[YQ\úõ‹äêHX\ö›\ôYY»[à‹öY⁄[ò[›\Y\àò\ôKà›\ù⁄\ŸH[ù\àHö[ò[›[\ôX›KàäBàò\ôHHò\ŸHH[[›[ùYàZ[ù\»[ŸHò\ŸH
+»[[›[ùÇà[Yàö[ò[⁄[ù‹àôKôù[X]⁄
+ààó äŒ∏†Æ_[úüú◊è O◊ ñÃNWJ ŒóñÃNWJ O◊ äŒù›[ö[ò[
+O◊ àãàò]ÀàôKíKà
+NÇàò\ôHH[[›[ùÇà[ŸNÇà»Z[à[[›[ù⁄]›]\ã\^€X\ö›\€‹ô[ô»Hö[ò[õ€⁄⁄[ô»›[Çàò\ôHH[[›[ùÇàYàò\ôHÇàòZ\ŸHò[YQ\úõ‹äï\]Yò\ôHÿ[õõ›ôHôYÿ]]ôKàäBàô]\õàõÿ]
+ò\ôJBÇÇôYàŸò\ôW‹€[ŸJò[YK›\Y\ó››[^ÿ€›[ù
+NÇàààë\ÿ‹öXôH›»H\ã\^ô\H\»[ù\úô]Yõ‹à€€ôö\õX][€à^àààÇàò]œ\›äò[YH‹ààäKú›ö\
+
+Kúô\XŸJããàäBà›œ\ò]Àõ›Ÿ\ä
+Kúô\XŸJ∏†ÆHãàäBà›œ\ôKú›Xäàä⁄JWäŒö[úüú◊è Wàãàã› Bàù[\œ\ôKôö[ô[
+àäœV–KVòK^óJJÃNWJ ŒóñÃNWJ O Hã› Bà[[›[ùYõÿ]
+ù[\÷ÃJHYàù[\»[ŸHåà^ÿ€›[ù[X^
+K[ù
+^ÿ€›[ù‹àJJBà›\Y\ó››[Yõÿ]
+›\Y\ó››[‹à
+Bà›\Y\ó‹J›\Y\ó››[‹^ÿ€›[ù
+HYà›\Y\ó››[å[ŸHåàZ[ù\œXõ€€
+ôKúŸX\ò⁄
+àä⁄JWó ã_äŒúôYXŸ_\‹ﬂZ[ù\ﬂYX›\ÿ€›[ù
+Wàã› JBà\œXõ€€
+ôKúŸX\ò⁄
+àä⁄JWó ó
+ﬂäŒòY\ﬂ[ò‹ôX\Ÿ_X\ö›\X\ö◊ ù\
+Wàã› JBà^X⁄]‹Ÿ[[ôœXõ€€
+ôKúŸX\ò⁄
+ààä⁄JWäŒúŸ[
+Œö[ô Oﬂ›\›€Y\ó äŒôò\ô_ò]_öXŸJ_Çààôö[ò[ äŒôò\ô_ò]_öXŸJ_XZŸW  Œö]  OﬂŸ]  Œö]  O Œù◊  O Wàãà›Àà
+JBàYàZ[ù\ŒÇàô]\õàúôYXŸHã[[›[ù›\Y\ó‹àYà\ŒÇàô]\õàõX\ö›\ã[[›[ù›\Y\ó‹àYà^X⁄]‹Ÿ[[ô»‹à[[›[ùèH›\Y\ó‹Çàô]\õàúŸ[[ô◊‹ã[[›[ù›\Y\ó‹àô]\õàú€X\ù€X\ö›\ã[[›[ù›\Y\ó‹ÇÇôYàŸò\ôW€ù[Jò[YJNÇàò[YOYõÿ]
+ò[YH‹à
+BàYàXú ò[YK\õ›[ô
+ò[YJJHåNÇàô]\õààû‹õ›[ô
+ò[YJNãåüHÇàô]\õààû›ò[YNãåôüHÇÇôYà⁄\◊⁄[ôò[ù‹\‹Ÿ[ôŸ\ä
+NÇàò]œHàãöõ⁄[ä›ä
+‹àﬂJKôŸ]
+ H‹ààäHõ‹à»[à
+ù\Hãù]Hãõò[YHäJKõ›Ÿ\ä
+Bàô]\õàõ€€
+ôKúŸX\ò⁄
+àóäŒö[ôò[ù[ôüòXûJWàãò] JBÇÇôYàŸò\ôW‹^ÿ€›[ù
+]K[ò€YW⁄[ôò[ùœQò[ŸJNÇàààê€›[ù⁄\ôŸXXõH^õ‹à\ã\\ú€€àò\ô\À€X\ö›\ÀÇÇàûHYò][[ôò[ù“Sëà\‹Ÿ[ôŸ\ú»\ôH^€YYà^H\ôH[ò€YY€õH⁄[ÇàH›€ô\â‹»€‹›ô\H^X⁄]H\⁄‹»»[ò€YH[ôò[ùÀÇàààÇà]OY]H‹àﬂBà\‹Ÿ[ôŸ\úœY]KôŸ]
+ú\‹Ÿ[ôŸ\ú»äH‹à◊Bà€›\òŸW››[Z[ù
+]KôŸ]
+	◊‹€›\òŸW‹\‹Ÿ[ôŸ\óÿ€›[ù	 H‹à
+Bà€›\òŸWÿ⁄\ôŸXXõOZ[ù
+]KôŸ]
+	◊‹€›\òŸWÿ⁄\ôŸXXõW‹\‹Ÿ[ôŸ\óÿ€›[ù	 H‹à
+BàYàõ›\‹Ÿ[ôŸ\úŒÇàô]\õàX^
+K€›\òŸW››[Yà[ò€YW⁄[ôò[ù»[ŸH€›\òŸWÿ⁄\ôŸXXõJBàYà[ò€YW⁄[ôò[ùŒÇàô]\õàX^
+K[ä\‹Ÿ[ôŸ\ú K€›\òŸW››[
+Bà[Y⁄XõOV‹õ‹à[à\‹Ÿ[ôŸ\ú»Yàõ›⁄\◊⁄[ôò[ù‹\‹Ÿ[ôŸ\ä
+WBàô]\õàX^
+K[ä[Y⁄XõJK€›\òŸWÿ⁄\ôŸXXõJBÇÇôYàŸò\ôW⁄[ò€YW⁄[ôò[ù ^
+NÇà›œ\›ä^‹ààäKõ›Ÿ\ä
+Bàô]\õàõ€€
+ôKúŸX\ò⁄
+ààóäŒö[ò€Y_[ò€Y[ôﬂY⁄]
+W  ŒùW  O Œö[ôò[ù[ôò[ùﬂ[ôäWüÇààóäŒö[ôò[ù[ôò[ùﬂ[ôäW  Œò[€ﬂ[ò€YY
+Wàãà›ÀàôKíKà
+JBÇÇôYàŸò\ôWÿ€‹›ÿ€€ôö\õX][€äò[YK›\Y\ó››[ö[ò[Ÿò\ôK^ÿ€›[ù
+NÇàò]œ\›äò[YH‹ààäKú›ö\
+
+Bà›œ\ò]Àõ›Ÿ\ä
+Bàù[\œ\ôKôö[ô[
+àäÃNWJ ŒóñÃNWJ O Hãò]Àúô\XŸJããàäJBà[[›[ùYõÿ]
+ù[\÷ÃJHYàù[\»[ŸHà^ÿ€›[ù[X^
+K[ù
+^ÿ€›[ù‹àJJBà›\Y\ó››[Yõÿ]
+›\Y\ó››[‹à
+Bà\ó‹\ú€€èXõ€€
+ôKúŸX\ò⁄
+àä⁄JJŒóú\ó äŒú\ú€€ü^\‹Ÿ[ôŸ\äWüôXX⁄ü
+œV–KVòK^óJ\äHã› JBàX\ö›\Xõ€€
+ôKúŸX\ò⁄
+àä⁄JWó ñ ÀW_äŒòY\ﬂ[ò‹ôX\Ÿ_X\ö›\X\ö◊ ù\ôYXŸ_\‹ﬂZ[ù\ﬂYX›\ÿ€›[ù
+Wàã› JBÇàYà\ó‹\ú€€à[ôõ››\Y\ó››[Çàô]\õà
+àà∏ß!H
+ê€‹›[ô\ú›€ŸäóàÇààîŸ[[ô»ò\ôHà
+íSîà◊Ÿò\ôW€ù[J[[›[ù
+_JóàÇààë[Y⁄XõH^à
+û‹^ÿ€›[ùJóàÇààëö[ò[›\›€Y\à›[à
+íSîà◊Ÿò\ôW€ù[Jö[ò[Ÿò\ôJ_JóóàÇààïHZ\àö[ù⁄[\›öXù]H\»›[[ù»ò\ŸHò\ôH[ô^\»	àôY\ÀóàÇààí[ôò[ùà
+ë^€YYûHYò][
+àÇà
+BÇàYà\ó‹\ú€€à[ô›\Y\ó››[Çà[ŸK[ù\ôY›\Y\ó‹WŸò\ôW‹€[ŸJò]À›\Y\ó››[^ÿ€›[ù
+BÇàYà[ŸH[à
+úŸ[[ô◊‹ãú€X\ù€X\ö›\ãõX\ö›\ãúôYXŸHäNÇàYà[ŸOOHúŸ[[ô◊‹éÇàŸ[[ô◊‹Y[ù\ôYàX\ö›\‹\Ÿ[[ô◊‹\›\Y\ó‹à[ù\úô]][€èHîŸ[[ô»ò\ôH\à^Çà[Yà[ŸOOHúôYXŸHéÇàX\ö›\‹KY[ù\ôYàŸ[[ô◊‹\›\Y\ó‹Y[ù\ôYà[ù\úô]][€èHî\ã\^ôYX›[€àÇà[ŸNÇàX\ö›\‹Y[ù\ôYàŸ[[ô◊‹\›\Y\ó‹
+Ÿ[ù\ôYà[ù\úô]][€èJàî\ã\^X\ö›\ÇàYà[ŸOOHõX\ö›\Çà[ŸHî€X\ù\ã\^X\ö›\Çà
+BÇàô]\õà
+àà∏ß!H
+ê€‹›[ô\ú›€ŸäóàÇààî›\Y\à›[à
+íSîà◊Ÿò\ôW€ù[J›\Y\ó››[
+_JóàÇààë[Y⁄XõH^à
+û‹^ÿ€›[ùJóàÇààî›\Y\àò\ôHà
+íSîà◊Ÿò\ôW€ù[J›\Y\ó‹
+_JóóàÇààí[ù\úô]][€éà
+û⁄[ù\úô]][€üJóàÇààñ[›\àŸ[[ô»ò\ôHà
+íSîà◊Ÿò\ôW€ù[JŸ[[ô◊‹
+_JóàÇààìX\ö›\à
+íSîà◊Ÿò\ôW€ù[JX\ö›\‹
+_JóóàÇààëö[ò[›\›€Y\à›[à
+íSîà◊Ÿò\ôW€ù[Jö[ò[Ÿò\ôJ_JóàÇààí[ôò[ùà
+ë^€YYûHYò][
+àÇà
+BÇà⁄Y€èH∏¢$ààYàôKúŸX\ò⁄
+àä⁄JWó ã_äŒúôYXŸ_\‹ﬂZ[ù\ﬂYX›\ÿ€›[ù
+Wàã› H[ŸHä»ÇàYàX\ö›\[ô›\Y\ó››[Çàô]\õà
+àà∏ß!H
+ê€‹›[ô\ú›€Ÿäà›\Y\àSîà◊Ÿò\ôW€ù[J›\Y\ó››[
+_H‹⁄Y€üHÇààíSîà◊Ÿò\ôW€ù[J[[›[ù
+_H8°§à
+ëö[ò[Sîà◊Ÿò\ôW€ù[Jö[ò[Ÿò\ôJ_JàÇà
+Bàô]\õàà∏ß!H
+ê€‹›[ô\ú›€Ÿäàö[ò[›\›€Y\àò\ôH8°§à
+íSîà◊Ÿò\ôW€ù[Jö[ò[Ÿò\ôJ_JàÇÇôYà⁄\◊‹^[Y[ù››[€Xô[
+Xô[
+NÇàààïùYHõ‹à›[[X\ûHõ›‹»]]\›õ›ôH€›[ùYYÿZ[à\»⁄\ôŸH€€\€ô[ùÀàààÇà^\ôKú›Xäàó »ãàã›äXô[‹ààäJKú›ö\
+
+Kõ›Ÿ\ä
+BàYàõ›^Çàô]\õàò[ŸBàô]\õàõ€€
+ôKôù[X]⁄
+ààäŒô‹ò[ô ››[‹õ‹‹◊ ››[›[ Ÿò\ô_›[ ÿ[[›[ùÇààòõ€⁄⁄[ô◊ ››[ô]  Œò[[›[ù^XXõJ_[[›[ù  ŒúZY^XXõJ_Çààôö[ò[  Œôò\ô_[[›[ù›[
+_›[ ‹öXŸ_^XXõW ÿ[[›[ù
+Hãà^àôKíKà
+JBÇÇôYà‹›\Y\óÿ€€\€ô[ù››[
+]JNÇàààî›[H\›[ò›õ€ã[ôYÿ]]ôH›\Y\à⁄\ôŸHõ›‹À^€Y[ô»›[[X\ûH›[ÀàààÇà›[Låàõ›[ôQò[ŸBàõ‹à][H[à
+
+]H‹àﬂJKôŸ]
+ú^[Y[ù⁄][\»äH‹à◊JNÇàYàõ›\⁄[ú›[òŸJ][KX›
+NÇà€€ù[ùYBàXô[\›ä][KôŸ]
+õXô[äH‹ààäKú›ö\
+
+BàYàõ›Xô[‹à⁄\◊‹^[Y[ù››[€Xô[
+Xô[
+NÇà€€ù[ùYBàûNÇà[[›[ùYõÿ]
+][KôŸ]
+ò[[›[ùäH‹à
+Bà^Ÿ\^Ÿ\[€éÇà€€ù[ùYBàYà[[›[ùÇà€€ù[ùYBà›[
+œH[[›[ùàõ›[ôUùYBàô]\õà›[Yàõ›[ô[ŸHåÇÇôYà‹›\Y\ó››[
+]JNÇàààîôX€€ò⁄[HH›\Y\à^XXõH›[ôYõ‹ôH›€ô\àX\ö›\\»\YYÇÇàö[‹ö]NÇàHHò[Y‹õ‹‹À‹^XXõH›[\»\ŸY⁄[à]Y‹ôY\»⁄]H⁄\ôŸHõ›‹ÀÇàHYà⁄\ôŸHõ›‹»\ôHX]\öX[HQ“Tà[à‹õ‹‹◊››[‹õ‹‹◊››[\»ôX]Yà\»HòY^òX›[€àôXÿ]\ŸHŸ[ùZ[ôHõ€ã[ôYÿ]]ôH⁄\ôŸHõ›‹»ÿ[õõ›Y\¬à[‹ôH[àH^XXõH[[›[ùàH€€\€ô[ù›[H⁄[úÀÇàHYà‹õ‹‹◊››[\»Y⁄\à[àH€õ›€à€€\€ô[ù›[K‹õ‹‹◊››[ÿ[à›[àôHò[YôXÿ]\ŸH[à€Z]Y›\Y\à⁄\ôŸHX^H^\›ÇàààÇà]OY]H‹àﬂBàûNÇà‹õ‹‹œYõÿ]
+]KôŸ]
+ô‹õ‹‹◊››[ã
+H‹à
+Bà^Ÿ\^Ÿ\[€éÇà‹õ‹‹œLåÇà€€\€ô[ùœW‹›\Y\óÿ€€\€ô[ù››[
+]JBÇà»Yà[ôH][\»^ŸYY‹õ‹‹»ûH[‹ôH[àH[ûH^òX›[€ã‹õ›[ô[ô»€\ò[òŸKà»H‹õ‹‹»öY[\»[ò€€ú⁄\›[ùà\ŸHH€€\]H⁄\ôŸK[[ôH›[KÇàYà€€\€ô[ù»à[ô‹õ‹‹»àÇà€\ò[òŸO[X^
+ãå‹õ‹‹ ååJBàYà€€\€ô[ù»à‹õ‹‹»
+»€\ò[òŸNÇàô]\õà€€\€ô[ù¬àô]\õà‹õ‹‹¬ÇàYà‹õ‹‹»àÇàô]\õà‹õ‹‹¬àYà€€\€ô[ù»àÇàô]\õà€€\€ô[ù¬ÇàûNÇàò\ŸOYõÿ]
+]KôŸ]
+òò\ŸWŸò\ôHã
+H‹à
+Bà^\œYõÿ]
+]KôŸ]
+ù^\»ã
+H‹à
+Bàô]\õàX^
+åò\ŸJ›^\ Bà^Ÿ\^Ÿ\[€éÇàô]\õàåÇôYà‹\úŸW‹ô\Wÿ€€ùõ€ [ú›ùX›[€ã›\úô[ùŸò\ôK]K›\úô[ùŸõ€›\èQò[ŸK›\úô[ù€Ÿ€œUùYK›\úô[ù‹YŸW‹⁄^ôOHò]]»äNÇàààî\úŸH]\õZ[ö\›X»ÿ›[Y[ù€€[X[ô»ôYõ‹ôHöY[\‹X⁄YöX»ÿÿ[Y]ÀàààÇà‹öY⁄[ò[H›ä[ú›ùX›[€à‹ààäKú›ö\
+
+Bà^H‹öY⁄[ò[à›Ÿ\àH^õ›Ÿ\ä
+Bà⁄[ôŸYHò[ŸBà€€ùõ€»H¬àôò\ôHéà›\úô[ùŸò\ôKàôõ€›\àéà›\úô[ùŸõ€›\ãàôõ€›\ó€[ŸHéàô\⁄Y€ààYà›\úô[ùŸõ€›\à[ŸHõõ€ôHãàõŸ€»éà›\úô[ù€Ÿ€ÀàúYŸW‹⁄^ôHéà›\úô[ù‹YŸW‹⁄^ôH‹àò]]»ãàBÇà»õ€›\àà€€[X[ôŒà\ŸHH›\YYò]ô[€€ùX›ÿ\ô\ù€‹öÀÇàYà
+ôKôù[X]⁄
+àó äõ€›\ó åüõ€›\åü\ŸHõ€›\àü\ŸHõ€›\åü€€ùX›ÿ\ô
+W àã›Ÿ\äBà‹àôKúŸX\ò⁄
+àóäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W  Œôõ€›\ó åüõ€›\åü€€ùX›ÿ\ô
+Wàã›Ÿ\äJNÇà€€ùõ€÷»ôõ€›\àóHHùYN»€€ùõ€÷»ôõ€›\ó€[ŸHóHHôõ€›\åàé»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W  Œôõ€›\ó åüõ€›\åü€€ùX›ÿ\ô
+Wàãàã^
+Bà^HôKú›Xäàä⁄JWó äõ€›\ó åüõ€›\åü\ŸHõ€›\àü\ŸHõ€›\åü€€ùX›ÿ\ô
+W âãàã^
+BÇà»€X\ùõ€›\ãŸ\⁄Y€à€€[X[ôÀà\ŸH[ù[ù[€ò[H€‹ö»\»ò]\ò[[[ô›XYŸH⁄‹ù›]¬à»€à[ûHZ\ã–ù\À“›[ôYô\ô[òŸNàô\⁄Y€àà›⁄]⁄\»»Hù[õ€›\à\⁄Y€ã⁄[Bà»ò€€ùX›ò\àà›⁄]⁄\»»H€€\X›€€ùX›ò\ãÇàYà
+ôKôù[X]⁄
+àó äõ€›\ó å_õ€›\å_€\⁄Y€ü\ŸHõ€›\àJW àã›Ÿ\äBà‹àôKúŸX\ò⁄
+àóäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W  Œôõ€›\ó å_õ€›\å_€\⁄Y€äWàã›Ÿ\äJNÇà€€ùõ€÷»ôõ€›\àóHHùYN»€€ùõ€÷»ôõ€›\ó€[ŸHóHHô\⁄Y€àé»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W  Œôõ€›\ó å_õ€›\å_€\⁄Y€äWàãàã^
+Bà^HôKú›Xäàä⁄JWó äõ€›\ó å_õ€›\å_€\⁄Y€ü\ŸHõ€›\àJW âãàã^
+Bà[Yà
+ôKôù[X]⁄
+àó äõ€›\ó åüõ€›\åüô]»\⁄Y€ü\ŸHõ€›\àäW àã›Ÿ\äBà‹àôKúŸX\ò⁄
+àóäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W  Œôõ€›\ó åüõ€›\åüô]»\⁄Y€äWàã›Ÿ\äJNÇà€€ùõ€÷»ôõ€›\àóHHùYN»€€ùõ€÷»ôõ€›\ó€[ŸHóHHôõ€›\åàé»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W  Œôõ€›\ó åüõ€›\åüô]»\⁄Y€äWàãàã^
+Bà^HôKú›Xäàä⁄JWó äõ€›\ó åüõ€›\åüô]»\⁄Y€ü\ŸHõ€›\àäW âãàã^
+Bà[Yà
+ôKôù[X]⁄
+àó ä\⁄Y€ü\ŸH\⁄Y€üõ€›\à\⁄Y€äW àã›Ÿ\äBà‹àôKúŸX\ò⁄
+àóäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W Ÿ\⁄Y€óàã›Ÿ\äJNÇà€€ùõ€÷»ôõ€›\àóHHùYN»€€ùõ€÷»ôõ€›\ó€[ŸHóHHô\⁄Y€àé»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W Ÿ\⁄Y€óàãàã^
+Bà^HôKú›Xäàä⁄JWó ä\⁄Y€ü\ŸH\⁄Y€üõ€›\à\⁄Y€äW âãàã^
+Bà[Yà
+ôKôù[X]⁄
+àó ä€€ùX›ò\üõ€›\àò\ü\ŸH€€ùX›ò\ü\ŸHõ€›\àò\äW àã›Ÿ\äBà‹àôKúŸX\ò⁄
+àóäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W  Œò€€ùX›õ€›\äW ÿò\óàã›Ÿ\äJNÇà€€ùõ€÷»ôõ€›\àóHHùYN»€€ùõ€÷»ôõ€›\ó€[ŸHóHHòò\àé»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒú›⁄]⁄⁄[ôŸ_ô\XŸ_\Ÿ_XZŸJW  Œö]Hõ€›\äW  Œùﬂ\ﬂ⁄]
+W  Œò€€ùX›õ€›\äW ÿò\óàãàã^
+Bà^HôKú›Xäàä⁄JWó ä€€ùX›ò\üõ€›\àò\ü\ŸH€€ùX›ò\ü\ŸHõ€›\àò\äW âãàã^
+BÇà»õ€›\à€€ùõ€Àà›\‹ùYY]€€[X[ôŒÇà»Yõ€›\àò\à»Y€€ùX›ò\Çà»Yõ€›\à\⁄Y€Çà»ô[[›ôHõ€›\à»⁄]›]õ€›\ÇàYàôKúŸX\ò⁄
+àóäŒúô[[›ô_[]_⁄]›]õ W  ŒùW  OŸõ€›\óàã›Ÿ\äH‹àôKúŸX\ò⁄
+àóôõ€›\ó  Œúô[[›ô_ŸôäWàã›Ÿ\äNÇà€€ùõ€÷»ôõ€›\àóHHò[ŸN»€€ùõ€÷»ôõ€›\ó€[ŸHóHHõõ€ôHé»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒúô[[›ô_[]_⁄]›]õ W  ŒùW  OŸõ€›\óàãàã^
+Bà^HôKú›Xäàä⁄JWôõ€›\ó  Œúô[[›ô_ŸôäWàãàã^
+Bà[YàôKúŸX\ò⁄
+àóäŒòY[ò€Y_⁄]]\ŸJW  ŒùW  O Œõ^]›\òò^ò\ó  O Œò€€ùX›  OŸõ€›\ó ÿò\óàã›Ÿ\äH‹àôKúŸX\ò⁄
+àóäŒòY\ŸJW ÿ€€ùX› ÿò\óàã›Ÿ\äNÇà€€ùõ€÷»ôõ€›\àóHHùYN»€€ùõ€÷»ôõ€›\ó€[ŸHóHHòò\àé»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒòY[ò€Y_⁄]]\ŸJW  ŒùW  O Œõ^]›\òò^ò\ó  O Œò€€ùX›  OŸõ€›\ó ÿò\óàãàã^
+Bà^HôKú›Xäàä⁄JWäŒòY\ŸJW ÿ€€ùX› ÿò\óàãàã^
+Bà[YàôKúŸX\ò⁄
+àóäŒòY[ò€Y_⁄]]\ŸJW  ŒùW  OŸõ€›\ó Ÿ\⁄Y€óàã›Ÿ\äNÇà€€ùõ€÷»ôõ€›\àóHHùYN»€€ùõ€÷»ôõ€›\ó€[ŸHóHHô\⁄Y€àé»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒòY[ò€Y_⁄]]\ŸJW  ŒùW  OŸõ€›\ó Ÿ\⁄Y€óàãàã^
+Bà[YàôKúŸX\ò⁄
+àóäŒòY[ò€Y_⁄]]\ŸJW  ŒùW  OŸõ€›\óàã›Ÿ\äH‹àôKúŸX\ò⁄
+àóôõ€›\ó  ŒòY€äWàã›Ÿ\äNÇà€€ùõ€÷»ôõ€›\àóHHùYN»€€ùõ€÷»ôõ€›\ó€[ŸHóHHô\⁄Y€àé»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒòY[ò€Y_⁄]]
+W  ŒùW  OŸõ€›\óàãàã^
+Bà^HôKú›Xäàä⁄JWôõ€›\ó  ŒòY€äWàãàã^
+BÇà»^U›\êò^ò\àŸ€»€€ùõ€ÀàZ\õ[ôHŸ€‹»\ôH[ô\[ô[ù[ô\ôHô]ô\à\ÿXõYûH\ÀÇàYàôKúŸX\ò⁄
+àóäô[[›ô_[]_⁄]›]õ W  W  O ^]›\òò^ò\ó  O€Ÿ€◊àã›Ÿ\äH‹àôKúŸX\ò⁄
+àóõŸ€◊  ô[[›ô_ŸôäWàã›Ÿ\äNÇà€€ùõ€÷»õŸ€»óHHò[ŸN»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäô[[›ô_[]_⁄]›]õ W  W  O ^]›\òò^ò\ó  O€Ÿ€◊àãàã^
+Bà^HôKú›Xäàä⁄JWõŸ€◊  ô[[›ô_ŸôäWàãàã^
+Bà[YàôKúŸX\ò⁄
+àóäY[ò€Y_⁄]]\ŸJW  W  O ^]›\òò^ò\ó  O€Ÿ€◊àã›Ÿ\äH‹àôKúŸX\ò⁄
+àóõŸ€◊  Y€äWàã›Ÿ\äNÇà€€ùõ€÷»õŸ€»óHHùYN»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäY[ò€Y_⁄]]\ŸJW  W  O ^]›\òò^ò\ó  O€Ÿ€◊àãàã^
+Bà^HôKú›Xäàä⁄JWõŸ€◊  Y€äWàãàã^
+BÇà»YŸK\⁄^ôH€€[X[ôÀà›\‹ùŒàúYŸH⁄^ôHL»ãò⁄[ôŸHYŸH»Yÿ[ãêL»ãò]]»YŸH⁄^ôHãÇà⁄^ôHHàÇàHHôKúŸX\ò⁄
+àä⁄JWäŒúYŸW ú⁄^ô_\\ó ú⁄^ô_YŸ_\\äW äŒùﬂ_äOœ◊ äM_MLﬂ]\üYÿ[]]ﬂ]]€X]X Wàã^
+BàYàNà⁄^ôHH€õ‹õX[^ôW‹YŸW‹⁄^ôJKô‹õ›\
+JJBà[YàôKôù[X]⁄
+àä⁄JW äM_MLﬂ]\üYÿ[]]ﬂ]]€X]X W àã^
+Nà⁄^ôHH€õ‹õX[^ôW‹YŸW‹⁄^ôJ^
+BàYà⁄^ôNÇà€€ùõ€÷»úYŸW‹⁄^ôHóHH⁄^ôN»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒúYŸW ú⁄^ô_\\ó ú⁄^ô_YŸ_\\äW äŒùﬂ_äOœ◊ äM_MLﬂ]\üYÿ[]]ﬂ]]€X]X Wàãàã^
+Bà^HôKú›Xäàä⁄JWó äM_MLﬂ]\üYÿ[]]ﬂ]]€X]X W âãàã^
+BÇà»€ÿò[ö[ùõ€ù€€ùõ€»\ôH[ôYôYõ‹ôH€€ù[ùY]»€»Hô\]Y\››X⁄\¬à»õXZŸHHõ€ùXô\ò][€àŸ\öYàõ€à⁄[ôŸ\»HX›X[ö[ùô[ô\ô\ãõ›Bà»][ô\ò\ûH]KÇàõ€ù€X]⁄Hõ€ôBà›◊Ÿõ‹óŸõ€ùH^õ›Ÿ\ä
+Bàõ‹àŸõ€ù€ò[YH[àì”ï”‘S”îŒÇàYàŸõ€ù€ò[YKõ›Ÿ\ä
+H[à›◊Ÿõ‹óŸõ€ùÇàõ€ù€X]⁄HŸõ€ù€ò[YBàúôXZ¬àYàõ€ù€X]⁄ÇàŸ]Ÿõ€ù
+õ€ù€X]⁄
+Bà⁄[ôŸYHùYBà^HôKú›XäôKô\ÿÿ\Jõ€ù€X]⁄
+K	…À^õY‹œ\ôKíJBÇà»€ÿò[ö[ù^\⁄^ôH€€ùõ€ÀÇàYàôKúŸX\ò⁄
+àä⁄JWäŒö[ò‹ôX\Ÿ_[õ\ôŸ_öYŸŸ\ü\ôŸ\ü\
+WãäóäŒôõ€ù^ö[ù
+W ú⁄^ôWüäŒö[ò‹ôX\Ÿ_[õ\ôŸ_XZŸJW  ŒùW  O Œôõ€ù^
+Wàã^
+NÇàYù\››^‹ÿÿ[JåJN»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒö[ò‹ôX\Ÿ_[õ\ôŸ_öYŸŸ\ü\ôŸ\ü\
+Wãäè Œôõ€ù^
+JŒó ú⁄^ôJO◊àã	…À^
+Bà[YàôKúŸX\ò⁄
+àä⁄JWäŒôX‹ôX\Ÿ_ôYXŸ_€X[\ü›€äWãäóäŒôõ€ù^
+W ú⁄^ôWüäŒôX‹ôX\Ÿ_ôYXŸ_XZŸJW  ŒùW  O Œôõ€ù^
+Wàã^
+NÇàYù\››^‹ÿÿ[JLåJN»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäŒôX‹ôX\Ÿ_ôYXŸ_€X[\ü›€äWãäè Œôõ€ù^
+JŒó ú⁄^ôJO◊àã	…À^
+BÇà»ò\ôKÿ€‹›€€ùõ€ÀÇàYàôKúŸX\ò⁄
+àä⁄JWäô[[›ô_[]_⁄]›]õ W  W  O ò\ô_€‹›
+Wàã^
+H‹àôKúŸX\ò⁄
+àä⁄JWäò\ô_€‹›
+W  ô[[›ô_ŸôäWàã^
+H‹àúö[ù⁄]›]ò\ôHà[à›Ÿ\éÇà€€ùõ€÷»ôò\ôHóHHõ€ôN»⁄[ôŸYHùYBà^HôKú›Xäàä⁄JWäô[[›ô_[]_⁄]›]õ W  W  O ò\ô_€‹›
+Wàãàã^
+Bà^HôKú›Xäàä⁄JWäò\ô_€‹›
+W  ô[[›ô_ŸôäWàãàã^
+Bà^HôKú›Xäàä⁄J\ö[ù ›⁄]›] Ÿò\ôHãàã^
+Bà[ŸNÇà»^X⁄]ö[ò[ò\ôNàòY€‹›Lãôò\ôHLãù\]Hò\ôH»LãÇàHHôKúŸX\ò⁄
+àä⁄JWäŒòYŸ]\]_⁄[ôŸ_ô\XŸJW  ŒùW  O Œò€‹›ò\ôJW äŒùﬂJO◊ ∏†ÆO◊ äÃNWVÃNKJäŒóó
+ O Wàã^
+BàYàõ›NÇàHHôKúŸX\ò⁄
+àä⁄JWäŒò€‹›ò\ôJW äŒùﬂJW ∏†ÆO◊ äÃNWVÃNKJäŒóó
+ O Wàã^
+BàYàNÇà€€ùõ€÷»ôò\ôHóHHõÿ]
+Kô‹õ›\
+JKúô\XŸJããàäJN»⁄[ôŸYHùYBà^H^ŒõKú›\ù
+
+WH
+»^€Kô[ô
+
+NóBà[ŸNÇà»Hò\ôH
+ÕLÀML\»HX\ö›\Yù\›Y[ùàò\ŸH]€à›\úô[ùö[ùYò\ôKà»›\ù⁄\ŸH\ŸHH›\Y\àò\ôKÇàHHôKôù[X]⁄
+àó ä ÀWJW ∏†ÆO◊ äÃNWVÃNKJäŒóó
+ O W àã^
+BàYàNÇàò\ŸHHõÿ]
+›\úô[ùŸò\ôH‹à
+H‹à‹›\Y\ó››[
+]JBà[[›[ùHõÿ]
+Kô‹õ›\
+äKúô\XŸJããàäJBà€€ùõ€÷»ôò\ôHóHHò\ŸH
+»[[›[ùYàKô‹õ›\
+JHOHä»à[ŸHò\ŸHH[[›[ùàYà€€ùõ€÷»ôò\ôHóHàòZ\ŸHò[YQ\úõ‹äï\]Yò\ôHÿ[õõ›ôHôYÿ]]ôKàäBà⁄[ôŸYHùYN»^HàÇà[ŸNÇà»ò]\ò[õ‹õNàòYLà»ö[ò‹ôX\ŸHò\ôHûHLà»ôX‹ôX\ŸH€‹›ûHÃãÇàHHôKúŸX\ò⁄
+àä⁄JWäŒòY[ò‹ôX\Ÿ_X‹ôX\Ÿ_ôYXŸJW  ŒùW  O Œôò\ô_€‹›
+O◊ äŒòûJO◊ ∏†ÆO◊ ä ÀWO◊◊JäŒóó
+ O Wàã^
+BàYàH[ôôKúŸX\ò⁄
+àä⁄JWäŒòY[ò‹ôX\Ÿ_X‹ôX\Ÿ_ôYXŸJWàãKô‹õ›\
+
+JNÇàò\ŸHHõÿ]
+›\úô[ùŸò\ôH‹à
+H‹à‹›\Y\ó››[
+]JBà[[›[ùHõÿ]
+Kô‹õ›\
+JKúô\XŸJããàäJBàô\òàHKô‹õ›\
+
+Kõ›Ÿ\ä
+Bà€€ùõ€÷»ôò\ôHóHHò\ŸHH[[›[ùYàôX‹ôX\ŸHà[àô\òà‹àúôYXŸHà[àô\òà[ŸHò\ŸH
+»[[›[ùàYà€€ùõ€÷»ôò\ôHóHàòZ\ŸHò[YQ\úõ‹äï\]Yò\ôHÿ[õõ›ôHôYÿ]]ôKàäBà⁄[ôŸYHùYN»^H^ŒõKú›\ù
+
+WH
+»^€Kô[ô
+
+NóBÇàô]\õà€€ùõ€À^ú›ö\
+à◊àäK⁄[ôŸYÇÇôYàŸŸ[ô\ò]W›X⁄Ÿ]ÿò\ŸJ⁄[ô]Kò\ôK›]]‹]Ÿ€◊‹]YŸW‹⁄^ôK^‹ÿÿ[W€›ô\úöYOSõ€ôKŸ€◊‹ÿÿ[W€›ô\úöYOSõ€ôJNÇàYà⁄[ôOHôõY⁄éÇàô]\õàŸ[ô\ò]WŸõY⁄›X⁄Ÿ]
+]Kò\ôK›]]‹]Ÿ€◊‹]YŸW‹⁄^ôO\YŸW‹⁄^ôK^‹ÿÿ[W€›ô\úöYO]^‹ÿÿ[W€›ô\úöYKŸ€◊‹ÿÿ[W€›ô\úöYO[Ÿ€◊‹ÿÿ[W€›ô\úöYJBàYà⁄[ôOHòù\»éÇàô]\õàŸ[ô\ò]Wÿù\◊›X⁄Ÿ]
+]Kò\ôK›]]‹]Ÿ€◊‹]YŸW‹⁄^ôO\YŸW‹⁄^ôK^‹ÿÿ[W€›ô\úöYO]^‹ÿÿ[W€›ô\úöYKŸ€◊‹ÿÿ[W€›ô\úöYO[Ÿ€◊‹ÿÿ[W€›ô\úöYJBàYà⁄[ôOHö›[éÇàô]\õàŸ[ô\ò]W⁄›[›õ›X⁄\ä]K›]]‹]Ÿ€◊‹]ò\ôOYò\ôKYŸW‹⁄^ôO\YŸW‹⁄^ôK^‹ÿÿ[W€›ô\úöYO]^‹ÿÿ[W€›ô\úöYKŸ€◊‹ÿÿ[W€›ô\úöYO[Ÿ€◊‹ÿÿ[W€›ô\úöYJBàòZ\ŸHù[ù[YQ\úõ‹äàï[ú›\‹ùYÿ›[Y[ù\Nà⁄⁄[ôHäBÇÇôYàŸŸ[ô\ò]WÿY\]ôW›X⁄Ÿ]
+⁄[ô]Kò\ôK›]]‹]Ÿ€◊‹]Sõ€ôKô\]Y\›Y‹⁄^ôOHò]]»ã^‹ÿÿ[W€›ô\úöYOSõ€ôKŸ€◊‹ÿÿ[W€›ô\úöYOSõ€ôJNÇàààëŸ[ô\ò]H⁄]›]⁄ö[ö⁄[ô»H\⁄Y€à»õ‹òŸHH⁄[ô€HYŸKÇÇà]]ÿõ›»YX[ú»Hõ‹õX[M^[›]àYàH€€ù[ù\»€ôŸ\ãBàô[ô\ô\à\»[›ŸY»õ›»ò]\ò[H€ù»YŸHä»€»\Ÿ‹ò\H[ôà‹X⁄[ô»ô[XZ[àõŸô\‹⁄[€ò[àMK–M”]\ã”Yÿ[–L»ÿ[à›[ôHŸ[X›Yà^X⁄]Hõ›Y⁄Hô\H€€ùõ€ÀÇàààÇà⁄^ôHH€õ‹õX[^ôW‹YŸW‹⁄^ôJô\]Y\›Y‹⁄^ôJH‹àò]]»Çàÿ[ôY]HHêMàYà⁄^ôHOHò]]»à[ŸH⁄^ôBàŸŸ[ô\ò]W›X⁄Ÿ]ÿò\ŸJ⁄[ô]Kò\ôK›]]‹]Ÿ€◊‹]ÿ[ôY]K^‹ÿÿ[W€›ô\úöYO]^‹ÿÿ[W€›ô\úöYKŸ€◊‹ÿÿ[W€›ô\úöYO[Ÿ€◊‹ÿÿ[W€›ô\úöYJBàô]\õàÿ[ôY]BÇÇôYàö[\◊€\›⁄Ÿ^Xõÿ\ô
+YŸOL\ó‹YŸOLL
+NÇàôX€‹ô»H\›‹ôX€‹ô 
+Bà›[‹YŸ\»HX^
+K
+[äôX€‹ô H
+»\ó‹YŸHHJHÀ»\ó‹YŸJBàYŸHHX^
+Z[äYŸK›[‹YŸ\»HJJBà›\ùHYŸH
+à\ó‹YŸBàõ›‹»HôX€‹ô÷‹›\ùú›\ù
+»\ó‹YŸWBàù]€ú»H◊Bàõ‹àà[àõ›‹ŒÇàXô[Hàû‹ãôŸ]
+	‹ôYô\ô[òŸIÀ	œ… _H8†(à‹ãôŸ]
+	›\IÀ	Ÿÿ›[Y[ù	 Kù]J
+_H8†(à◊Ÿ\‹^WŸö[[ò[YJãôŸ]
+	Ÿö[[ò[YIÀ	… J_HÇàù]€úÀò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€äXô[ÿ[òX⁄◊Ÿ]OYàúŸ[X›‹ôYéû‹ãôŸ]
+	‹ôYô\ô[òŸIÀ	… _HäWJBàò]àH◊BàYàYŸHàÇàò]ãò\[ô
+[õ[ôRŸ^Xõÿ\ôù]€ä∏´!{Ó#»ô]ö[›\»ãÿ[òX⁄◊Ÿ]OYàôö[\◊‹YŸNû‹YŸKL_HäJBàYàYŸH›[‹YŸ\»HNÇàò]ãò\[ô
+[õ[ôRŸ^Xõÿ\ôù]€äìô^8ß®{Ó#»ãÿ[òX⁄◊Ÿ]OYàôö[\◊‹YŸNû‹YŸJÃ_HäJBàYàò]éÇàù]€úÀò\[ô
+ò]äBàù]€úÀò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä∏ß#˚Ó#»[ù\àôYô\ô[òŸHù[Xô\àãÿ[òX⁄◊Ÿ]OHô[ù\ó‹ôYàäWJBàô]\õà[õ[ôRŸ^Xõÿ\ôX\ö›\
+ù]€ú BÇÇò\ﬁ[ò»Yà⁄›◊Ÿö[\ \]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàYàõ›\◊ÿ[›ŸY
+\]JNÇàô]\õÇàôX€‹ô»H\›‹ôX€‹ô 
+BàYàõ›ôX€‹ôŒÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+àº'‰‡à
+ì^U›\êò^ò\àö[\ óóìõ»Ÿ[ô\ò]Yö[\»]ôHôY[àÿ]ôYY]àãà\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+Bà
+Bàô]\õÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+àº'‰‡à
+ì^U›\êò^ò\àö[\ óóîŸ[X›HôYô\ô[òŸH»Y]]ÿ›[Y[ùóì]\›ö[\»\ôH⁄›€àö\ú›àãà\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\Yö[\◊€\›⁄Ÿ^Xõÿ\ô
+
+Bà
+BÇÇò\ﬁ[ò»YàY]ÿûW‹ôYó‹›\ù
+\]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàYàõ›\◊ÿ[›ŸY
+\]JNÇàô]\õÇà€€ù^ù\Ÿ\óŸ]V»ò]ÿZ][ô◊ŸY]‹ôYàóHHùYBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ß#˚Ó#»
+ëY][à^\›[ô»ÿ›[Y[ù
+óóàÇàï\»€ôYô\ô[òŸKYY]⁄‹ù›]\»ôY[àô[[›ôYóóï\ŸH
+ì[ŸYûH	àôYŸ[ô\ò]Jà€àHŸ[ô\ò]Yà[ú›XYàãà\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\Tô\RŸ^Xõÿ\ôô[[›ôJ
+Bà
+BÇÇÇîëQó‘ëHHôKò€€\[JàäŒóìUñÀW»O◊ÃKWüóÃÀWäHãôKíJBÇôYàõ‹õX[^ôW‹ôYô\ô[òŸJò[YJNÇàHHëQó‘ëKúŸX\ò⁄
+›äò[YH‹ààäJBàYàõ›Nàô]\õààÇàY⁄]»HôKú›XäàóãàãKô‹õ›\
+
+JBàô]\õààìUû⁄[ù
+Y⁄] NåôHàYàY⁄]»[ŸHàÇÇôYà›[Y‹ò[W€Y\‹ÿYŸW⁄Ÿ^JY\‹ÿYŸJNÇàYàY\‹ÿYŸH\»õ€ôNÇàô]\õààÇà⁄]HŸ]]äY\‹ÿYŸKò⁄]ãõ€ôJBà⁄]⁄YHŸ]]ä⁄]öYãõ€ôJH‹àŸ]]äY\‹ÿYŸKò⁄]⁄Yãõ€ôJBàY\‹ÿYŸW⁄YHŸ]]äY\‹ÿYŸKõY\‹ÿYŸW⁄Yãõ€ôJBàYà⁄]⁄Y\»õ€ôH‹àY\‹ÿYŸW⁄Y\»õ€ôNÇàô]\õààÇàô]\õààûÿ⁄]⁄YNû€Y\‹ÿYŸW⁄YHÇÇÇôYà‹ôY⁄\›\ó‹ôYô\ô[òŸW€Y\‹ÿYŸJôYô\ô[òŸKY\‹ÿYŸJNÇàààîô[Y[Xô\àH^X›[Y‹ò[H›]]Y\‹ÿYŸHõ‹àô[XXõHô\K]ÀYY]õ›][ôÀÇÇàHQ»›^H[ù\õò[[àHÿÿ[ôX€‹ô»õ›[ô»\»⁄›€à[àH[Y‹ò[Hÿ\[€ãÇàààÇàŸ^HH›[Y‹ò[W€Y\‹ÿYŸW⁄Ÿ^JY\‹ÿYŸJBàYàõ›ôYô\ô[òŸH‹àõ›Ÿ^NÇàô]\õÇàôX€‹ôHÿY‹ôX€‹ô
+ôYô\ô[òŸJBàYàõ›ôX€‹ôÇàô]\õÇàŸ^\»H‹›ä
+Hõ‹à[à
+ôX€‹ôôŸ]
+ù[Y‹ò[W€Y\‹ÿYŸW⁄Ÿ^\»äH‹à◊JHYà›ä
+Kú›ö\
+
+WBàYàŸ^Hõ›[àŸ^\ŒÇàŸ^\Àò\[ô
+Ÿ^JBàôX€‹ô»ù[Y‹ò[W€Y\‹ÿYŸW⁄Ÿ^\»óHHŸ^\÷ÀMóBà\]W‹ôX€‹ô
+ôYô\ô[òŸKôX€‹ô
+BÇÇôYàö[ô‹ôYô\ô[òŸWŸõ‹ó‹ô\Jô\YY
+NÇàY\‹ÿYŸW⁄Ÿ^HH›[Y‹ò[W€Y\‹ÿYŸW⁄Ÿ^Jô\YY
+BàYàY\‹ÿYŸW⁄Ÿ^NÇàõ‹àà[à\›‹ôX€‹ô 
+NÇàôYàHãôŸ]
+úôYô\ô[òŸHäBàôX»HÿY‹ôX€‹ô
+ôYäH‹àﬂBàYàY\‹ÿYŸW⁄Ÿ^H[à‹›ä
+Hõ‹à[à
+ôXÀôŸ]
+ù[Y‹ò[W€Y\‹ÿYŸW⁄Ÿ^\»äH‹à◊JWNÇàô]\õàôYÇà€›\òŸHHàãöõ⁄[äö[\äõ€ôKŸŸ]]äô\YYù^ãõ€ôJKŸ]]äô\YYòÿ\[€àãõ€ôJKŸ]]äŸ]]äô\YYôÿ›[Y[ùãõ€ôJKôö[W€ò[YHãõ€ôJWJJBàôYàHõ‹õX[^ôW‹ôYô\ô[òŸJ€›\òŸJBàYàôYà[ôÿY‹ôX€‹ô
+ôYäNàô]\õàôYÇàö[[ò[YHHŸ]]äŸ]]äô\YYôÿ›[Y[ùãõ€ôJKôö[W€ò[YHãõ€ôJBàõ‹àà[à\›‹ôX€‹ô 
+NÇàYàö[[ò[YH[ôãôŸ]
+ôö[[ò[YHäHOHö[[ò[YNàô]\õàãôŸ]
+úôYô\ô[òŸHäBà›»H€›\òŸKõ›Ÿ\ä
+Bàõ‹àà[à\›‹ôX€‹ô 
+NÇàôXœ[ÿY‹ôX€‹ô
+ãôŸ]
+úôYô\ô[òŸHäJH‹àﬂBà]O\ôXÀôŸ]
+ô]HäH‹àﬂBà^OHàãöõ⁄[ä›ä]KôŸ]
+ÀàäJHõ‹à»[à
+ò€}Ô]=∂âûÀk∫wµÁOHô^€\⁄[€àÇàô]\õÇÇàYà]Y\ûKô]HOHòYŸõY⁄éÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+à∏ß";Ó#»
+êYõY⁄»òZ[à]Z[ óóàÇàñ[›Hÿ[àõ›»Ÿ[ô
+úÿ‹ôY[ú⁄›»‹à^
+ãà[›HX^HŸ[ô€ùÿ\ô[ôô]\õà]Z[»Ÿ\\ò][H‹àŸŸ]\ãàÇàíH⁄[]]€X]Xÿ[HY[ùYûH]ô\ûHõY⁄›òZ[àŸX›‹à[ôŸY\€€õôX›[ô»ŸX›‹ú»Ÿ\\ò]KóóàÇàï⁄[àö[ö\⁄Y\
+∏ß!H€ôJãàãà\úŸW€[ŸOHìX\öŸ›€àãàô\W€X\ö›\Tô\RŸ^Xõÿ\ôX\ö›\
+÷»∏ß#{Ó#»õY⁄^óK»∏ß";Ó#»õY⁄ÿ‹ôY[ú⁄›óK»∏ß!H€ôHóWKô\⁄^ôW⁄Ÿ^Xõÿ\ôUùYJBà
+Bà€€ù^ù\Ÿ\óŸ]V»ò]ÿZ][ô◊ŸõY⁄óHHùYBàô]\õÇÇàYà]Y\ûKô]HOHòYŸõY⁄›^éÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+à∏ß#{Ó#»
+êYõY⁄»òZ[à]Z[»[à^
+óóàÇàî\›H⁄]]ô\à]Z[»[›H]ôKàõ»‹X⁄X[õ‹õX]\»ô\]Z\ôYà[›Hÿ[àŸ[ô€ùÿ\ô[ôô]\õàõ›\õô^\»ŸŸ]\à‹à[àŸ\\ò]HY\‹ÿYŸ\ÀóóàÇàë^[\NóòHÿ›à[ôQ€»ëKMNMòZ\\à8°§à][XòZHNåÃSH8†$»LNåçHSWàÇàåHÿ›à[ôQ€»ëKLçÃ»][XòZH8°§àòZö€›NåLH8†$»ŒçLXóàÇàïHÿÿ[\úŸ\à⁄[^òX›H‹\ò]‹ãŸ\ùöXŸHù[Xô\ãõ›]K]K\\ù\ôH[ô\úö]ò[]]€X]Xÿ[KóóàÇàï⁄[àö[ö\⁄Y\
+∏ß!H€ôJãàãà\úŸW€[ŸOHìX\öŸ›€àãàô\W€X\ö›\Tô\RŸ^Xõÿ\ôX\ö›\
+÷»∏ß#{Ó#»õY⁄^óK»∏ß";Ó#»õY⁄ÿ‹ôY[ú⁄›óK»∏ß!H€ôHóWKô\⁄^ôW⁄Ÿ^Xõÿ\ôUùYJBà
+Bà€€ù^ù\Ÿ\óŸ]V»ò]ÿZ][ô◊ŸõY⁄óHHùYBàô]\õÇÇàYà]Y\ûKô]HOH	ŸòYùŸY]	ŒÇàYàõ›€€ù^ù\Ÿ\óŸ]KôŸ]
+	⁄][ô\ò\ûI NÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	¯ßcõ»›\úô[ùòYù\»]òZ[XõKàX\ŸH›\ùH›\à€‹öŸõ›»YÿZ[ãâÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà€€ù^ù\Ÿ\óŸ]V…ŸY][ô◊ÿ›\úô[ù⁄][ô\ò\ûI◊HHùYBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+à	¸'ÊË;Ó#»
+ì[ŸYûH	àôYŸ[ô\ò]Jóóâ¬à	’[YH^X›H⁄][›Hÿ[ù⁄[ôŸYàH⁄[\]HHòYù€õH8†%õ»à⁄[ôHŸ[ô\ò]YY]óóâ¬à	—^[\\Œóâ¬à	¯†(à⁄[ôŸH^Hà⁄Y⁄ŸYZ[ô»»€€õX\ôÀòâ¬à	¯†(à⁄[ôŸHH›[[à›[X\ô»»H›\à‹[€ãòâ¬à	¯†(à€‹úôX›H›Y\›ò[YH»\ãà[Z]⁄\õXKòâ¬à	¯†(àYö]ò]HZ\ú‹ùX⁄›\»[ò€\⁄[€úÀòóâ¬à	÷[›Hÿ[à\Hõ‹õX[H‹àô\H\ôX›H»\»Y\‹ÿYŸKâÀà\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\Tô\RŸ^Xõÿ\ôô[[›ôJ
+Bà
+Bàô]\õÇÇàYà]Y\ûKô]HOH	ŸòYùŸ€ôIŒÇà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+	⁄][ô\ò\ûI BàYàõ›]NÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	¯ßcõ»›\úô[ùòYù\»]òZ[XõKàX\ŸH›\ùH›\à€‹öŸõ›»YÿZ[ãâÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà€€ù^ù\Ÿ\óŸ]V…⁄][ô\ò\ûI◊HHŸ[ú›\ôW‹›\Y\óÿ€‹› ]JBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\ó‹ó€õ◊ÿ€‹›	◊HHùYBà€€ù^ù\Ÿ\óŸ]Kú‹
+	ŸY][ô◊ÿ›\úô[ù⁄][ô\ò\ûIÀõ€ôJBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+à]Y\ûKà	¯ß!H
+ëòYù€€ôö\õYYäóóê⁄€‹ŸHH›]][›Hÿ[ùàõ‹àãö\ú›⁄€‹ŸHò\⁄XÀ—]Z[Y[ô[à›\à][›][€à‹à›\àõ›X⁄\ãâÀà\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\]›\ó€›]]⁄Ÿ^Xõÿ\ô
+
+Bà
+Bàô]\õÇÇàYà]Y\ûKô]HOHù›\óŸ]Z[òò\⁄X»à‹à]Y\ûKô]HOHù›\óŸ]Z[ô]Z[YéÇà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+ö][ô\ò\ûHäBàYàõ›]NÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+ìõ»][ô\ò\ûH]H\»]òZ[XõKàX\ŸH›\ùH›\à€‹öŸõ›»YÿZ[ãàãô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà]Z[H]Y\ûKô]Kú‹]
+éàãJVÃWBàûNÇà›]\»H]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+∏¶¶{Ó#»\][ô»H^H[ú»ÿÿ[KããàäBàô]◊Ÿ]HH]ÿZ]‹ù[óÿZW›⁄]‹ô]ûW‹›]\ ]Y\ûKõY\‹ÿYŸK[XôNà\ﬁ[ò⁄[Àù◊›ôXY
+[ö[òŸW‹X⁄ÿYŸW⁄][ô\ò\ûK]KRW–TW“—VKRW”S—S]Z[
+K›]\œ\›]\ Bàô]◊Ÿ]V»ò€Y[ù€ò[YHóHH]KôŸ]
+ò€Y[ù€ò[YHãàäBàô]◊Ÿ]V»ô]Z[€]ô[óHH]Z[àYà]KôŸ]
+	ÿåòâ H‹à]KôŸ]
+	ÿúò[ô€ô]]ò[	 H‹à€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊ÿåòâ NÇàô]◊Ÿ]HHÿ\W››\óŸÿ›[Y[ù€[ŸWŸöY[ àô]◊Ÿ]Kà]KôŸ]
+	Ÿÿ›[Y[ù€[ŸI H‹àô]◊Ÿ]KôŸ]
+	Ÿÿ›[Y[ù€[ŸI H‹à	⁄][ô\ò\ûIÀàåòèUùYKà
+Bà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿåòâ◊HHùYBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿ€X[óÿYŸ[òﬁI◊HHùYBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\ó€\›‹YŸI◊HH	ÿåòâ¬à€€ù^ù\Ÿ\óŸ]V»ö][ô\ò\ûHóHHô]◊Ÿ]Bà]ÿZ]ÿYôW‹›]\◊ŸY]
+›]\À]Y\ûKõY\‹ÿYŸKà∏ß!HŸ]Z[ù]J
+_H][ô\ò\ûHôXYKà⁄€‹ŸH⁄]–\‹àãàäBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+ùZ[ÿ€€ôö\õX][€äô]◊Ÿ]JK\úŸW€[ŸOHìX\öŸ›€àäBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+ê⁄€‹ŸHH›]][›Hÿ[ùàãô\W€X\ö›\]›\ó€›]]⁄Ÿ^Xõÿ\ô
+
+JBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€äï›\à]Z[[ö[òŸ[Y[ùòZ[YäBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+à∏ßc€›[õ›\]H][ô\ò\ûNà‹›ä^ VŒçÃ_Hãô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇÇàYà]Y\ûKô]HOHù›\óŸY]ÿ›\úô[ùéÇà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+ö][ô\ò\ûHäBàYàõ›]NÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+ìõ»›\úô[ù][ô\ò\ûH\»]òZ[XõKàãô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà€€ù^ù\Ÿ\óŸ]V»ôY][ô◊ÿ›\úô[ù⁄][ô\ò\ûHóHHùYBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+àº'ÊË;Ó#»
+ì[ŸYûH	àôYŸ[ô\ò]Jóóï[YHò]\ò[H⁄][›Hÿ[ù⁄[ôŸYàH⁄[\]HH›\úô[ùòYù€õKàYù\àH\]YòYù\»ôXYK[›Hÿ[àYÿZ[à⁄€‹ŸH⁄]–\‹àãàãà\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\Tô\RŸ^Xõÿ\ôô[[›ôJ
+Bà
+Bàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+ù›\ó›ò[ú⁄]àäNÇàX›[€è\]Y\ûKô]Kú‹]
+éàãJVÃWBà]OX€€ù^ù\Ÿ\óŸ]KôŸ]
+ö][ô\ò\ûHäH‹àﬂBàYàX›[€èOHòÿ[òŸ[éÇà€€ù^ù\Ÿ\óŸ]Kú‹
+ò]ÿZ][ô◊››\ó›ò[ú⁄]ÿ⁄⁄XŸHãõ€ôJBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK∏ßcò[ú⁄]Ÿ[X›[€àÿ[òŸ[Yàãô\W€X\ö›\YòYù‹ô]öY]◊⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYàX›[€èOHù\ŸHéÇà€€ù^ù\Ÿ\óŸ]Kú‹
+ò]ÿZ][ô◊››\ó›ò[ú⁄]ÿ⁄⁄XŸHãõ€ôJBà]V»ùò[ú⁄]Ÿ€ôWÿûW‹Ÿ[àóOQò[ŸN»€€ù^ù\Ÿ\óŸ]V»ö][ô\ò\ûHóOY]Bà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK∏ß!H]X›Yò[ú⁄]⁄[ôH\ŸYàäBà]ÿZ]ÿ€€ù[ùYW››\ó‹óÿYù\ó›ò[ú⁄]
+]Y\ûKõY\‹ÿYŸK€€ù^
+N»ô]\õÇàYàX›[€èOHú⁄⁄\éÇà€€ù^ù\Ÿ\óŸ]Kú‹
+ò]ÿZ][ô◊››\ó›ò[ú⁄]ÿ⁄⁄XŸHãõ€ôJBà]V»ùò[ú⁄]óOV◊N»]V»ùò[ú⁄]Ÿ€ôWÿûW‹Ÿ[àóOUùYN»€€ù^ù\Ÿ\óŸ]V»ö][ô\ò\ûHóOY]Bà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK∏ß!Hò[ú⁄]⁄⁄\YàHõﬁ⁄[⁄›»
+ë€ôHûHŸ[äãàã\úŸW€[ŸOHìX\öŸ›€àäBà]ÿZ]ÿ€€ù[ùYW››\ó‹óÿYù\ó›ò[ú⁄]
+]Y\ûKõY\‹ÿYŸK€€ù^
+N»ô]\õÇàYàX›[€èOHòYéÇà€€ù^ù\Ÿ\óŸ]Kú‹
+ò]ÿZ][ô◊››\ó›ò[ú⁄]ÿ⁄⁄XŸHãõ€ôJBà€€ù^ù\Ÿ\óŸ]V»ò]ÿZ][ô◊››\ó›ò[ú⁄]⁄[ú]óOUùYBà€€ù^ù\Ÿ\óŸ]V»ú[ô[ô◊››\ó›ò[ú⁄]Ÿö[\»óOV◊Bà€€ù^ù\Ÿ\óŸ]V»ú[ô[ô◊››\ó›ò[ú⁄]›^óOHàÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKà∏ß";Ó#»
+êY»ô\XŸHò[ú⁄]
+óóàÇàîŸ[ô€ôH‹à][\HõY⁄]X⁄Ÿ]úÀÿ‹ôY[ú⁄›À[ú›ùX›\ôY€ôK]ÿ^K‹õ›[ô]ö\^‹à[ûHZ^\ôKóóàÇàíH⁄[‹]]ô\ûHŸX›‹ã]X›€ùÿ\ôÿ€€õôX›[€ã‹ô]\õãŸY\Hù[õY⁄ù[Xô\ãô\Ÿ\ùôH\õZ[ò[⁄[ô]ô\à›\YYÇàò[ô⁄›»Z\ò‹òYù[àúòX⁄Ÿ]»⁄[à›\YYóóï⁄[àö[ö\⁄Y\
+∏ß!H€ôHò[ú⁄]
+ãàãà\úŸW€[ŸOHìX\öŸ›€àäBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+îŸ[ôHò[ú⁄]€›\òŸ\»õ›Ààãô\W€X\ö›\]›\ó›ò[ú⁄]⁄[ú]⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	›õ⁄XŸWŸY]â NÇàôYô\ô[òŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWBàôX€‹ô[ÿY‹ôX€‹ô
+ôYô\ô[òŸJBàYàõ›ôX€‹ôÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	¯ßcÿ]ôYÿ›[Y[ùõ›õ›[ôâÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇà€€ù^ù\Ÿ\óŸ]V…ŸY][ô◊‹ôYô\ô[òŸI◊O\ôYô\ô[òŸBà€€ù^ù\Ÿ\óŸ]V…›õ⁄XŸWŸY]‹ôYô\ô[òŸI◊O\ôYô\ô[òŸBà⁄[ô\ôX€‹ôôŸ]
+	›\IÀ	Ÿÿ›[Y[ù	 BàXô[^…ŸõY⁄	Œâ–Z\âÀ	ÿù\…Œâ–ù\…À	⁄›[	Œâ“›[	À	‹X⁄ÿYŸIŒâ’›\âﬂKôŸ]
+⁄[ô	—ÿ›[Y[ù	 Bà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+à]Y\ûKàâ¸'„¶{Ó#»
+ïõ⁄XŸH»^Y]
+óóîŸ[ô€ôHõ‹õX[
+ù^Y\‹ÿYŸH‹àõ⁄XŸHõ›Jà⁄]H⁄[ôŸ\»[›Hÿ[ù[à\»€Xô[Hö[ùà	¬à	”õ»ôYö^‹àö^Yõ‹õX]\»ô\]Z\ôYàH⁄[[ô\ú›[ôH[ú›ùX›[€à[ôôYŸ[ô\ò]HHÿ[YHãóóâ¬à	—^[\\Œà⁄[ôŸH\‹Ÿ[ôŸ\à[ÿö[H»NÕçMÃåL⁄[ôŸHõ€€H\H»[^X‹à⁄[\H^Z[àH⁄[ôŸHûHõ⁄XŸKâÀà\úŸW€[ŸOI”X\öŸ›€â¬à
+Bàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	ÿ]]Ÿö]â NÇàôYô\ô[òŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWBàûNÇà]ÿZ]]]◊Ÿö]‹ÿ]ôY›X⁄Ÿ]
+]Y\ûK€€ù^ôYô\ô[òŸJBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä	–]]»ö]ÿ[òX⁄»òZ[Y	 Bà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+â¯ßc]]»ö]òZ[YóóîôX\€€éà‹›ä^ VŒé_X	À\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[ŸYûNâ H[ô]Y\ûKô]Kò€›[ù
+	Œâ HOHNÇàôYô\ô[òŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWN»ôX€‹ô[ÿY‹ôX€‹ô
+ôYô\ô[òŸJBàYàõ›ôX€‹ôÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	¯ßcÿ]ôYÿ›[Y[ùõ›õ›[ôâÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYàôX€‹ôôŸ]
+	›\I HOH	‹X⁄ÿYŸIŒÇà»€ôHò]\ò[[[ô›XYŸK›õ⁄XŸHY][ùûHõ‹à›\‹ùY›\àöY[»ÿ[à⁄[ôŸBà»›[ÀŸ^H[ú»\»Ÿ[\»Z^YõY⁄›òZ[ãÿù\»ò[ú⁄]à€‹›[ô»Xô[¬à»
+Y[–’–ã–”êã—PäH\ôHô\Ÿ\ùôYÿÿ[HYù\àHRHY]Çà€€ù^ù\Ÿ\óŸ]V…ŸY][ô◊‹ôYô\ô[òŸI◊O\ôYô\ô[òŸBà€€ù^ù\Ÿ\óŸ]V…›õ⁄XŸWŸY]‹ôYô\ô[òŸI◊O\ôYô\ô[òŸBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKà	¸'ÊË;Ó#»
+ì[ŸYûH	àôYŸ[ô\ò]JóóîŸ[ô€ôHõ‹õX[
+ù^Y\‹ÿYŸH‹àõ⁄XŸHõ›Jà\ÿ‹öXö[ô»[⁄[ôŸ\Àà	¬à	÷[›Hÿ[àZ^›[Ÿ^K\[à⁄[ôŸ\À›\›€Y\à€‹›[ô»[ô[ûHù[Xô\àŸàõY⁄›òZ[ãÿù\»ò[ú⁄]ŸX›‹úÀóóâ¬à	—^[\\Œó∏†(àY[Õ’–àLå∏†(à⁄[ôŸH][õò\à›[»[Xô\ô[H›\ò∏†(àòZ\\à»òY‹\àûHòZ[àŒåMKòY‹\à»€ÿHõY⁄]Mååô]\õà€ÿKS][XòZKQ[HûHõY⁄[ô[KTòZ\\àûHù\Àòóâ¬à	”õ»ôYö^‹àö^Yõ‹õX]\»ô\]Z\ôYàH⁄[[ô\ú›[ôH[ú›ùX›[€à[ôôYŸ[ô\ò]HHÿ[YHãâÀà\úŸW€[ŸOI”X\öŸ›€â Bàô]\õÇà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀﬂJBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¸'ÊË;Ó#»[ŸYûH\»à8†%Ÿ[X›⁄][›Hÿ[ù»⁄[ôŸK[àô\‹»€ôH8†(àXZŸHYÿZ[ãâÀô\W€X\ö›\[[ŸYûW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸKôX€‹ôôŸ]
+	›\IÀ	‹X⁄ÿYŸI JJBàô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[ŸŸõ€ùâ NÇàÀôYô\ô[òŸK[O\]Y\ûKô]Kú‹]
+	ŒâÀäBà[ô[ôœX€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀﬂJBàÿ]ôY[ÿY‹ôX€‹ô
+ôYô\ô[òŸJH‹àﬂBà›\úô[ùYõÿ]
+[ô[ôÀôŸ]
+	Ÿõ€ù‹ÿÿ[I H‹àÿ]ôYôŸ]
+	›^‹ÿÿ[I H‹àÿY‹Ÿ][ô‹ 
+KôŸ]
+	›^‹ÿÿ[IÀKå
+JBà[ô[ô÷…Ÿõ€ù‹ÿÿ[I◊O\õ›[ô
+X^
+çÃZ[äKåÕK›\úô[ù
+Ÿõÿ]
+[JJJKäBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKà∏ß!Hÿ›[Y[ùõ€ù⁄^ôNà⁄[ù
+õ›[ô
+[ô[ô÷…Ÿõ€ù‹ÿÿ[I◊JåL
+J_IHãô\W€X\ö›\[[ŸYûW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸKÿ]ôYôŸ]
+	›\IÀ	‹X⁄ÿYŸI JJN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[Ÿ€Ÿ€Œâ NÇàÀôYô\ô[òŸK[O\]Y\ûKô]Kú‹]
+	ŒâÀäBà[ô[ôœX€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀﬂJBàÿ]ôY[ÿY‹ôX€‹ô
+ôYô\ô[òŸJH‹àﬂBà⁄[ô\ÿ]ôYôŸ]
+	›\IÀ	‹X⁄ÿYŸI Bà›\úô[ùYõÿ]
+[ô[ôÀôŸ]
+	€Ÿ€◊‹ÿÿ[I H‹àÿ]ôYôŸ]
+	€Ÿ€◊‹ÿÿ[I H‹àŸ]€Ÿ€◊‹ÿÿ[J⁄[ô
+JBà[ô[ô÷…€Ÿ€◊‹ÿÿ[I◊O\õ›[ô
+X^
+çÃZ[äKçL›\úô[ù
+Ÿõÿ]
+[JJJKäBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKà∏ß!HŸ€»⁄^ôNà⁄[ù
+õ›[ô
+[ô[ô÷…€Ÿ€◊‹ÿÿ[I◊JåL
+J_IHãô\W€X\ö›\[[ŸYûW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸK⁄[ô
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[Ÿÿ€X[éâ NÇàôYô\ô[òŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWN»[ô[ôœX€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀﬂJN»[ô[ô÷…ÿ€X[óÿYŸ[òﬁI◊O[õ›õ€€
+[ô[ôÀôŸ]
+	ÿ€X[óÿYŸ[òﬁIÀò[ŸJJBàXô[I””à8†%YŸ[òﬁH]Z[»⁄[ôHô[[›ôY	»Yà[ô[ô÷…ÿ€X[óÿYŸ[òﬁI◊H[ŸH	”—ëà8†%õ‹õX[YŸ[òﬁH]Z[»ô\›‹ôY	¬à]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKâ¸'Ê™»ô[[›ôHYŸ[òﬁH]Z[Œà€Xô[IÀô\W€X\ö›\[[ŸYûW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸK
+ÿY‹ôX€‹ô
+ôYô\ô[òŸJH‹àﬂJKôŸ]
+	›\IÀ	‹X⁄ÿYŸI JJN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[Ÿ‹⁄^ôNâ NÇà\ùœ\]Y\ûKô]Kú‹]
+	Œâ N»ôYô\ô[òŸO\\ù÷ÃWBàYà[ä\ù OOLéÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¸'‰‰⁄€‹ŸHHô]»YŸH⁄^ôKâÀô\W€X\ö›\[[ŸYûW‹⁄^ôW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸJJN»ô]\õÇà⁄^ôO\\ù÷ÃóN»€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀﬂJV…‹YŸW‹⁄^ôI◊O\⁄^ôBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKâ¯ß!HYŸH⁄^ôHŸ[X›Yà‹⁄^ô_KâÀô\W€X\ö›\[[ŸYûW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸK
+ÿY‹ôX€‹ô
+ôYô\ô[òŸJH‹àﬂJKôŸ]
+	›\IÀ	‹X⁄ÿYŸI JJN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[ŸŸõ€›\ó€Y[ùNâ NÇàôYô\ô[òŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¸'ÈÔà⁄€‹ŸHHõ€›\àõ‹à\»ôYŸ[ô\ò]YãâÀô\W€X\ö›\[[ŸYûWŸõ€›\ó⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸJJN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[ŸŸõ€›\éâ NÇàÀôYô\ô[òŸK[ŸO\]Y\ûKô]Kú‹]
+	ŒâÀäBà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀﬂJV…Ÿõ€›\ó€[ŸI◊O[[ŸBàXô[^…Ÿ\⁄Y€âŒâ—õ€›\àH
+€\⁄Y€äIÀ	Ÿõ€›\åâŒâ—õ€›\àà
+ô]»\⁄Y€äIÀ	ÿò\âŒâ–€€ùX›ò\âﬂV€[ŸWBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKâ¯ß!H€Xô[HŸ[X›YâÀô\W€X\ö›\[[ŸYûW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸK
+ÿY‹ôX€‹ô
+ôYô\ô[òŸJH‹àﬂJKôŸ]
+	›\IÀ	‹X⁄ÿYŸI JJN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[ŸŸ]Z[â NÇàÀôYô\ô[òŸK]Z[\]Y\ûKô]Kú‹]
+	ŒâÀäBà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀﬂJV…Ÿ]Z[	◊OY]Z[à]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯ß!H]Z[Y^H[àŸ[X›YâÀô\W€X\ö›\[[ŸYûW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸK	‹X⁄ÿYŸI JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[Ÿ€\›‹YŸNâ NÇà\ùœ\]Y\ûKô]Kú‹]
+	Œâ BàôYô\ô[òŸO\\ù÷ÃWBàYà[ä\ù OOLéÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¸'‰Á⁄€‹ŸHH›\à\›YŸHõ‹à\»ôYŸ[ô\ò][€ãâÀô\W€X\ö›\[[ŸYûW€\›‹YŸW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸJJN»ô]\õÇà⁄⁄XŸO\\ù÷ÃóBà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀﬂJV…››\ó€\›‹YŸI◊OX⁄⁄XŸBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKâ¯ß!H\›YŸHŸ[X›Yà›\õ\◊€Xô[
+⁄⁄XŸJ_IÀô\W€X\ö›\[[ŸYûW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸK	‹X⁄ÿYŸI JN»ô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[Ÿÿåòéâ NÇàôYô\ô[òŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWBàôX€‹ô[ÿY‹ôX€‹ô
+ôYô\ô[òŸJBàYàõ›ôX€‹ôÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	¯ßcÿ]ôY›\àÿ›[Y[ùõ›õ›[ôâÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇà]ÿZ]Ÿ\ôX›‹ÿ]ôYÿåòó‹ö[ù
+]Y\ûKõY\‹ÿYŸK€€ù^ôYô\ô[òŸKôX€‹ô]Y\ûO\]Y\ûJBàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[Ÿ€[ŸNâ NÇàÀôYô\ô[òŸK[ŸO\]Y\ûKô]Kú‹]
+	ŒâÀäBà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀﬂJV…Ÿÿ›[Y[ù€[ŸI◊O[[ŸBàXô[I”ŸôöX⁄X[›\à][›][€â»Yà[ŸOOI‹][›][€â»[ŸH	”ŸôöX⁄X[›\àõ›X⁄\â¬à]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKâ¯ß!H€Xô[HŸ[X›YâÀô\W€X\ö›\[[ŸYûW⁄Ÿ^Xõÿ\ô
+ôYô\ô[òŸK	‹X⁄ÿYŸI JN»ô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[ŸŸ€ôNâ NÇàôYô\ô[òŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWBàûNÇà]ÿZ]ôYŸ[ô\ò]W‹ÿ]ôY›⁄]€[ŸYöXÿ][€ú ]Y\ûK€€ù^ôYô\ô[òŸJBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä	”[ŸYûH	àôYŸ[ô\ò]HòZ[Y	 N»]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+â¯ßcôYŸ[ô\ò][€àòZ[YóóîôX\€€éà‹›ä^ VŒé_IÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	€[Ÿÿÿ[òŸ[â NÇàôYô\ô[òŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWN»€€ù^ù\Ÿ\óŸ]Kú‹
+â€[ŸYûNû‹ôYô\ô[òŸ_IÀõ€ôJBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯ßc⁄[ôŸ\»ÿ[òŸ[Yâ N»ô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+ù›\ó›\õ\ŒàäNÇà]Z[H€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊››\ó‹óŸ]Z[	 H‹à	ÿò\⁄X…¬àõ◊ÿ€‹›Hõ€€
+€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊››\ó‹ó€õ◊ÿ€‹›	Àò[ŸJJBà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+	⁄][ô\ò\ûI BàYàõ›]NÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	”õ»][ô\ò\ûH]H\»]òZ[XõKàX\ŸH›\ùH›\à€‹öŸõ›»YÿZ[ãâÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇàûNÇàYà›ä]KôŸ]
+	Ÿ]Z[€]ô[	À	… JKõ›Ÿ\ä
+HOH]Z[Çà]HH]ÿZ]‹ù[óÿZW›⁄]‹ô]ûW‹›]\ ]Y\ûKõY\‹ÿYŸK[XôNà\ﬁ[ò⁄[Àù◊›ôXY
+[ö[òŸW‹X⁄ÿYŸW⁄][ô\ò\ûK]KRW–TW“—VKRW”S—S]Z[
+JBà]V…ÿ€Y[ù€ò[YI◊HH€€ù^ù\Ÿ\óŸ]KôŸ]
+	Ÿ›Y\›€ò[YI H‹à]KôŸ]
+	ÿ€Y[ù€ò[YIÀ	… Bà€€ù^ù\Ÿ\óŸ]V…⁄][ô\ò\ûI◊HH]Bà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯£Ï»Ÿ[ô\ò][ô»Hö[ò[›\àà⁄]	ê»ì”à””—”Kããâ Bà]ÿZ]Ÿ[ô\ò]W››\ó‹óŸö[ò[
+]Y\ûKõY\‹ÿYŸK€€ù^]K]Z[õ◊ÿ€‹›
+Bàõ‹à»[à
+	‹[ô[ô◊››\ó‹óŸ]Z[	À	‹[ô[ô◊››\ó‹ó€õ◊ÿ€‹›	À	‹[ô[ô◊››\ó‹YŸW‹⁄^ôIÀ	‹[ô[ô◊››\óŸõ€›\ó€[ŸI NÇà€€ù^ù\Ÿ\óŸ]Kú‹
+Àõ€ôJBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	¯ß!HôXYHõ‹àHô^ô\]Y\›âÀô\W€X\ö›\\ôXYW⁄Ÿ^Xõÿ\ô
+
+JBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä	’›\ààŸ[ô\ò][€àòZ[Y	 Bà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+â¯ßc›\ààŸ[ô\ò][€àòZ[YóóîôX\€€éà‹›ä^ VŒé_IÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	››\ó‹‹X⁄X[€õ›\Œâ NÇà⁄⁄XŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWBà]OX€€ù^ù\Ÿ\óŸ]KôŸ]
+	⁄][ô\ò\ûI H‹àﬂBàYà⁄⁄XŸOOIÿY	ŒÇà]V…‹‹X⁄X[€õ›\…◊OX€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊‹‹X⁄X[€õ›\…À	… Bà[ŸNÇà]V…‹‹X⁄X[€õ›\…◊OI…¬à€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊‹‹X⁄X[€õ›\◊ŸX⁄YY	◊OUùYBàYà]KôŸ]
+	‹X⁄ÿYŸWÿ€‹›… NÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯ß!H‹X⁄X[õ›\»X⁄\⁄[€àÿ]ôYàõ›»⁄€‹ŸH›»»[ôHH›\Y\à€‹›âÀô\W€X\ö›\]›\óÿ€‹›⁄Ÿ^Xõÿ\ô
+
+JBà[ŸNÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯ß!H‹X⁄X[õ›\»X⁄\⁄[€àÿ]ôYà⁄€‹ŸHHö[ò[›\à›]]âÀô\W€X\ö›\]›\ó€›]]⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	››\óÿ›\›€Wÿ€‹›â NÇàX›[€ó‹\ù»H]Y\ûKô]Kú‹]
+	Œâ BàX›[€àHX›[€ó‹\ù÷ÃWHYà[äX›[€ó‹\ù HàH[ŸH	…¬àYàôKôù[X]⁄
+â”Uó
+…ÀX›[€ãôKíJNÇàôYàHX›[€ãù\\ä
+BàôX»HÿY‹ôX€‹ô
+ôYäH‹àﬂBà]HHŸ[ú›\ôW‹›\Y\óÿ€‹› ôXÀôŸ]
+	Ÿ]I H‹àﬂJBà]HH€õ‹õX[^ôWŸ›Y\›ÿ€›[ù ]JBàöY[»Hÿ›\›€Wÿ€‹›ŸöY[ ]JBàYàõ›]KôŸ]
+	‹X⁄ÿYŸWÿ€‹›… NÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯ßcõ»X⁄ÿYŸH€‹›\»]òZ[XõHõ‹à\»][ô\ò\ûKâ Bàô]\õÇà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿ›\›€Wÿ€‹›‹ôYô\ô[òŸI◊HHôYÇà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿ›\›€Wÿ€‹›Ÿ]I◊HH€‹KôY\€‹J]JBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿ›\›€Wÿ€‹›ŸöY[…◊HHöY[¬à€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿ›\›€Wÿ€‹›⁄[ô^	◊HHà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿ›\›€Wÿ€‹›⁄[ú]	◊HHùYBàYàöY[ŒÇàŸ^KöY[Xô[€›[ùHöY[÷ÃBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKàâ¸'ÈÔà
+ê›\›€H€‹›
+óóâ¬àâ û€Xô[Jà8†%ÿ€›[ùH\‹Ÿ[ôŸ\ä Wâ¬àâ—[ù\àH\ôX›\ã\\ú€€à€‹›à^[\NàLóâ¬àâ’Hà€‹›õﬁ⁄[ÿ[›[]NàL0Â»ÿ€›[ùHHÃL
+ò€›[ùãXâÀàô\W€X\ö›\X›\›€Wÿ€‹›⁄Ÿ^Xõÿ\ô
+
+K\úŸW€[ŸOI”X\öŸ›€â Bà[ŸNÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKà	¸'ÈÔà
+ê›\›€H€‹›
+óóìõ»Y[–⁄[–’–ã–”êã—Pà€›[ù\»]òZ[XõKà[›Hÿ[à›[Ÿ]H\ôX›€‹›Yà[›HY\‹Ÿ[ôŸ\à€›[ù»ö\ú›âÀàô\W€X\ö›\X›\›€Wÿ€‹›⁄Ÿ^Xõÿ\ô
+
+K\úŸW€[ŸOI”X\öŸ›€â Bàô]\õÇàYàX›[€àOH	Ÿ€ôIŒÇà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊ÿ›\›€Wÿ€‹›Ÿ]I BàôYàH€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊ÿ›\›€Wÿ€‹›‹ôYô\ô[òŸI BàYàõ›]H‹àõ›ôYéÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯ßc›\›€H€‹›Ÿ\‹⁄[€à^\ôYàX\ŸH‹[à›\›€H€‹›YÿZ[ãâ Bàô]\õÇàûNÇà]HHŸö[ò[^ôWÿ›\›€Wÿ€‹›
+]JBàôX»HÿY‹ôX€‹ô
+ôYäH‹àﬂBàôX÷…Ÿ]I◊HH]Bàÿ]ôW‹ôX€‹ô
+ôYãôX Bà€€ù^ù\Ÿ\óŸ]V…⁄][ô\ò\ûI◊HH]Bàõ‹à»[à
+	‹[ô[ô◊ÿ›\›€Wÿ€‹›‹ôYô\ô[òŸIÀ	‹[ô[ô◊ÿ›\›€Wÿ€‹›Ÿ]IÀ	‹[ô[ô◊ÿ›\›€Wÿ€‹›ŸöY[…À	‹[ô[ô◊ÿ›\›€Wÿ€‹›⁄[ô^	À	‹[ô[ô◊ÿ›\›€Wÿ€‹›⁄[ú]	 NÇà€€ù^ù\Ÿ\óŸ]Kú‹
+Àõ€ôJBà»ô\ö[ùHÿ[YHÿ›[Y[ù[[YYX][H⁄]H\]Y€‹›õﬁÇà]Z[H]KôŸ]
+	Ÿ]Z[€]ô[	 H‹à	ÿò\⁄X…¬à€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\ó‹óŸ]Z[	◊HH]Z[à€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\ó‹ó€õ◊ÿ€‹›	◊HHò[ŸBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\óŸÿ›[Y[ù€[ŸI◊HH]KôŸ]
+	Ÿÿ›[Y[ù€[ŸI H‹à	⁄][ô\ò\ûI¬à]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯¶${Ó#»
+ê›\›€H€‹›ÿ]ôYäóóâ»
+»ÿ›\›€Wÿ€‹›‹›[[X\ûJ]JH
+»	◊ó∏£Ï»ôYŸ[ô\ò][ô»HãããâÀ\úŸW€[ŸOI”X\öŸ›€â Bà]ÿZ]Ÿ[ô\ò]W››\ó‹óŸö[ò[
+]Y\ûKõY\‹ÿYŸK€€ù^]K]Z[ò[ŸKôYô\ô[òŸO\ôYäBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä	–›\›€H€‹›ö[ò[^ò][€àòZ[Y	 Bà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKâ¯ßc€›[õ›ÿ]ôH›\›€H€‹›óóîôX\€€éà‹›ä^ VŒçÃ_X	À\úŸW€[ŸOI”X\öŸ›€â Bàô]\õÇàYàX›[€àOH	ÿÿ[òŸ[	ŒÇàõ‹à»[à
+	‹[ô[ô◊ÿ›\›€Wÿ€‹›‹ôYô\ô[òŸIÀ	‹[ô[ô◊ÿ›\›€Wÿ€‹›Ÿ]IÀ	‹[ô[ô◊ÿ›\›€Wÿ€‹›ŸöY[…À	‹[ô[ô◊ÿ›\›€Wÿ€‹›⁄[ô^	À	‹[ô[ô◊ÿ›\›€Wÿ€‹›⁄[ú]	 NÇà€€ù^ù\Ÿ\óŸ]Kú‹
+Àõ€ôJBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯ßc
+ê›\›€H€‹›ÿ[òŸ[Yäóóìõ»€‹›ÿ\»⁄[ôŸYâÀ\úŸW€[ŸOI”X\öŸ›€â Bàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	››\ó€X\ö›\â NÇà»òX⁄›ÿ\ô€€\]Xö[]Hõ‹à€[Y‹ò[HY\‹ÿYŸ\»‹ôX]YûHX\õY\àùZ[ÀÇà»õ»X\ö›\Ÿ\‹⁄[€à\»›\ùY[àåMNKÇàõ‹à€YÿXﬁW⁄Ÿ^H[à
+à	‹[ô[ô◊››\ó€X\ö›\‹ö[ù	À	‹[ô[ô◊››\ó€X\ö›\⁄[ú]	À	‹[ô[ô◊››\ó€X\ö›\€[ŸIÀà	‹[ô[ô◊››\ó€X\ö›\‹€ò\⁄›	À	‹[ô[ô◊››\ó€X\ö›\ÿÿ[ôY]I¬à
+NÇà€€ù^ù\Ÿ\óŸ]Kú‹
+€YÿXﬁW⁄Ÿ^Kõ€ôJBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+à]Y\ûKà	¯°.{Ó#»
+ïH€›\àX\ö›\ﬁ\›[H\»ôY[àô[[›ôYäóóâ¬à	’\ŸH
+ì[ŸYûH	àôYŸ[ô\ò]Jà€àH›\àà[ô[YHHö[ò[›\›€Y\à€‹›[ô»ò]\ò[KûH^‹àõ⁄XŸKâÀà\úŸW€[ŸOI”X\öŸ›€â¬à
+Bàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+	››\óÿ€‹›â NÇà⁄⁄XŸO\]Y\ûKô]Kú‹]
+	ŒâÀJVÃWBà]OWŸ[ú›\ôW‹›\Y\óÿ€‹› €€ù^ù\Ÿ\óŸ]KôŸ]
+	⁄][ô\ò\ûI H‹àﬂJBà€€ù^ù\Ÿ\óŸ]V…⁄][ô\ò\ûI◊OY]BàYà⁄⁄XŸOOI€õ€ôIŒÇà]V…‹⁄›◊ÿ€‹›	◊OQò[ŸBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\óÿ€‹›ŸX⁄YY	◊OUùYBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¸'Â™;Ó#»
+îö[ù⁄]›]€‹›Ÿ[X›YäóóïH[ù\õò[›\Y\à€‹›⁄[ôHY[àúõ€HH›\›€Y\àãâÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\]›\ó€›]]⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇàYà⁄⁄XŸH[à
+	€X\ö›\‹ö[ù	À	€X\ö›\	 NÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯°.{Ó#»H€X\ö›\ﬁ\›[H\»ôY[àô[[›ôYà\ŸH
+ì[ŸYûH	àôYŸ[ô\ò]Jà[ô[YHHö[ò[›\›€Y\à€‹›ò]\ò[HûH^‹àõ⁄XŸKâÀ\úŸW€[ŸOI”X\öŸ›€â Bàô]\õÇà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\óÿ€‹›ŸX⁄YY	◊OUùYBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯ß!H€‹›ôYô\ô[òŸHÿ]ôYà⁄€‹ŸHHö[ò[›\à›]]âÀô\W€X\ö›\]›\ó€›]]⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+ù›\ó€›]]€[ŸNàäNÇà\ù»H]Y\ûKô]Kú‹]
+éàäBà]Z[H\ù÷ÃWHYà[ä\ù HàH[ŸH	ÿò\⁄X…¬à[ŸHH\ù÷ÃóHYà[ä\ù Hàà[ŸH	‹][›][€â¬à]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKà∏ß!HŸ]Z[ù]J
+_Hà8†(à…’›\à][›][€â»Yà[ŸOOI‹][›][€â»[ŸH	’›\àõ›X⁄\âﬂHŸ[X›Yàã\úŸW€[ŸOI”X\öŸ›€â BàYà››\ó›åóÿX›]ôJ€€ù^
+NÇà»›[Hù]€ú»úõ€H€\àòYù»›^HÿYôNàö[ù\ôX›H[ôô]ô\àô[‹[à€ò[ú⁄]⁄⁄XŸ\ÀÇà]OX€‹KôY\€‹J€€ù^ù\Ÿ\óŸ]KôŸ]
+	⁄][ô\ò\ûI H‹àﬂJBàYàõ›]NÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	¯ßcõ»›\úô[ù›\àòYù\»]òZ[XõKâÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà›ä]KôŸ]
+	Ÿ]Z[€]ô[	 H‹à	ÿò\⁄X… Kõ›Ÿ\ä
+HOY]Z[Çà›]\œX]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+â¯ß*ô\\ö[ô»HŸ]Z[H][ô\ò\ûKããâ Bà€€ò[YO\›ä]KôŸ]
+	ÿ€Y[ù€ò[YI H‹à	… Bà]OX]ÿZ]‹ù[óÿZW›⁄]‹ô]ûW‹›]\ ]Y\ûKõY\‹ÿYŸK[XôNà\ﬁ[ò⁄[Àù◊›ôXY
+[ö[òŸW‹X⁄ÿYŸW⁄][ô\ò\ûK]KRW–TW“—VKRW”S—S]Z[
+K›]\œ\›]\ Bà]V…ÿ€Y[ù€ò[YI◊O[€€ò[YH‹à›ä]KôŸ]
+	ÿ€Y[ù€ò[YI H‹à	… Bà]V…Ÿ]Z[€]ô[	◊OY]Z[à]ÿZ]ÿYôW‹›]\◊ŸY]
+›]\À]Y\ûKõY\‹ÿYŸKâ¯ß!HŸ]Z[ù]J
+_H^H[àôXYKâ Bà]V…Ÿÿ›[Y[ù€[ŸI◊O[[ŸBà€€ù^ù\Ÿ\óŸ]V…⁄][ô\ò\ûI◊OY]Bà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\óŸÿ›[Y[ù€[ŸI◊O[[ŸBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\ó‹óŸ]Z[	◊OY]Z[àõ◊ÿ€‹›[õ›õ€€
+]KôŸ]
+	‹⁄›◊ÿ€‹›	 H[ô]KôŸ]
+	‹X⁄ÿYŸWÿ€‹›… JBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\ó‹ó€õ◊ÿ€‹›	◊O[õ◊ÿ€‹›à€€ù^ù\Ÿ\óŸ]V…››\ó›åó‹\ŸI◊OI‹ö[ù[ô◊Ÿ\ôX›	¬àôYãœX]ÿZ]Ÿ[ô\ò]W››\ó‹óŸö[ò[
+]Y\ûKõY\‹ÿYŸK€€ù^]K]Z[õ◊ÿ€‹›
+Bà€€ù^ù\Ÿ\óŸ]V…››\ó›åó‹\ŸI◊OIÿ€€\]I¬à]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	¯ß!Hà[]ô\ôYàôXYHõ‹àHô]»\ÿY‹à\ŸHHù]€ú»€àHà»[ŸYûH]âÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà]ÿZ]‹ô\\ôW››\ó‹ó‹ô\]Y\›
+]Y\ûKõY\‹ÿYŸK€€ù^]Z[[ŸJBàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+ù›\ó€›]]àäNÇà\ù»H]Y\ûKô]Kú‹]
+éàäBà›]]H\ù÷ÃWBà]Z[H\ù÷ÃóBàYà››\ó›åóÿX›]ôJ€€ù^
+NÇà]OX€‹KôY\€‹J€€ù^ù\Ÿ\óŸ]KôŸ]
+ö][ô\ò\ûHäH‹àﬂJBàYàõ›]NÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+ìõ»][ô\ò\ûH]H\»]òZ[XõKàX\ŸH›\ùH›\à€‹öŸõ›»YÿZ[ãàãô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇàûNÇàYà›ä]KôŸ]
+ô]Z[€]ô[äH‹àòò\⁄X»äKõ›Ÿ\ä
+HOY]Z[Çà›]\œX]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+à∏ß*ô\\ö[ô»HŸ]Z[H][ô\ò\ûKããàäBà€€ò[YO\›ä]KôŸ]
+ò€Y[ù€ò[YHäH‹ààäBà]OX]ÿZ]‹ù[óÿZW›⁄]‹ô]ûW‹›]\ ]Y\ûKõY\‹ÿYŸK[XôNà\ﬁ[ò⁄[Àù◊›ôXY
+[ö[òŸW‹X⁄ÿYŸW⁄][ô\ò\ûK]KRW–TW“—VKRW”S—S]Z[
+K›]\œ\›]\ Bà]V»ò€Y[ù€ò[YHóO[€€ò[YH‹à›ä]KôŸ]
+ò€Y[ù€ò[YHäH‹ààäBà]V»ô]Z[€]ô[óOY]Z[à]ÿZ]ÿYôW‹›]\◊ŸY]
+›]\À]Y\ûKõY\‹ÿYŸK∏ß!H][ô\ò\ûH]Z[]ô[ôXYKàäBà]V»ú⁄›◊ÿ€‹›óOXõ€€
+]KôŸ]
+ú⁄›◊ÿ€‹›äH[ô]KôŸ]
+úX⁄ÿYŸWÿ€‹›»äJBà€€ù^ù\Ÿ\óŸ]V»ö][ô\ò\ûHóOY]BàYà›]]OHù⁄]ÿ\éÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKà∏ß!HŸ]Z[ù]J
+_H⁄]–\Ÿ[X›YàŸ[ô\ò][ô»õ›ÀããàäBà]ÿZ]ô\W›^ÿ⁄[öŸY
+]Y\ûKõY\‹ÿYŸKùZ[›⁄]ÿ\⁄][ô\ò\ûJ]K]Z[
+K\úŸW€[ŸOHìX\öŸ›€àäBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+∏ß!H⁄]–\][ô\ò\ûHŸ[ô\ò]Yà[›Hÿ[à⁄€‹ŸH[õ›\àõ‹õX]ô[›Ààãô\W€X\ö›\W››\ó›åó€›]]⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇàYà›]]OHúàéÇàô\]Y\›Y€[ŸHH›ä€€ù^ù\Ÿ\óŸ]KôŸ]
+ú€X\ù‹ô\]Y\›YŸÿ›[Y[ù€[ŸHäH‹ààäKõ›Ÿ\ä
+BàYàô\]Y\›Y€[ŸH[à
+ú][›][€àãùõ›X⁄\àäNÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+à]Y\ûKààº'‰·
+ûŸ]Z[ù]J
+_H…’›\à][›][€â»Yàô\]Y\›Y€[ŸOOI‹][›][€â»[ŸH	’›\àõ›X⁄\âﬂHŸ[X›Yúõ€H[›\àRH\‹⁄\›[ùô\]Y\›äóóëŸ[ô\ò][ô»õ›Àããàãà\úŸW€[ŸOHìX\öŸ›€àãà
+Bà]ÿZ]‹ô\\ôW››\ó‹ó‹ô\]Y\›
+]Y\ûKõY\‹ÿYŸK€€ù^]Z[ô\]Y\›Y€[ŸJBà[ŸNÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+à]Y\ûKààº'‰·
+ûŸ]Z[ù]J
+_HàŸ[X›Yäóóìõ›»⁄€‹ŸH⁄]\à\»⁄›[ôHH›\àõ›X⁄\à‹à›\à][›][€ãàãà\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\]›\ó‹ó€[ŸW⁄Ÿ^Xõÿ\ô
+]Z[
+Bà
+Bàô]\õÇà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€äï›\àåà›]]òZ[YäBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+à∏ßc›\à›]]òZ[Yà‹›ä^ VŒçÃ_Hãô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇàÿ›[Y[ù€[ŸHH\ù÷Ã◊HYà[ä\ù Hà»[ŸHõ€ôBà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+ö][ô\ò\ûHäBàYàõ›]NÇà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+ìõ»][ô\ò\ûH]H\»]òZ[XõKàX\ŸH›\ùH›\à€‹öŸõ›»YÿZ[ãàãô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇàûNÇàYà›]]OHúàéÇàô\]Y\›Y€[ŸHHÿ›[Y[ù€[ŸH‹à›ä€€ù^ù\Ÿ\óŸ]KôŸ]
+ú€X\ù‹ô\]Y\›YŸÿ›[Y[ù€[ŸHäH‹ààäKõ›Ÿ\ä
+BàYàô\]Y\›Y€[ŸH[à
+	‹][›][€âÀ	›õ›X⁄\â NÇà]ÿZ]‹ô\\ôW››\ó‹ó‹ô\]Y\›
+]Y\ûKõY\‹ÿYŸK€€ù^]Z[ô\]Y\›Y€[ŸJBà[ŸNÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+à]Y\ûKààº'‰·
+ûŸ]Z[ù]J
+_HàŸ[X›Yäóóìõ›»⁄€‹ŸH⁄]\à\»⁄›[ôHH›\à][›][€à‹à›\àõ›X⁄\ãàãà\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\]›\ó‹ó€[ŸW⁄Ÿ^Xõÿ\ô
+]Z[
+Bà
+Bàô]\õÇàYà›ä]KôŸ]
+ô]Z[€]ô[ãàäJKõ›Ÿ\ä
+HOH]Z[Çà€€ò[YHH›ä]KôŸ]
+	ÿ€Y[ù€ò[YI H‹à	… Kú›ö\
+
+Bà]HH]ÿZ]‹ù[óÿZW›⁄]‹ô]ûW‹›]\ ]Y\ûKõY\‹ÿYŸK[XôNà\ﬁ[ò⁄[Àù◊›ôXY
+[ö[òŸW‹X⁄ÿYŸW⁄][ô\ò\ûK]KRW–TW“—VKRW”S—S]Z[
+JBà]V»ò€Y[ù€ò[YHóHH€€ò[YH‹à›ä]KôŸ]
+ò€Y[ù€ò[YHäH‹ààäKú›ö\
+
+Bà]V»ô]Z[€]ô[óHH]Z[àYà]KôŸ]
+	ÿåòâ H‹à]KôŸ]
+	ÿúò[ô€ô]]ò[	 H‹à€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊ÿåòâ NÇà]HHÿ\W››\óŸÿ›[Y[ù€[ŸWŸöY[ à]Kà€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊››\óŸÿ›[Y[ù€[ŸI H‹à]KôŸ]
+	Ÿÿ›[Y[ù€[ŸI H‹à	⁄][ô\ò\ûIÀàåòèUùYKà
+Bà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿåòâ◊HHùYBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿ€X[óÿYŸ[òﬁI◊HHùYBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊››\ó€\›‹YŸI◊HH	ÿåòâ¬à€€ù^ù\Ÿ\óŸ]V»ö][ô\ò\ûHóHH]BàYà›]]OHù⁄]ÿ\éÇà]ÿZ]ô\W›^ÿ⁄[öŸY
+]Y\ûKõY\‹ÿYŸKùZ[›⁄]ÿ\⁄][ô\ò\ûJ]K]Z[
+K\úŸW€[ŸOHìX\öŸ›€àäBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+º'‰ÏH⁄]–\][ô\ò\ûHŸ[ùà[›Hÿ[à⁄€‹ŸH[õ›\àõ‹õX]‹àXZŸH⁄[ôŸ\Ààãô\W€X\ö›\YòYù‹ô]öY]◊⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€äï›\à›]]Ÿ[ô\ò][€àòZ[YäBà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+à∏ßc›\à›]]òZ[Yà‹›ä^ VŒçÃ_Hãô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇÇàYà]Y\ûKô]H[à
+ôŸ[ô\ò]HãôŸ[ô\ò]W€õ◊ÿ€‹›äNÇà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+ö][ô\ò\ûHäBàYàõ›]NÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKìõ»][ô\ò\ûH]H\»]òZ[XõKàX\ŸH›\ùYÿZ[ãàäBàô]\õÇà]HHX›
+]JBà]Z[H]KôŸ]
+	Ÿ]Z[€]ô[	 H‹à	ÿò\⁄X…¬àõ◊ÿ€‹›H]Y\ûKô]HOH	ŸŸ[ô\ò]W€õ◊ÿ€‹›	¬à]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK∏£Ï»Ÿ[ô\ò][ô»Hö[ò[›\àà⁄]HYò][	êÀããàäBàûNÇà]ÿZ]Ÿ[ô\ò]W››\ó‹óŸö[ò[
+]Y\ûKõY\‹ÿYŸK€€ù^]K]Z[õ◊ÿ€‹›
+Bà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+	¯ß!HôXYHõ‹àHô^ô\]Y\›âÀô\W€X\ö›\\ôXYW⁄Ÿ^Xõÿ\ô
+
+JBà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€ä	’›\ààŸ[ô\ò][€àòZ[Y	 Bà]ÿZ]]Y\ûKõY\‹ÿYŸKúô\W›^
+â¯ßc›\ààŸ[ô\ò][€àòZ[YóóîôX\€€éà‹›ä^ VŒé_IÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇÇàYà]Y\ûKô]H[à
+ôõ€›\óÿò\àãôõ€›\óŸ\⁄Y€àãôõ€›\åàãúö[ùÿ€X[àãôõ€›\óﬁY\»ãôõ€›\ó€õ»äNÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¯°.{Ó#»õ€›\à\»õ›»€€ùõ€YûH‹Ÿ][ô‹»[ôûH[ŸYûH	àôYŸ[ô\ò]HYù\àHà\»Ÿ[ô\ò]Yâ Bàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+ôò\ôW€‹öY⁄[ò[àäNÇàÿÿ[òŸ[ÿ]]◊‹ö[ù
+€€ù^
+Bà⁄[ôH]Y\ûKô]Kú‹]
+éàãJVÃWBà›\Y\ó››[Hõÿ]
+€€ù^ù\Ÿ\óŸ]KôŸ]
+ú[ô[ô◊Ÿò\ôW‹›\Y\ó››[ã
+H‹à
+BàYà›\Y\ó››[HÇà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKà∏ßcõ»‹öY⁄[ò[›\Y\àò\ôHÿ\»õ›[ôóóàÇàï\ŸH
+êY€‹›
+à‹à
+îö[ù⁄]›]ò\ôJà[ú›XYàãà\úŸW€[ŸOHìX\öŸ›€àÇà
+Bàô]\õÇà€€ù^ù\Ÿ\óŸ]VŸàú[ô[ô◊ﬁ⁄⁄[ôWŸò\ôHóHH›\Y\ó››[à€€ù^ù\Ÿ\óŸ]Kú‹
+ú[ô[ô◊Ÿò\ôW⁄⁄[ôãõ€ôJBà€€ù^ù\Ÿ\óŸ]V»ú[ô[ô◊Ÿõ€›\ó⁄⁄[ôóHH⁄[ôà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKàº'‰¨
+ì‹öY⁄[ò[›\Y\àò\ôHŸ[X›YàSîà‹›\Y\ó››[ãåôüKäóóëŸ[ô\ò][ô»⁄]Hÿ]ôY⁄⁄[ôù]J
+_Hõ€›\àŸ][ôÀããàã\úŸW€[ŸOHìX\öŸ›€àäBà]ÿZ]‹ö[ù›X⁄Ÿ]Ÿö[ò[
+]Y\ûKõY\‹ÿYŸK€€ù^⁄[ôõ€›\ó€[ŸOWŸYò][Ÿõ€›\ó€[ŸJ⁄[ô
+JBàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+ôò\ôWÿYàäNÇàÿÿ[òŸ[ÿ]]◊‹ö[ù
+€€ù^
+Bà⁄[ô\]Y\ûKô]Kú‹]
+éàãJVÃWBà€€ù^ù\Ÿ\óŸ]V»ú[ô[ô◊Ÿò\ôW⁄⁄[ôóOZ⁄[ôà›\Y\ó››[Yõÿ]
+€€ù^ù\Ÿ\óŸ]KôŸ]
+ú[ô[ô◊Ÿò\ôW‹›\Y\ó››[ã
+H‹à
+BàYà⁄[ôOI⁄›[	ŒÇàYà›\Y\ó››[àÇàõ€\Jàº'„Í
+î›\Y\à›[›[àSîà‹›\Y\ó››[ãåüKäóóàÇàë[ù\à›[›\›€Y\à€‹›[ô»\ŒàÕL\àõ€€H\àöY⁄òõ€€Hå[ôPàLå\àöY⁄ò›[çLóìõ»ôYö^\»ô\]Z\ôYàH⁄[ÿ[›[]Hõ€€\»0Â»öY⁄»[ôPà0Â»öY⁄»]]€X]Xÿ[KàH\ôX››[\»[€»XÿŸ\YàäBà[ŸNÇàõ€\Jº'„Í
+êY›[€‹›
+óóë[ù\éàÕL\àõ€€H\àöY⁄òõ€€Hå[ôPàLå\àöY⁄ò›[çLóìõ»ôYö^\»ô\]Z\ôYàH⁄[ÿ[›[]Hõ€€\»0Â»öY⁄»[ôPà0Â»öY⁄»]]€X]Xÿ[KàH\ôX››[\»[€»XÿŸ\YàäBà[Yà›\Y\ó››[àÇàõ€\Jàº'‰¨
+î›\Y\àò\ôNàSîà‹›\Y\ó››[ãåüKäóóàÇàï‹ö]HH›\›€Y\à€‹›ò]\ò[H8†%
+õõ»ôYö^\»ô\]Z\ôY
+ãóò\à^\à\ú€€ò[ôXX⁄YX[à[›\àŸ[[ô»ò\ôH\à^»\ŸH
+ÿ‹àX\ö›\õ‹à[à^X⁄]X\ö›\óóàÇàë^[\\ŒóàÇàòÕåMH8°§àŸ[[ô»ò\ôHSîàÀåMH0Â»Y[–⁄[^ò»8°§à€X\ùX\ö›\⁄[à]\»ô[›»›\Y\àò
+Õ»\à\ú€€ò8°§à^X⁄]X\ö›\Sîà»0Â»Y[–⁄[^òéLÕH›[8°§àö[ò[õ€⁄⁄[ô»›[SîàéLÕWàÇàòYX\ö›\Ã\à^ò»\à^[ò€Y[ô»[ôò[ù8°§à[ò€YHSëà€◊àÇàòX\ö›\Lå›[àÇàòML›[àÇàòXZŸH›[MLàÇàòMLäBà[ŸNÇàõ€\Jº'‰¨
+ìõ»›\Y\àò\ôH\»]òZ[XõKäóóàÇàï‹ö]HHö[ò[›\›€Y\à›[ò]\ò[H8†%õ»ôYö^ô\]Z\ôYóóàÇàë^[\\ŒàMLML›[XZŸH›[MLóàÇàî\ã\\ú€€àX\ö›\ôYY»[à‹öY⁄[ò[›\Y\àò\ôKàäBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûKõ€\\úŸW€[ŸOI”X\öŸ›€â Bàô]\õÇÇàYà]Y\ûKô]Kú›\ù›⁄]
+ôò\ôW€õ€ôNàäNÇàÿÿ[òŸ[ÿ]]◊‹ö[ù
+€€ù^
+Bà⁄[ô\]Y\ûKô]Kú‹]
+éàãJVÃWBà€€ù^ù\Ÿ\óŸ]VŸàú[ô[ô◊ﬁ⁄⁄[ôWŸò\ôHóOSõ€ôBà€€ù^ù\Ÿ\óŸ]Kú‹
+ú[ô[ô◊Ÿò\ôW⁄⁄[ôãõ€ôJBà]ÿZ]ÿYôWÿÿ[òX⁄◊ŸY]
+]Y\ûK	¸'Â™;Ó#»
+ëò\ôH⁄[õ›ôHö[ùYäóóëŸ[ô\ò][ô»⁄]Hÿ]ôYõ€›\àŸ][ôÀããâÀ\úŸW€[ŸOI”X\öŸ›€â Bà€€ù^ù\Ÿ\óŸ]V»ú[ô[ô◊Ÿõ€›\ó⁄⁄[ôóHH⁄[ôà]ÿZ]‹ö[ù›X⁄Ÿ]Ÿö[ò[
+]Y\ûKõY\‹ÿYŸK€€ù^⁄[ôõ€›\ó€[ŸOWŸYò][Ÿõ€›\ó€[ŸJ⁄[ô
+JBàô]\õÇÇÇÇÇôYàŸõ€›\ó‹Ÿ][ô◊€Xô[
+[ŸJNÇàô]\õà…Ÿ\⁄Y€âŒâ—õ€›\àH
+€\⁄Y€äIÀ	Ÿõ€›\åâŒâ—õ€›\àà
+ô]»\⁄Y€äIÀ	ÿò\âŒâ–€€ùX›ò\âﬂKôŸ]
+[ŸK	—õ€›\àà
+ô]»\⁄Y€äI BÇôYàŸ][ô‹◊Ÿõ€›\ó⁄Ÿ^Xõÿ\ô
+⁄[ô
+NÇà›\úô[ùYŸ]ŸYò][Ÿõ€›\ä⁄[ô
+Bàô]\õà[õ[ôRŸ^Xõÿ\ôX\ö›\
+¬à“[õ[ôRŸ^Xõÿ\ôù]€ä
+	¯ß!H	»Yà›\úô[ùOIŸ\⁄Y€â»[ŸH	… J…—õ€›\àH8†(à€\⁄Y€âÀÿ[òX⁄◊Ÿ]OYâ‹Ÿ][ô‹Œôõ€›\éû⁄⁄[ôNô\⁄Y€â WKà“[õ[ôRŸ^Xõÿ\ôù]€ä
+	¯ß!H	»Yà›\úô[ùOIŸõ€›\åâ»[ŸH	… J…—õ€›\àà8†(àô]»\⁄Y€âÀÿ[òX⁄◊Ÿ]OYâ‹Ÿ][ô‹Œôõ€›\éû⁄⁄[ôNôõ€›\åâ WKà“[õ[ôRŸ^Xõÿ\ôù]€ä
+	¯ß!H	»Yà›\úô[ùOIÿò\â»[ŸH	… J…–€€ùX›ò\âÀÿ[òX⁄◊Ÿ]OYâ‹Ÿ][ô‹Œôõ€›\éû⁄⁄[ôNòò\â WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¯´!{Ó#»òX⁄»»Ÿ][ô‹…Àÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œõ‹[â WKàJBÇôYàŸ][ô‹◊››\ó€\›‹YŸW⁄Ÿ^Xõÿ\ô
+
+NÇà›\úô[ùYŸ]››\ó€\›‹YŸJ
+Bà‹œV 	›◊€õ€óŸ€€Ÿ€IÀ	¸'‰Á	ê»ì”à””—”I K
+	›⁄]›]Ÿõ€›\âÀ	¸'‰·⁄]›]õ€›\â WBàõ›‹œV◊Bàõ‹àŸ^KXô[[à‹ŒÇàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä
+	¯ß!H	»Yà›\úô[ùOZŸ^H[ŸH	… J€Xô[ÿ[òX⁄◊Ÿ]OYâ‹Ÿ][ô‹Œù›\ó€\›‹YŸNû⁄Ÿ^_I WJBàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¯´!{Ó#»òX⁄»»Ÿ][ô‹…Àÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œõ‹[â WJBàô]\õà[õ[ôRŸ^Xõÿ\ôX\ö›\
+õ›‹ BÇôYàŸ][ô‹◊€Ÿ€◊⁄Ÿ^Xõÿ\ô
+⁄[ô
+NÇà›\úô[ùYŸ]€Ÿ€◊‹ÿÿ[J⁄[ô
+BàXô[^…ŸõY⁄	Œâ–Z\âÀ	ÿù\…Œâ–ù\…À	⁄›[	Œâ“›[	À	‹X⁄ÿYŸIŒâ’›\âﬂV⁄⁄[ôBàô]\õà[õ[ôRŸ^Xõÿ\ôX\ö›\
+¬à“[õ[ôRŸ^Xõÿ\ôù]€ä	¯ß•àŸ€»⁄^ôIÀÿ[òX⁄◊Ÿ]OYâ‹Ÿ][ô‹ŒõŸ€Œû⁄⁄[ôNãLåL	 K[õ[ôRŸ^Xõÿ\ôù]€äâﬁ⁄[ù
+õ›[ô
+›\úô[ù
+åL
+J_IIÀÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œõõ€‹	 K[õ[ôRŸ^Xõÿ\ôù]€ä	”Ÿ€»⁄^ôH8ß•IÀÿ[òX⁄◊Ÿ]OYâ‹Ÿ][ô‹ŒõŸ€Œû⁄⁄[ôNååL	 WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¯´!{Ó#»òX⁄»»Ÿ][ô‹…Àÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œõ‹[â WKàJBÇÇôYàŸ][ô‹◊⁄Ÿ^Xõÿ\ô
+
+NÇàœ[ÿY‹Ÿ][ô‹ 
+BàYàX\ö Ÿ^KXô[
+Nàô]\õààû…¯ß!I»Yà÷…ÿù]€ú…◊KôŸ]
+Ÿ^KùYJH[ŸH	¯ßc	ﬂH€Xô[HÇàô\ÀôŸ]
+	Ÿõ€›\óŸYò][…ÀﬂJBàô]\õà[õ[ôRŸ^Xõÿ\ôX\ö›\
+¬à“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'Â)õ€ùà	 ‹÷…Ÿõ€ù	◊Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œôõ€ù… WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¯ß•à^⁄^ôIÀÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œú⁄^ôNãLåI K[õ[ôRŸ^Xõÿ\ôù]€äàº'Â(⁄[ù
+õ›[ô
+÷…›^‹ÿÿ[I◊JåL
+J_IHãÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œõõ€‹	 K[õ[ôRŸ^Xõÿ\ôù]€ä	¯ß•H^⁄^ôIÀÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œú⁄^ôNååI WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¯ß";Ó#»Z\àõ€›\éà	 ◊Ÿõ€›\ó‹Ÿ][ô◊€Xô[
+ôôŸ]
+	ŸõY⁄	À	Ÿõ€›\åâ JKÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œôõ€›\ó€Y[ùNôõY⁄	 WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'Ê£ù\»õ€›\éà	 ◊Ÿõ€›\ó‹Ÿ][ô◊€Xô[
+ôôŸ]
+	ÿù\…À	Ÿõ€›\åâ JKÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œôõ€›\ó€Y[ùNòù\… WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'„Í›[õ€›\éà	 ◊Ÿõ€›\ó‹Ÿ][ô◊€Xô[
+ôôŸ]
+	⁄›[	À	Ÿõ€›\åâ JKÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œôõ€›\ó€Y[ùNö›[	 WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'ÂÓªÓ#»›\àõ€›\éà	 ◊Ÿõ€›\ó‹Ÿ][ô◊€Xô[
+ôôŸ]
+	‹X⁄ÿYŸIÀ	Ÿõ€›\åâ JKÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œôõ€›\ó€Y[ùNúX⁄ÿYŸI WKà“[õ[ôRŸ^Xõÿ\ôù]€äà∏ß";Ó#»Z\àŸ€Œà⁄[ù
+õ›[ô
+Ÿ]€Ÿ€◊‹ÿÿ[J	ŸõY⁄	 JåL
+J_IHãÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒõŸ€◊€Y[ùNôõY⁄	 K[õ[ôRŸ^Xõÿ\ôù]€äàº'Ê£ù\»Ÿ€Œà⁄[ù
+õ›[ô
+Ÿ]€Ÿ€◊‹ÿÿ[J	ÿù\… JåL
+J_IHãÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒõŸ€◊€Y[ùNòù\… WKà“[õ[ôRŸ^Xõÿ\ôù]€äàº'„Í›[Ÿ€Œà⁄[ù
+õ›[ô
+Ÿ]€Ÿ€◊‹ÿÿ[J	⁄›[	 JåL
+J_IHãÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒõŸ€◊€Y[ùNö›[	 K[õ[ôRŸ^Xõÿ\ôù]€äàº'ÂÓªÓ#»›\àŸ€Œà⁄[ù
+õ›[ô
+Ÿ]€Ÿ€◊‹ÿÿ[J	‹X⁄ÿYŸI JåL
+J_IHãÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒõŸ€◊€Y[ùNúX⁄ÿYŸI WKà“[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	€XZŸWÿ⁄[ôŸ\…À	‘€X\ù⁄[ôŸ\… Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€NõXZŸWÿ⁄[ôŸ\… WKà“[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	ÿYÿ€‹›	À	–Y€‹›	 Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€NòYÿ€‹›	 K[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	‹ö[ù›⁄]›]Ÿò\ôIÀ	’⁄]›]ò\ôI Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€Núö[ù›⁄]›]Ÿò\ôI WKà“[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	‹ö[ù€‹öY⁄[ò[Ÿò\ôIÀ	”‹öY⁄[ò[ò\ôI Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€Núö[ù€‹öY⁄[ò[Ÿò\ôI K[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	‹YŸW‹⁄^ôWÿ€€ùõ€…À	‘YŸH⁄^ô\… Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€NúYŸW‹⁄^ôWÿ€€ùõ€… WKà“[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	›ÿ]\õX\ö…À	’ÿ]\õX\ö… Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€Nùÿ]\õX\ö… WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¯•‡;Ó#»‹X⁄]IÀÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œù€W€‹X⁄]NãLåI K[õ[ôRŸ^Xõÿ\ôù]€äàû⁄[ù
+õ›[ô
+÷…›ÿ]\õX\ö◊€‹X⁄]I◊JåL
+J_IHãÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œõõ€‹	 K[õ[ôRŸ^Xõÿ\ôù]€ä	”‹X⁄]H8•≠ªÓ#…Àÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œù€W€‹X⁄]NååI WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¯•‡;Ó#»ÿÿ[IÀÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œù€W‹ÿÿ[NãLåL	 K[õ[ôRŸ^Xõÿ\ôù]€äàû⁄[ù
+õ›[ô
+÷…›ÿ]\õX\ö◊‹ÿÿ[I◊JåL
+J_IHãÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œõõ€‹	 K[õ[ôRŸ^Xõÿ\ôù]€ä	‘ÿÿ[H8•≠ªÓ#…Àÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œù€W‹ÿÿ[NååL	 WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¸'‰Á›\à\›YŸNà	 ›\õ\◊€Xô[
+Ÿ]››\ó€\›‹YŸJ
+JKÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œù›\ó€\›‹YŸW€Y[ùI WKà“[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	€XZ[ó››\âÀ	’›\â Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€NõXZ[ó››\â K[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	€XZ[óÿZ\âÀ	–Z\â Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€NõXZ[óÿZ\â WKà“[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	€XZ[óÿù\…À	–ù\… Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€NõXZ[óÿù\… K[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	€XZ[ó⁄›[	À	“›[	 Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€NõXZ[ó⁄›[	 WKà“[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	€XZ[óÿZIÀ	–RH\‹⁄\›[ù	 Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€NõXZ[óÿZI WKà“[õ[ôRŸ^Xõÿ\ôù]€äX\ö 	€XZ[ó‹Ÿ][ô‹…À	‘Ÿ][ô‹»ù]€â Kÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹ŒùŸŸ€NõXZ[ó‹Ÿ][ô‹… WKà“[õ[ôRŸ^Xõÿ\ôù]€ä	¯¶n˚Ó#»ô\Ÿ]Ÿ][ô‹…Àÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œúô\Ÿ]	 WKàJBÇôYàŸ][ô‹◊Ÿõ€ù⁄Ÿ^Xõÿ\ô
+
+NÇà›\úô[ù[ÿY‹Ÿ][ô‹ 
+V…Ÿõ€ù	◊Bàõ›‹œV÷“[õ[ôRŸ^Xõÿ\ôù]€ä
+	¯ß!H	»Yàò[YOOX›\úô[ù[ŸH	… J€ò[YKÿ[òX⁄◊Ÿ]OYâ‹Ÿ][ô‹Œôõ€ùû€ò[Y_I WHõ‹àò[YH[àì”ï”‘S”î◊Bàõ›‹Àò\[ô
+“[õ[ôRŸ^Xõÿ\ôù]€ä	¯´!{Ó#»òX⁄»»Ÿ][ô‹…Àÿ[òX⁄◊Ÿ]OI‹Ÿ][ô‹Œõ‹[â WJBàô]\õà[õ[ôRŸ^Xõÿ\ôX\ö›\
+õ›‹ BÇò\ﬁ[ò»YàŸ][ô‹◊ÿ€€[X[ô
+\]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàYàõ›\◊ÿ[›ŸY
+\]JNàô]\õÇàœ[ÿY‹Ÿ][ô‹ 
+N»ô\ÀôŸ]
+	Ÿõ€›\óŸYò][…ÀﬂJBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à	¯¶¶{Ó#»
+ì^U›\êò^ò\àö[ùŸ][ô‹ óóâ¬ààëõ€ùà
+û‹÷…Ÿõ€ù	◊_Jóï^⁄^ôNà
+û⁄[ù
+õ›[ô
+÷…›^‹ÿÿ[I◊JåL
+J_IJóàÇàà∏ß";Ó#»Z\àõ€›\éà
+û◊Ÿõ€›\ó‹Ÿ][ô◊€Xô[
+ôôŸ]
+	ŸõY⁄	À	Ÿõ€›\åâ J_JóàÇààº'Ê£ù\»õ€›\éà
+û◊Ÿõ€›\ó‹Ÿ][ô◊€Xô[
+ôôŸ]
+	ÿù\…À	Ÿõ€›\åâ J_JóàÇààº'„Í›[õ€›\éà
+û◊Ÿõ€›\ó‹Ÿ][ô◊€Xô[
+ôôŸ]
+	⁄›[	À	Ÿõ€›\åâ J_JóàÇààº'ÂÓªÓ#»›\àõ€›\éà
+û◊Ÿõ€›\ó‹Ÿ][ô◊€Xô[
+ôôŸ]
+	‹X⁄ÿYŸIÀ	Ÿõ€›\åâ J_JóàÇààìŸ€»⁄^ô\ŒàZ\à⁄[ù
+õ›[ô
+Ÿ]€Ÿ€◊‹ÿÿ[J	ŸõY⁄	 JåL
+J_IHù\»⁄[ù
+õ›[ô
+Ÿ]€Ÿ€◊‹ÿÿ[J	ÿù\… JåL
+J_IH›[⁄[ù
+õ›[ô
+Ÿ]€Ÿ€◊‹ÿÿ[J	⁄›[	 JåL
+J_IH›\à⁄[ù
+õ›[ô
+Ÿ]€Ÿ€◊‹ÿÿ[J	‹X⁄ÿYŸI JåL
+J_IWàÇààïÿ]\õX\öŒà
+û…””â»Yà÷…ÿù]€ú…◊KôŸ]
+	›ÿ]\õX\ö… H[ŸH	”—ëâﬂJà‹X⁄]Nà
+û⁄[ù
+õ›[ô
+÷…›ÿ]\õX\ö◊€‹X⁄]I◊JåL
+J_IJàÿÿ[Nà
+û⁄[ù
+õ›[ô
+÷…›ÿ]\õX\ö◊‹ÿÿ[I◊JåL
+J_IJóàÇààï›\à\›YŸNà
+û›\õ\◊€Xô[
+Ÿ]››\ó€\›‹YŸJ
+J_Jóàã\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊⁄Ÿ^Xõÿ\ô
+
+JBÇò\ﬁ[ò»YàŸ][ô‹◊ÿÿ[òX⁄ ]Y\ûK€€ù^
+NÇàYà]Y\ûKô]OOI‹Ÿ][ô‹Œõõ€‹	Œà]ÿZ]]Y\ûKò[ú›Ÿ\ä
+N»ô]\õÇàYà]Y\ûKô]OOI‹Ÿ][ô‹Œõ‹[âŒà]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+	¯¶¶{Ó#»
+ì^U›\êò^ò\àö[ùŸ][ô‹ âÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà]Y\ûKô]OOI‹Ÿ][ô‹Œù›\ó€\›‹YŸW€Y[ùIŒÇà]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+	¸'‰Á
+ï›\à\›YŸHŸ][ô óóê⁄€‹ŸH⁄X⁄YŸH\»\[ôYYù\àH›\à][ô\ò\ûHûHYò][âÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊››\ó€\›‹YŸW⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹Œù›\ó€\›‹YŸNâ NÇà⁄⁄XŸO\]Y\ûKô]Kú‹]
+	ŒâÀäVÃóBàŸ]››\ó€\›‹YŸJ⁄⁄XŸJBà]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+â¯ß!H›\à\›YŸH⁄[ôŸY»
+û›\õ\◊€Xô[
+⁄⁄XŸJ_JãâÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊››\ó€\›‹YŸW⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹Œôõ€›\ó€Y[ùNâ NÇà⁄[ô\]Y\ûKô]Kú‹]
+	ŒâÀäVÃóBàXô[^…ŸõY⁄	Œâ–Z\âÀ	ÿù\…Œâ–ù\…À	⁄›[	Œâ“›[	À	‹X⁄ÿYŸIŒâ’›\âﬂV⁄⁄[ôBà]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+â¸'ÈÔà
+û€Xô[Hõ€›\àŸ][ô óóê⁄€‹ŸHHõ€›\à\ŸYõ‹à[ù]\ôH€Xô[Hö[ùÀâÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊Ÿõ€›\ó⁄Ÿ^Xõÿ\ô
+⁄[ô
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹Œôõ€›\éâ NÇàÀÀ⁄[ô[ŸO\]Y\ûKô]Kú‹]
+	ŒâÀ BàŸ]ŸYò][Ÿõ€›\ä⁄[ô[ŸJBà]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+â¯ß!H⁄⁄[ôù]J
+_Hõ€›\à⁄[ôŸY»
+û◊Ÿõ€›\ó‹Ÿ][ô◊€Xô[
+[ŸJ_JãâÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊Ÿõ€›\ó⁄Ÿ^Xõÿ\ô
+⁄[ô
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹ŒõŸ€◊€Y[ùNâ NÇà⁄[ô\]Y\ûKô]Kú‹]
+	ŒâÀäVÃóN»Xô[^…ŸõY⁄	Œâ–Z\âÀ	ÿù\…Œâ–ù\…À	⁄›[	Œâ“›[	À	‹X⁄ÿYŸIŒâ’›\âﬂV⁄⁄[ôBà]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+â¸'ÂØ;Ó#»
+û€Xô[HŸ€»⁄^ôJóóï\ŸH
+»»8¢$àõ‹à[ù]\ôH€Xô[Hö[ùÀâÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊€Ÿ€◊⁄Ÿ^Xõÿ\ô
+⁄[ô
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹ŒõŸ€Œâ NÇàÀÀ⁄[ô[O\]Y\ûKô]Kú‹]
+	ŒâÀ N»‹œXYù\›€Ÿ€◊‹ÿÿ[J⁄[ôõÿ]
+[JJN»]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+à∏ß!H⁄⁄[ôù]J
+_HŸ€»⁄^ôNà
+û⁄[ù
+õ›[ô
+‹÷…€Ÿ€◊‹ÿÿ[\…◊V⁄⁄[ôJåL
+J_IJàã\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊€Ÿ€◊⁄Ÿ^Xõÿ\ô
+⁄[ô
+JN»ô]\õÇàYà]Y\ûKô]OOI‹Ÿ][ô‹Œôõ€ù…Œà]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+	¸'Â)
+ê⁄€‹ŸHö[ùõ€ù
+âÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊Ÿõ€ù⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹Œôõ€ùâ NÇàò[YO\]Y\ûKô]Kú‹]
+	ŒâÀäVÃóN»Ÿ]Ÿõ€ù
+ò[YJN»]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+â¯ß!Hö[ùõ€ù⁄[ôŸY»
+û€ò[Y_JãâÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹Œú⁄^ôNâ NÇà[OYõÿ]
+]Y\ûKô]Kú‹]
+	ŒâÀäVÃóJN»‹œXYù\››^‹ÿÿ[J[JN»]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+à∏ß!H^⁄^ôH\»õ›»
+û⁄[ù
+õ›[ô
+‹÷…›^‹ÿÿ[I◊JåL
+J_IJãàã\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹Œù€W€‹X⁄]Nâ NÇà[OYõÿ]
+]Y\ûKô]Kú‹]
+	ŒâÀäVÃóJN»‹œ[ÿY‹Ÿ][ô‹ 
+N»‹÷…›ÿ]\õX\ö◊€‹X⁄]I◊O\õ›[ô
+X^
+åKZ[äååõÿ]
+‹ÀôŸ]
+	›ÿ]\õX\ö◊€‹X⁄]IÀå
+JJŸ[JJKäN»ÿ]ôW‹Ÿ][ô‹ ‹ N»]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+à∏ß!Hÿ]\õX\ö»‹X⁄]Nà
+û⁄[ù
+õ›[ô
+‹÷…›ÿ]\õX\ö◊€‹X⁄]I◊JåL
+J_IJàã\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹Œù€W‹ÿÿ[Nâ NÇà[OYõÿ]
+]Y\ûKô]Kú‹]
+	ŒâÀäVÃóJN»‹œ[ÿY‹Ÿ][ô‹ 
+N»‹÷…›ÿ]\õX\ö◊‹ÿÿ[I◊O\õ›[ô
+X^
+çKZ[äãåõÿ]
+‹ÀôŸ]
+	›ÿ]\õX\ö◊‹ÿÿ[IÀKçJJJŸ[JJKäN»ÿ]ôW‹Ÿ][ô‹ ‹ N»]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+à∏ß!Hÿ]\õX\ö»ÿÿ[Nà
+û⁄[ù
+õ›[ô
+‹÷…›ÿ]\õX\ö◊‹ÿÿ[I◊JåL
+J_IJàã\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\\Ÿ][ô‹◊⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà]Y\ûKô]Kú›\ù›⁄]
+	‹Ÿ][ô‹ŒùŸŸ€Nâ NÇàŸ^O\]Y\ûKô]Kú‹]
+	ŒâÀäVÃóN»ŸŸ€Wÿù]€äŸ^JN»]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+	¯ß!HŸ][ô»\]YâÀô\W€X\ö›\\Ÿ][ô‹◊⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà]Y\ûKô]OOI‹Ÿ][ô‹Œúô\Ÿ]	Œàô\Ÿ]‹Ÿ][ô‹ 
+N»]ÿZ]]Y\ûKôY]€Y\‹ÿYŸW›^
+	¯¶n˚Ó#»Ÿ][ô‹»ô\Ÿ]»Yò][Ààõ€›\àà\»HYò][õ‹à[Ÿ\ùöXŸ\ÀâÀô\W€X\ö›\\Ÿ][ô‹◊⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇÇÇò\ﬁ[ò»YàŸ]€Ÿ€ \]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàYàõ›\◊ÿ[›ŸY
+\]JNÇàô]\õÇÇà€€ù^ù\Ÿ\óŸ]V»ùÿZ][ô◊Ÿõ‹ó€Ÿ€»óHHùYBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+àº'ÂØ;Ó#»Ÿ[ô[›\à^U›\êò^ò\àŸ€»\»[à[XYŸHõ›ÀàÇà
+BÇÇò\ﬁ[ò»YàôXŸZ]ôW€Ÿ€ \]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàYàõ›\◊ÿ[›ŸY
+\]JNÇàô]\õÇÇàYàõ›€€ù^ù\Ÿ\óŸ]KôŸ]
+ùÿZ][ô◊Ÿõ‹ó€Ÿ€»äNÇàô]\õÇÇà›»H\]KõY\‹ÿYŸKú›÷ÀLWBà◊Ÿö[HH]ÿZ]€€ù^òõ›ôŸ]Ÿö[J›Àôö[W⁄Y
+Bà]ÿZ]◊Ÿö[Kô›€õÿY›◊Ÿö]ôJT—Tó”—”◊‘U
+Bà€ÿò[—”◊‘Uà—”◊‘UHT—Tó”—”◊‘Uà€€ù^ù\Ÿ\óŸ]V»ùÿZ][ô◊Ÿõ‹ó€Ÿ€»óHHò[ŸBÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ß!HŸ€»ÿ]ôY›XÿŸ\‹Ÿù[Kàãàô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+Bà
+BÇÇò\ﬁ[ò»YàôXŸZ]ôWŸ^òW›^
+\]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàYàõ›\◊ÿ[›ŸY
+\]JNÇàô]\õÇÇà^H
+\]KõY\‹ÿYŸKù^‹ààäKú›ö\
+
+BÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ú‹›⁄›[ÿ€‹›‹ôYô\ô[òŸHäNÇà]ÿZ]‹õÿŸ\‹◊‹‹›ŸŸ[ô\ò]Y⁄›[ÿ€‹›[ô \]KõY\‹ÿYŸK€€ù^^
+N»ô]\õÇÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ú‹›ÿ€‹›‹ôYô\ô[òŸHäNÇà]ÿZ]‹õÿŸ\‹◊‹‹›ŸŸ[ô\ò]Yÿ€‹›[ô \]KõY\‹ÿYŸK€€ù^^
+N»ô]\õÇÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ú‹››ò[ú⁄]‹ôYô\ô[òŸHäNÇàYàôKôù[X]⁄
+àä⁄JW äŒõ⁄◊ äO Œõõ◊ ›ò[ú⁄]õ◊ ⁄õ›\õô^_õ€ô_⁄⁄\ÿ[òŸ[ ›ò[ú⁄]
+W àã^‹à	… NÇà€€ù^ù\Ÿ\óŸ]Kú‹
+	‹‹››ò[ú⁄]‹ôYô\ô[òŸIÀõ€ôJBà€€ù^ù\Ÿ\óŸ]Kú‹
+	‹‹››ò[ú⁄]‹[ô[ô…Àõ€ôJBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+	¯ß!Hõ»ò[ú⁄]YYà[›\à›\à\»›[ôXYH»\ŸKâÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà]ÿZ]‹õÿŸ\‹◊‹‹›ŸŸ[ô\ò]Y›ò[ú⁄]›^
+\]KõY\‹ÿYŸK€€ù^^
+N»ô]\õÇÇàYà››\ó›åóÿX›]ôJ€€ù^
+NÇà\ŸOX€€ù^ù\Ÿ\óŸ]KôŸ]
+ù›\ó›åó‹\ŸHäBàYà\ŸOOHò]ÿZ][ô◊ŸY]YŸö[ò[éÇà]ÿZ]››\ó›åó‹õÿŸ\‹◊ŸY]YŸö[ò[
+\]KõY\‹ÿYŸK€€ù^^
+N»ô]\õÇàYà\ŸOOHõZ\‹⁄[ô◊Ÿ]Z[»éÇà]ÿZ]››\ó›åóÿ\W€Z\‹⁄[ô◊‹ô\J\]KõY\‹ÿYŸK€€ù^^
+N»ô]\õÇàYà\ŸH[à
+õ€ùÿ\ôãúô]\õàãò€€õôX›[€àäNÇà⁄⁄\€Xô[œ^»õ€ùÿ\ôéà∏£Î{Ó#»õ»€ùÿ\ôõ›\õô^Hãúô]\õàéà∏£Î{Ó#»õ»ô]\õàõ›\õô^Hãò€€õôX›[€àéà∏£Î{Ó#»õ»€€õôX›[ô»õ›\õô^HüBàYà^OH∏ßcÿ[òŸ[éàô]\õà]ÿZ]ÿ[òŸ[
+\]K€€ù^
+BàYà^O\⁄⁄\€Xô[÷‹\ŸWNÇàYà\ŸOOHõ€ùÿ\ôéà]ÿZ]››\ó›åóÿ\⁄◊‹ô]\õä\]KõY\‹ÿYŸK€€ù^
+Bà[Yà\ŸOOHúô]\õàéà]ÿZ]››\ó›åóÿ\⁄◊ÿ€€õôX›[€ä\]KõY\‹ÿYŸK€€ù^
+Bà[ŸNà]ÿZ]››\ó›åó‹⁄›◊€›]] \]KõY\‹ÿYŸK€€ù^
+Bàô]\õÇàYà^Çà]ÿZ]››\ó›åóŸ^òX›⁄õ›\õô^J\]KõY\‹ÿYŸK€€ù^\ŸK€›\òŸW›^]^
+N»ô]\õÇàYà\ŸOOHò€‹›[ô»éÇà]ÿZ]››\ó›åóŸö[ö\⁄‹Ÿ[X›Y€›]]
+\]KõY\‹ÿYŸK€€ù^^
+N»ô]\õÇÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊››\ó›ò[ú⁄]⁄[ú]äNÇàYà^OH∏ßcÿ[òŸ[éÇàõ‹à»[à
+ò]ÿZ][ô◊››\ó›ò[ú⁄]⁄[ú]ãú[ô[ô◊››\ó›ò[ú⁄]Ÿö[\»ãú[ô[ô◊››\ó›ò[ú⁄]›^äNÇà€€ù^ù\Ÿ\óŸ]Kú‹
+Àõ€ôJBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+∏ßcò[ú⁄][ùûHÿ[òŸ[Yàãô\W€X\ö›\YòYù‹ô]öY]◊⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàYà^OH∏£Î{Ó#»⁄⁄\ò[ú⁄]éÇà]OX€€ù^ù\Ÿ\óŸ]KôŸ]
+ö][ô\ò\ûHäH‹àﬂBà]V»ùò[ú⁄]óOV◊N»]V»ùò[ú⁄]Ÿ€ôWÿûW‹Ÿ[àóOUùYN»€€ù^ù\Ÿ\óŸ]V»ö][ô\ò\ûHóOY]Bàõ‹à»[à
+ò]ÿZ][ô◊››\ó›ò[ú⁄]⁄[ú]ãú[ô[ô◊››\ó›ò[ú⁄]Ÿö[\»ãú[ô[ô◊››\ó›ò[ú⁄]›^äNÇà€€ù^ù\Ÿ\óŸ]Kú‹
+Àõ€ôJBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+∏ß!Hò[ú⁄]⁄⁄\YàHõﬁ⁄[⁄›»
+ë€ôHûHŸ[äãàã\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\Tô\RŸ^Xõÿ\ôô[[›ôJ
+JBà]ÿZ]ÿ€€ù[ùYW››\ó‹óÿYù\ó›ò[ú⁄]
+\]KõY\‹ÿYŸK€€ù^
+N»ô]\õÇàYà^OH∏ß!H€ôHò[ú⁄]éÇà]ÿZ]‹õÿŸ\‹◊‹[ô[ô◊››\ó›ò[ú⁄]
+\]KõY\‹ÿYŸK€€ù^
+N»ô]\õÇàYà^Çà€€ù^ù\Ÿ\óŸ]V»ú[ô[ô◊››\ó›ò[ú⁄]›^óOJ›ä€€ù^ù\Ÿ\óŸ]KôŸ]
+ú[ô[ô◊››\ó›ò[ú⁄]›^äH‹ààäJ»óàä›^
+Kú›ö\
+
+Bà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+º'‰ÁHò[ú⁄]^ôXŸZ]ôYàŸ[ô[‹ôH‹à\
+∏ß!H€ôHò[ú⁄]
+ãàã\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\]›\ó›ò[ú⁄]⁄[ú]⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+	ÿ]ÿZ][ô◊››\ó‹ö[ù€ò[YI NÇàYà^OH	¯ßcÿ[òŸ[	ŒÇà€€ù^ù\Ÿ\óŸ]Kú‹
+	ÿ]ÿZ][ô◊››\ó‹ö[ù€ò[YIÀõ€ôJBà€€ù^ù\Ÿ\óŸ]Kú‹
+	‹[ô[ô◊››\ó‹ó‹ô\]Y\›	Àõ€ôJBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+	¯ßc›\ààö[ùÿ[òŸ[YàHòYù\»›[]òZ[XõKâÀô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+	⁄][ô\ò\ûI H‹àﬂBàYà^OH	¯£Î{Ó#»ö[ù⁄]›]ò[YIŒÇà]V…ÿ€Y[ù€ò[YI◊HH	…¬à[ŸNÇàYàõ›^Çà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+	‘X\ŸH[ù\àH›Y\›»€Y[ùò[YK‹à\8£Î{Ó#»ö[ù⁄]›]ò[YKâÀô\W€X\ö›\\[ô[ô◊››\ó€ò[YW⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà]V…ÿ€Y[ù€ò[YI◊HH^à€€ù^ù\Ÿ\óŸ]V…Ÿ›Y\›€ò[YI◊HH^à]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+â¯ß!H›Y\›ò[YHYYà
+û›^JâÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\Tô\RŸ^Xõÿ\ôô[[›ôJ
+JBà€€ù^ù\Ÿ\óŸ]V…⁄][ô\ò\ûI◊HH]Bà€€ù^ù\Ÿ\óŸ]Kú‹
+	ÿ]ÿZ][ô◊››\ó‹ö[ù€ò[YIÀõ€ôJBà]ÿZ]Ÿö[ö\⁄‹[ô[ô◊››\ó‹ä\]KõY\‹ÿYŸK€€ù^
+Bàô]\õÇÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊ŸY]‹ôYàäNÇà]ÿZ]ÿôY⁄[óŸY]
+\]K€€ù^^
+Bàô]\õÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ôY][ô◊ÿ›\úô[ù⁄][ô\ò\ûHäNÇà]ÿZ]\ôõ‹õWŸòYùŸY]
+\]K€€ù^^
+Bàô]\õÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ôY][ô◊‹ôYô\ô[òŸHäNÇà]ÿZ]\ôõ‹õW‹ÿ]ôYŸY]
+\]K€€ù^^
+Bàô]\õÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊ÿ›\›€Wÿ€‹›⁄[ú]	 NÇà^H
+\]KõY\‹ÿYŸKù^‹à	… Kú›ö\
+
+BàöY[»H€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊ÿ›\›€Wÿ€‹›ŸöY[… H‹à◊BàYH[ù
+€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊ÿ›\›€Wÿ€‹›⁄[ô^	 H‹à
+Bà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹[ô[ô◊ÿ›\›€Wÿ€‹›Ÿ]I BàYàõ›]H‹àYèH[äöY[ NÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+	’\8¶${Ó#»€ôH»ö[ö\⁄›\›€H€‹›‹à8ßcÿ[òŸ[â Bàô]\õÇàò]»H^úô\XŸJ	¯†ÆIÀ	… Kúô\XŸJ	À	À	… Kú›ö\
+
+BàYàõ›ôKôù[X]⁄
+â◊
+ Œóó
+ O…Àò] NÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+	¯ßc[ù\à€õHH[[›[ùõ‹à^[\HLâÀ\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\X›\›€Wÿ€‹›⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà[[›[ùYõÿ]
+ò] BàŸ^KöY[Xô[€›[ùHöY[÷⁄YBà]HHÿ\Wÿ›\›€Wÿ€‹›ŸöY[
+]KöY[[[›[ù
+Bà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿ›\›€Wÿ€‹›Ÿ]I◊HH]BàY
+œHBà€€ù^ù\Ÿ\óŸ]V…‹[ô[ô◊ÿ›\›€Wÿ€‹›⁄[ô^	◊HHYàYàY[äöY[ NÇàÀÀô^€Xô[ô^ÿ€›[ùHöY[÷⁄YBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+àâ¯ß!H€Xô[Nà
+û◊€[€ô^J[[›[ù
+_H0Â»ÿ€›[ùHH◊€[€ô^J[[›[ù
+ò€›[ù
+_Jóóâ¬àâ û€ô^€Xô[Jà8†%€ô^ÿ€›[ùH\‹Ÿ[ôŸ\ä Wâ¬àâ—[ù\àH\ôX›\ã\\ú€€à€‹›à^[\NàLâÀà\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\X›\›€Wÿ€‹›⁄Ÿ^Xõÿ\ô
+
+JBà[ŸNÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à	¯ß!H[\ôX›ò]\»[ù\ôYóóâ»
+»ÿ›\›€Wÿ€‹›‹›[[X\ûJ]JH
+»	◊óï\
+∏¶${Ó#»€ôJà»]\ŸH[[›[ù»[ù»H€‹›õﬁ[ôôYŸ[ô\ò]HHãâÀà\úŸW€[ŸOI”X\öŸ›€âÀô\W€X\ö›\X›\›€Wÿ€‹›⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇà»åMNNàõ»›\àX\ö›\^Ÿ\‹⁄[€ãà[ûH›\à€‹›⁄[ôŸH€Ÿ\»õ›Y⁄Bà»ÿ]ôY\ôYô\ô[òŸH[ŸYûH	àôYŸ[ô\ò]H]\»H\ôX››\›€Y\àŸ[[ô»ò]KÇÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ú[ô[ô◊Ÿò\ôW⁄⁄[ôäNÇà⁄[ôX€€ù^ù\Ÿ\óŸ]KôŸ]
+ú[ô[ô◊Ÿò\ôW⁄⁄[ôäBà]ÿZ]ÿ\W‹[ô[ô◊Ÿò\ôW⁄[ú]
+\]KõY\‹ÿYŸK€€ù^⁄[ô^
+Bàô]\õÇÇÇàYà^OH∏ß#{Ó#»õY⁄^à[ô€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊ŸõY⁄äNÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ß#{Ó#»Ÿ[ôHõY⁄»òZ[à]Z[»\»^àõ»‹X⁄X[õ‹õX][ô»\»ô\]Z\ôYàÇàîŸ[ô€ùÿ\ô[ôô]\õà]Z[»ŸŸ]\à‹àŸ\\ò][K[à\
+∏ß!H€ôJãàãàô\W€X\ö›\Tô\RŸ^Xõÿ\ôX\ö›\
+÷»∏ß#{Ó#»õY⁄^óK»∏ß";Ó#»õY⁄ÿ‹ôY[ú⁄›óK»∏ß!H€ôHóWKô\⁄^ôW⁄Ÿ^Xõÿ\ôUùYJBà
+Bàô]\õÇÇàYà^OH∏ß";Ó#»õY⁄ÿ‹ôY[ú⁄›à[ô€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊ŸõY⁄äNÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ß";Ó#»Ÿ[ôHõY⁄ÿ‹ôY[ú⁄›õ›Àà[›Hÿ[àŸ[ô][\Hÿ‹ôY[ú⁄›À[à\
+∏ß!H€ôJãàãàô\W€X\ö›\Tô\RŸ^Xõÿ\ôX\ö›\
+÷»∏ß#{Ó#»õY⁄^óK»∏ß";Ó#»õY⁄ÿ‹ôY[ú⁄›óK»∏ß!H€ôHóWKô\⁄^ôW⁄Ÿ^Xõÿ\ôUùYJBà
+Bàô]\õÇÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊ŸõY⁄äNÇàò[YHH
+\]KõY\‹ÿYŸKù^‹ààäKú›ö\
+
+BàYàò[YHOH∏ß!H€ôHéÇà€€ù^ù\Ÿ\óŸ]V»ò]ÿZ][ô◊ŸõY⁄óHHò[ŸBà]ÿZ]õÿŸ\‹◊‹€›\òŸ\ \]K€€ù^
+Bàô]\õÇàYàò[YNÇà€€ù^ù\Ÿ\óŸ]V»ôõY⁄›^óHH
+€€ù^ù\Ÿ\óŸ]KôŸ]
+ôõY⁄›^ãàäH
+»óàà
+»ò[YJKú›ö\
+
+Bà€€ù^ù\Ÿ\óŸ]V»ò]ÿZ][ô◊ŸõY⁄óHHùYBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ß";Ó#»õY⁄^ôXŸZ]ôYàŸ[ô[õ›\àõY⁄ÿ‹ôY[ú⁄››^‹à\
+∏ß!H€ôJãàãàô\W€X\ö›\X€€ôö\õX][€ó⁄Ÿ^Xõÿ\ô
+
+Bà
+Bàô]\õÇÇà[ŸHH€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊Ÿ^òHäBàYàõ›[ŸNÇà»\ôX››\Y\à^\»XÿŸ\Y]ô[à⁄[àH›€ô\àYõ›ö\ú›‹[Çà»RH\‹⁄\›[ùà\»ô\›‹ô\»H€\àåL€€ùô[öY[òŸNà\›H›\Y\Çà»X]\öX[[ôHõ›]]€X]Xÿ[HY[ùYöY\»›\ã–Z\ã–ù\À“›[ÇàYà€€⁄‹◊€ZŸW‹›\Y\ó€X]\öX[
+^
+H[ôõ›€€ù^ù\Ÿ\óŸ]KôŸ]
+	‹€X\ù€[ŸI NÇàÿÿ[òŸ[‹€›\òŸWÿ]]◊‹õÿŸ\‹ €€ù^
+Bà€€ù^ù\Ÿ\óŸ]V…‹€X\ù€[ŸI◊OUùYBà€€ù^ù\Ÿ\óŸ]V…‹€X\ù›^	◊O]^à€€ù^ù\Ÿ\óŸ]V…‹€X\ùŸö[\…◊OV◊Bà]ÿZ]€X\ù‹õÿŸ\‹ \]K€€ù^
+Bàô]\õÇà»›]⁄YHHYXÿ]Y€‹öŸõ›À]HRHôX€Ÿ€ö^ôH⁄]H\Ÿ\àYX[úÀÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ú€X\ù€[ŸHäNÇà]ÿZ]€X\ù›^
+\]K€€ù^
+Bà[ŸNÇà]ÿZ]€X\ù›^
+\]K€€ù^
+Bàô]\õÇàò[YHH
+\]KõY\‹ÿYŸKù^‹ààäKú›ö\
+
+BàYàõ›ò[YNÇàô]\õÇà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+ô^òW⁄[ò€\⁄[€ú»ã◊JBà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+ô^òWŸ^€\⁄[€ú»ã◊JBàŸ^HHô^òW⁄[ò€\⁄[€ú»àYà[ŸHOHö[ò€\⁄[€àà[ŸHô^òWŸ^€\⁄[€ú»Çà€€ù^ù\Ÿ\óŸ]V⁄Ÿ^WKò\[ô
+ò[YJBà€€ù^ù\Ÿ\óŸ]V»ò]ÿZ][ô◊Ÿ^òHóHHõ€ôBÇà]HH€€ù^ù\Ÿ\óŸ]KôŸ]
+ö][ô\ò\ûHãﬂJBà]KúŸ]Yò][
+ö[ò€\⁄[€ú»ã◊JBà]KúŸ]Yò][
+ô^€\⁄[€ú»ã◊JBà\ôŸ]H]V»ö[ò€\⁄[€ú»óHYà[ŸHOHö[ò€\⁄[€àà[ŸH]V»ô^€\⁄[€ú»óBàYàò[YHõ›[à\ôŸ]Çà\ôŸ]ò\[ô
+ò[YJBà€€ù^ù\Ÿ\óŸ]V»ö][ô\ò\ûHóHH]BÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+àùZ[ÿ€€ôö\õX][€ä]JKà\úŸW€[ŸOHìX\öŸ›€àãàô\W€X\ö›\X€€ôö\õX][€ó⁄Ÿ^Xõÿ\ô
+
+Bà
+BÇÇò\ﬁ[ò»YàôXŸZ]ôWŸõY⁄‹› \]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàYàõ›\◊ÿ[›ŸY
+\]JNÇàô]\õÇàYàõ›€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊ŸõY⁄äNÇàô]\õÇÇàûNÇà›»H\]KõY\‹ÿYŸKú›÷ÀLWBà◊Ÿö[HH]ÿZ]€€ù^òõ›ôŸ]Ÿö[J›Àôö[W⁄Y
+Bàö[[ò[YHHST—Tà»àôõY⁄ﬁ›\]KôYôôX›]ôW›\Ÿ\ãöYWﬁŸ]][YKõõ› 
+NâVI[IY…R	SIT◊…YüKöú»Çà]ÿZ]◊Ÿö[Kô›€õÿY›◊Ÿö]ôJö[[ò[YJBà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+ôõY⁄Ÿö[\»ã◊JKò\[ô
+›äö[[ò[YJJBà€€ù^ù\Ÿ\óŸ]V»ò]ÿZ][ô◊ŸõY⁄óHHùYBÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ß";Ó#»õY⁄ÿ‹ôY[ú⁄›ôXŸZ]ôYàŸ[ô[õ›\àõY⁄ÿ‹ôY[ú⁄››^‹à\
+ë€ôJà⁄[àö[ö\⁄Yàãàô\W€X\ö›\Tô\RŸ^Xõÿ\ôX\ö›\
+÷»∏ß#{Ó#»õY⁄^óK»∏ß";Ó#»õY⁄ÿ‹ôY[ú⁄›óK»∏ß!H€ôHóWKô\⁄^ôW⁄Ÿ^Xõÿ\ôUùYJBà
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇàŸŸŸ\ãô^Ÿ\[€äëõY⁄ÿ‹ôY[ú⁄›òZ[YäBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ßc€›[õ›õÿŸ\‹»HõY⁄ÿ‹ôY[ú⁄›àŸ^ﬂHäBÇÇò\ﬁ[ò»YàôXŸZ]ôWŸ€ÿò[‹› \]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàààîõ›]H^X⁄]€‹öŸõ›»›]\»ö\ú›»›\ù⁄\ŸHHõ‹õX[\ÿY\»[ÿ^\»ëU»€‹öÀàààÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ú‹››ò[ú⁄]‹ôYô\ô[òŸHäNÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+ï\HXX⁄õY⁄›òZ[àŸX›‹à€àHô]»[ôKàõ»€ùÿ\ô‘ô]\õàôYö^\»ô\]Z\ôY»H⁄[[ôô\àHõ›\õô^HŸ\]Y[òŸKàãô\W€X\ö›\Tô\RŸ^Xõÿ\ôô[[›ôJ
+JBàô]\õÇÇàYà››\ó›åóÿX›]ôJ€€ù^
+H[ô€€ù^ù\Ÿ\óŸ]KôŸ]
+ù›\ó›åó‹\ŸHäH[à
+õ€ùÿ\ôãúô]\õàãò€€õôX›[€àäNÇà\ŸOX€€ù^ù\Ÿ\óŸ]KôŸ]
+ù›\ó›åó‹\ŸHäBàûNÇà›œ]\]KõY\‹ÿYŸKú›÷ÀLWN»◊Ÿö[OX]ÿZ]€€ù^òõ›ôŸ]Ÿö[J›Àôö[W⁄Y
+Bà]UST—Tà»àù›\ó›åóﬁ‹\Ÿ_Wﬁ›\]KôYôôX›]ôW›\Ÿ\ãöYWﬁŸ]][YKõõ› 
+NâVI[IY…R	SIT◊…YüKöú»Çà]ÿZ]◊Ÿö[Kô›€õÿY›◊Ÿö]ôJ]
+Bà]ÿZ]››\ó›åóŸ^òX›⁄õ›\õô^J\]KõY\‹ÿYŸK€€ù^\ŸKö[W‹]\]
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ßc€›[õ›ôXYõ›\õô^Hÿ‹ôY[ú⁄›à‹›ä^ VŒçL_HäBàô]\õÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊››\ó›ò[ú⁄]⁄[ú]äNÇàûNÇà›œ]\]KõY\‹ÿYŸKú›÷ÀLWN»◊Ÿö[OX]ÿZ]€€ù^òõ›ôŸ]Ÿö[J›Àôö[W⁄Y
+Bà]UST—Tà»àù›\ó›ò[ú⁄]ﬁ›\]KôYôôX›]ôW›\Ÿ\ãöYWﬁŸ]][YKõõ› 
+NâVI[IY…R	SIT◊…YüKöú»Çà]ÿZ]◊Ÿö[Kô›€õÿY›◊Ÿö]ôJ]
+Bà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+ú[ô[ô◊››\ó›ò[ú⁄]Ÿö[\»ã◊JKò\[ô
+›ä]
+JBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+º'‰Óò[ú⁄]ÿ‹ôY[ú⁄›ôXŸZ]ôYàŸ[ô[‹ôH‹à\
+∏ß!H€ôHò[ú⁄]
+ãàã\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\]›\ó›ò[ú⁄]⁄[ú]⁄Ÿ^Xõÿ\ô
+
+JBà^Ÿ\^Ÿ\[€à\»^ŒÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ßc€›[õ›ÿ]ôHò[ú⁄]ÿ‹ôY[ú⁄›à‹›ä^ VŒçL_Hãô\W€X\ö›\]›\ó›ò[ú⁄]⁄[ú]⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ùÿZ][ô◊Ÿõ‹ó€Ÿ€»äNÇàô]\õà]ÿZ]ôXŸZ]ôW€Ÿ€ \]K€€ù^
+BàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊ŸõY⁄äNÇàô]\õà]ÿZ]ôXŸZ]ôWŸõY⁄‹› \]K€€ù^
+Bà»åMçNàõ‹õX[ö[K⁄[XYŸHõ‹Yù\àH€€\]Yö[ù\»[ÿ^\»HëU»õÿãÇà»^\›[ô»\ôX›–]]»‹ôX][€àò]⁄\»\ôHH€õH›]\»[›ŸY»Xÿ›[][]Hö[\ÀÇàYàõ›€€ù^ù\Ÿ\óŸ]KôŸ]
+	◊Ÿ\ôX›Ÿõ‹€[ŸI H[ôõ›€€ù^ù\Ÿ\óŸ]KôŸ]
+	ÿ]]◊ÿ‹ôX][€â NÇàÿÿ[òŸ[ÿ]]◊‹ö[ù
+€€ù^
+Bàÿÿ[òŸ[‹€›\òŸWÿ]]◊‹õÿŸ\‹ €€ù^
+Bà€€ù^ù\Ÿ\óŸ]Kò€X\ä
+Bà€€ù^ù\Ÿ\óŸ]V»ú€X\ù€[ŸHóHHùYBà€€ù^ù\Ÿ\óŸ]V»óŸ\ôX›Ÿõ‹€[ŸHóHHùYBà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+ú€X\ùŸö[\»ã◊JBàô]\õà]ÿZ]€X\ù‹› \]K€€ù^
+BÇÇò\ﬁ[ò»YàôXŸZ]ôWŸ€ÿò[Ÿÿ›[Y[ù
+\]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàààîõ›]H^X⁄]€‹öŸõ›»›]\»ö\ú›»›\ù⁄\ŸHHõ‹õX[\ÿY\»[ÿ^\»ëU»€‹öÀàààÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ú‹››ò[ú⁄]‹ôYô\ô[òŸHäNÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+ï\HXX⁄õY⁄›òZ[àŸX›‹à€àHô]»[ôKàõ»€ùÿ\ô‘ô]\õàôYö^\»ô\]Z\ôY»H⁄[[ôô\àHõ›\õô^HŸ\]Y[òŸKàãô\W€X\ö›\Tô\RŸ^Xõÿ\ôô[[›ôJ
+JBàô]\õÇÇàYà››\ó›åóÿX›]ôJ€€ù^
+H[ô€€ù^ù\Ÿ\óŸ]KôŸ]
+ù›\ó›åó‹\ŸHäH[à
+õ€ùÿ\ôãúô]\õàãò€€õôX›[€àäNÇà\ŸOX€€ù^ù\Ÿ\óŸ]KôŸ]
+ù›\ó›åó‹\ŸHäBàÿœ]\]KõY\‹ÿYŸKôÿ›[Y[ù»ò[YOYÿÀôö[W€ò[YH‹àöõ›\õô^Kúàé»Z[YOJÿÀõZ[YW›\H‹ààäKõ›Ÿ\ä
+BàYàõ›
+ò[YKõ›Ÿ\ä
+Kô[ô›⁄]
+ãúàäH‹àZ[YOOHò\Xÿ][€ã‹àäNÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+îX\ŸHŸ[ôHãÿ‹ôY[ú⁄›‹àõ‹õX[^àäN»ô]\õÇàûNÇà◊Ÿö[OX]ÿZ]€€ù^òõ›ôŸ]Ÿö[JÿÀôö[W⁄Y
+BàÿYôOHàãöõ⁄[ä»YàÀö\ÿ[ù[J
+H‹à»[àãóÀHà[ŸHó»àõ‹à»[àò[YJBà]UST—Tà»àù›\ó›åóﬁ‹\Ÿ_Wﬁ›\]KôYôôX›]ôW›\Ÿ\ãöYWﬁŸ]][YKõõ› 
+NâVI[IY…R	SIT◊…YüWﬁ‹ÿYô_HÇà]ÿZ]◊Ÿö[Kô›€õÿY›◊Ÿö]ôJ]
+Bà]ÿZ]››\ó›åóŸ^òX›⁄õ›\õô^J\]KõY\‹ÿYŸK€€ù^\ŸKö[W‹]\]
+Bà^Ÿ\^Ÿ\[€à\»^ŒÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ßc€›[õ›ôXYõ›\õô^Héà‹›ä^ VŒçL_HäBàô]\õÇàYà€€ù^ù\Ÿ\óŸ]KôŸ]
+ò]ÿZ][ô◊››\ó›ò[ú⁄]⁄[ú]äNÇàÿœ]\]KõY\‹ÿYŸKôÿ›[Y[ù»ò[YOYÿÀôö[W€ò[YH‹àùò[ú⁄]úàé»Z[YOJÿÀõZ[YW›\H‹ààäKõ›Ÿ\ä
+BàYàõ›
+ò[YKõ›Ÿ\ä
+Kô[ô›⁄]
+ãúàäH‹àZ[YOOHò\Xÿ][€ã‹àäNÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+îX\ŸHŸ[ôHõY⁄]X⁄Ÿ]ãÿ‹ôY[ú⁄›‹à^àãô\W€X\ö›\]›\ó›ò[ú⁄]⁄[ú]⁄Ÿ^Xõÿ\ô
+
+JN»ô]\õÇàûNÇà◊Ÿö[OX]ÿZ]€€ù^òõ›ôŸ]Ÿö[JÿÀôö[W⁄Y
+BàÿYôOHàãöõ⁄[ä»YàÀö\ÿ[ù[J
+H‹à»[àãóÀHà[ŸHó»àõ‹à»[àò[YJBà]UST—Tà»àù›\ó›ò[ú⁄]ﬁ›\]KôYôôX›]ôW›\Ÿ\ãöYWﬁŸ]][YKõõ› 
+NâVI[IY…R	SIT◊…YüWﬁ‹ÿYô_HÇà]ÿZ]◊Ÿö[Kô›€õÿY›◊Ÿö]ôJ]
+Bà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+ú[ô[ô◊››\ó›ò[ú⁄]Ÿö[\»ã◊JKò\[ô
+›ä]
+JBàè[[ä€€ù^ù\Ÿ\óŸ]KôŸ]
+ú[ô[ô◊››\ó›ò[ú⁄]Ÿö[\»äH‹à◊JBà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+àº'‰·ò[ú⁄]àôXŸZ]ôY
+€üJKàŸ[ô[‹ôH‹à\
+∏ß!H€ôHò[ú⁄]
+ãàã\úŸW€[ŸOHìX\öŸ›€àãô\W€X\ö›\]›\ó›ò[ú⁄]⁄[ú]⁄Ÿ^Xõÿ\ô
+
+JBà^Ÿ\^Ÿ\[€à\»^ŒÇà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+à∏ßc€›[õ›ÿ]ôHò[ú⁄]éà‹›ä^ VŒçL_Hãô\W€X\ö›\]›\ó›ò[ú⁄]⁄[ú]⁄Ÿ^Xõÿ\ô
+
+JBàô]\õÇàYàõ›€€ù^ù\Ÿ\óŸ]KôŸ]
+	◊Ÿ\ôX›Ÿõ‹€[ŸI H[ôõ›€€ù^ù\Ÿ\óŸ]KôŸ]
+	ÿ]]◊ÿ‹ôX][€â NÇàÿÿ[òŸ[ÿ]]◊‹ö[ù
+€€ù^
+Bàÿÿ[òŸ[‹€›\òŸWÿ]]◊‹õÿŸ\‹ €€ù^
+Bà€€ù^ù\Ÿ\óŸ]Kò€X\ä
+Bà€€ù^ù\Ÿ\óŸ]V»ú€X\ù€[ŸHóHHùYBà€€ù^ù\Ÿ\óŸ]V»óŸ\ôX›Ÿõ‹€[ŸHóHHùYBà€€ù^ù\Ÿ\óŸ]KúŸ]Yò][
+ú€X\ùŸö[\»ã◊JBàô]\õà]ÿZ]€X\ùŸÿ›[Y[ù
+\]K€€ù^
+BÇÇò\ﬁ[ò»Yàÿ[òŸ[
+\]Nà\]K€€ù^à€€ù^\\ÀëQêUS’TJNÇàÿÿ[òŸ[‹€›\òŸWÿ]]◊‹õÿŸ\‹ €€ù^
+Bàÿÿ[òŸ[ÿ]]◊‹ö[ù
+€€ù^
+Bàõ‹àŸ^H[à
+	◊‹€›\òŸW‹õÿŸ\‹⁄[ô…À	‹€X\ù€[ŸIÀ	ÿ]ÿZ][ô◊ŸY]‹ôYâÀ	ŸY][ô◊‹ôYô\ô[òŸIÀ	ŸY][ô◊ÿ›\úô[ù⁄][ô\ò\ûIÀ	‹[ô[ô◊››\ó€X\ö›\‹ö[ù	À	‹[ô[ô◊Ÿò\ôW⁄⁄[ô	 NÇà€€ù^ù\Ÿ\óŸ]Kú‹
+Ÿ^Kõ€ôJBà€€ù^ù\Ÿ\óŸ]Kò€X\ä
+Bà]ÿZ]\]KõY\‹ÿYŸKúô\W›^
+∏ßcÿ[òŸ[Yà›\úô[ù€‹öŸõ›»€X\ôYàãô\W€X\ö›\[XZ[ó⁄Ÿ^Xõÿ\ô
+
+JBàô]\õà€€ùô\úÿ][€í[ô\ãëSëÇÇò\ﬁ[ò»Yà\úõ‹ó⁄[ô\ä\]NàÿöôX›€€ù^à€€ù^\\ÀëQêUS’TJNÇàYà\⁄[ú›[òŸJ€€ù^ô\úõ‹ãô]€‹ö—\úõ‹äNÇàŸŸŸ\ãùÿ\õö[ô ï[\‹ò\ûH[Y‹ò[Hô]€‹ö»[ù\úù\[€é»€[ô»⁄[ôX€€õôX›]]€X]Xÿ[Nà	\»ã€€ù^ô\úõ‹äBàô]\õÇàŸŸŸ\ãô^Ÿ\[€äï[ö[ôY^Ÿ\[€àã^◊⁄[ôõœX€€ù^ô\úõ‹äBÇÇÇÇôYàXZ[ä
+NÇàYàõ›ì’’“—SéÇàòZ\ŸHù[ù[YQ\úõ‹äêì’’“—Sà\»Z\‹⁄[ô»[àô[ùàäBàŸŸŸ\ãö[ôõ €€ôöY›\ò][€ó‹›[[X\ûJ
+JBÇàô\]Y\›Hô\]Y\›
+€€õôX››[Y[›]LåôXY›[Y[›]Må‹ö]W›[Y[›]Må€€›[Y[›]Lå
+Bà€[ô◊‹ô\]Y\›Hô\]Y\›
+€€õôX››[Y[›]LåôXY›[Y[›]MK‹ö]W›[Y[›]LÃ€€›[Y[›]Lå
+Bà\H
+à\Xÿ][€ãòùZ[\ä
+Bàù⁄Ÿ[äì’’“—SäBàúô\]Y\›
+ô\]Y\›
+BàôŸ]›\]\◊‹ô\]Y\›
+€[ô◊‹ô\]Y\›
+Bàò€€ò›\úô[ù›\]\ ò[ŸJBàòùZ[
+
+Bà
+BÇàõ›X⁄\óÿ€€ùô\úÿ][€àH€€ùô\úÿ][€í[ô\äà[ùûW‹⁄[ùœV”Y\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àóº'„Í›[ö[ù	äK›[›õ›X⁄\ó‹›\ù
+WKà›]\œ^¬à’S’ì’P“Tó“SîUà¬àY\‹ÿYŸR[ô\äö[\úÀî’À›[›õ›X⁄\ó‹› KàY\‹ÿYŸR[ô\äö[\úÀëÿ›[Y[ùîã›[›õ›X⁄\óŸÿ›[Y[ù
+KàY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSë›[›õ›X⁄\ó›^
+KàBàKàò[òX⁄‹œV–€€[X[ô[ô\äòÿ[òŸ[ãÿ[òŸ[
+KY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏ßcÿ[òŸ[	äKÿ[òŸ[
+WKà[›◊‹ôY[ùûOUùYKà
+BÇàõY⁄›X⁄Ÿ]ÿ€€ùô\úÿ][€àH€€ùô\úÿ][€í[ô\äà[ùûW‹⁄[ùœV”Y\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏ß";Ó#»Z\àö[ù	äKõY⁄›X⁄Ÿ]‹›\ù
+WKà›]\œ^¬àìQ“’P“—U“SîUñ”Y\‹ÿYŸR[ô\äö[\úÀî’ÀõY⁄›X⁄Ÿ]‹› KY\‹ÿYŸR[ô\äö[\úÀëÿ›[Y[ùîãõY⁄›X⁄Ÿ]Ÿÿ›[Y[ù
+KY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëõY⁄›X⁄Ÿ]›^
+WKàìQ“—êTëW“SîUñ”Y\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëõY⁄›X⁄Ÿ]Ÿò\ôJWKàKàò[òX⁄‹œV–€€[X[ô[ô\äòÿ[òŸ[ãÿ[òŸ[
+KY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏ßcÿ[òŸ[	äKÿ[òŸ[
+WK[›◊‹ôY[ùûOUùYJBÇàù\◊›X⁄Ÿ]ÿ€€ùô\úÿ][€àH€€ùô\úÿ][€í[ô\äà[ùûW‹⁄[ùœV”Y\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àóº'Ê£ù\»ö[ù	äKù\◊›X⁄Ÿ]‹›\ù
+WKà›]\œ^¬àïT◊’P“—U“SîUñ”Y\‹ÿYŸR[ô\äö[\úÀî’Àù\◊›X⁄Ÿ]‹› KY\‹ÿYŸR[ô\äö[\úÀëÿ›[Y[ùîãù\◊›X⁄Ÿ]Ÿÿ›[Y[ù
+KY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëù\◊›X⁄Ÿ]›^
+WKàïT◊—êTëW“SîUñ”Y\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëù\◊›X⁄Ÿ]Ÿò\ôJWBàKàò[òX⁄‹œV–€€[X[ô[ô\äòÿ[òŸ[ãÿ[òŸ[
+KY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏ßcÿ[òŸ[	äKÿ[òŸ[
+WK[›◊‹ôY[ùûOUùYJBÇà€X\ùÿ€€ùô\úÿ][€àH€€ùô\úÿ][€í[ô\äà[ùûW‹⁄[ùœV¬àY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àóº'È%àRH\‹⁄\›[ù»ô]»ô\]Y\›	äK€X\ùÿZW‹›\ù
+KàY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àóº'È%à]]»‹ôX][€âäK]]◊ÿ‹ôX][€ó‹›\ù
+KàKà›]\œ^¬à”PTï“SîUà¬àY\‹ÿYŸR[ô\äö[\úÀî’À€X\ù‹› KàY\‹ÿYŸR[ô\äö[\úÀëÿ›[Y[ùîã€X\ùŸÿ›[Y[ù
+KàY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSë€X\ù›^
+KàKà–RUSë◊—’QT’”êSQNà¬àY\‹ÿYŸR[ô\äö[\úÀî’ÀôXŸZ]ôW››\ó‹€›\òŸW›⁄]›]Ÿ›Y\›
+KàY\‹ÿYŸR[ô\äö[\úÀëÿ›[Y[ùîãôXŸZ]ôW››\ó‹€›\òŸW›⁄]›]Ÿ›Y\›
+KàY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëôXŸZ]ôWŸ›Y\›€ò[YJKàKàKàò[òX⁄‹œV–€€[X[ô[ô\äòÿ[òŸ[ãÿ[òŸ[
+KY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏ßcÿ[òŸ[	äKÿ[òŸ[
+WKà[›◊‹ôY[ùûOUùYKà
+BÇà€€ùô\úÿ][€àH€€ùô\úÿ][€í[ô\äà[ùûW‹⁄[ùœV¬àY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àóäŒº'ÂÓªÓ#»›\à][ô\ò\û_<'ÂÓªÓ#»›\à›ZYJIäKô]◊⁄][ô\ò\ûJKà€€[X[ô[ô\äõô]»ãô]◊⁄][ô\ò\ûJKàKà›]\œ^¬à–RUSë◊—’QT’”êSQNà¬àY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëôXŸZ]ôWŸ›Y\›€ò[YJKàKà–RUSë◊‘”’Tê—Nà¬àY\‹ÿYŸR[ô\äö[\úÀî’ÀôXŸZ]ôW‹› KàY\‹ÿYŸR[ô\äö[\úÀëÿ›[Y[ùîãôXŸZ]ôWŸÿ›[Y[ù
+KàY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëôXŸZ]ôW›^
+KàKàKàò[òX⁄‹œV¬à€€[X[ô[ô\äòÿ[òŸ[ãÿ[òŸ[
+KàY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏ßcÿ[òŸ[	äKÿ[òŸ[
+KàKà[›◊‹ôY[ùûOUùYKà
+BÇà\òY⁄[ô\ä€€[X[ô[ô\äú›\ùã›\ù
+JBà\òY⁄[ô\ä€€[X[ô[ô\äú›‹ã›‹ÿõ››€‹öŸõ› JBà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏•≠ªÓ#»‘’Tï	äK›\ù
+K‹õ›\KLäBà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏£Ó{Ó#»‘’‘	äK›‹ÿõ››€‹öŸõ› K‹õ›\KLäBà\òY⁄[ô\ä€€[X[ô[ô\ä»úŸ][ô‹»ãúŸ][ô»óKŸ][ô‹◊ÿ€€[X[ô
+JBà»Ÿ][ô‹»]\›⁄[à›ô\à]ô\ûHX›]ôH€€ùô\úÿ][€í[ô\à›]Kà›\ù⁄\ŸHBà»ô\‹ŸYŸ][ô‹»ô\KZŸ^Xõÿ\ôù]€àÿ[àôH€€ú›[YY\»›\Y\à^[ôà»Xÿ⁄Y[ù[H›\ù][ô\ò\ûHõÿŸ\‹⁄[ôÀÇà\ﬁ[ò»Yà‹Ÿ][ô‹◊€Y[ùWŸ›X\ô
+\]K€€ù^
+NÇà]ÿZ]Ÿ][ô‹◊ÿ€€[X[ô
+\]K€€ù^
+BàòZ\ŸH\Xÿ][€í[ô\î›‹Çà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏¶¶{Ó#»Ÿ][ô‹…äK‹Ÿ][ô‹◊€Y[ùWŸ›X\ô
+K‹õ›\KLäBÇà»UT’ù[àôYõ‹ôH]ô\ûH€€ùô\úÿ][€í[ô\ãà\»XZŸ\»[Y‹ò[I‹»ô\HX›[€Çà»€‹ö»õ‹àò\ôHõ€\»[ôŸ[ô\ò]Y\ôYô\ô[òŸHY\‹ÿYŸ\ÀôYÿ\ô\‹»Ÿà⁄X⁄à»€‹öŸõ›»\»›\úô[ùHX›]ôKàõ€ã\ô\HY\‹ÿYŸ\»\ôH[ù›X⁄YÇà»åMåà[õ‹õX[^\‹Ÿ\»\»Y⁄ŸZY⁄›X\ôôYõ‹ôH[ûH€€ùô\úÿ][€í[ô\ãÇà»]€õH€€ú›[Y\»H\]H⁄[àH[ŸYûH	àôYŸ[ô\ò]HŸ\‹⁄[€à
+‹àHõ›[Y\‹ÿYŸBà»ô\JH\»X›]ôN»›\ù⁄\ŸH]ô]\õú»[ôõ‹õX[Y[ùK‹€›\òŸHõ›][ô»€€ù[ùY\ÀÇà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëô\W‹ôYô\ô[òŸWŸY]
+K‹õ›\KLJBÇà»ôY⁄\›\àS[õ[ôHÿ[òX⁄‹À[ò€Y[ô»›\à›]]ù]€úÀôYõ‹ôHBà»€‹öŸõ›»[ô\úÀà\»[ú›\ô\»]ô\ûHö\⁄XõH›\àù]€à\»H]ôHõ›]KÇà\òY⁄[ô\äÿ[òX⁄‘]Y\ûR[ô\äàÿ[òX⁄◊⁄[ô\ãà]\õè\àóäŸ][ô‹Œãäü›\ó›\õ\Œãäü›\ó‹‹X⁄X[€õ›\Œãäü›\óÿ€‹›ãäü›\ó€X\ö›\ãäü›\óÿ›\›€Wÿ€‹›ãäü›\ó€›]]ãäü›\ó€›]]€[ŸNãäü›\ó›ò[ú⁄]ãäü‹››ò[ú⁄]ãäü‹››ò[ú⁄]€XZŸNãäü‹››ò[ú⁄]ÿ€‹›ãäü‹›ÿ€‹›ãäü›[ÿ€‹›ãäü›\óŸY]ÿ›\úô[ù	òYùŸY]	òYùŸ€ôIŸ[ô\ò]_Ÿ[ô\ò]W€õ◊ÿ€‹›ôY[ù\üÿ[òŸ[Y⁄[ò€\⁄[€üYŸ^€\⁄[€üYŸõY⁄YŸõY⁄›^ò\ôWÿYãäüò\ôW€õ€ôNãäüò\ôW€‹öY⁄[ò[ãäü⁄^ôNãäüõ€›\óÿò\üõ€›\óŸ\⁄Y€üõ€›\åüö[ùÿ€X[üõ€›\óﬁY\ﬂõ€›\ó€õﬂY]ŸŸ[ô\ò]Yãäüõ⁄XŸWŸY]ãäü]]Ÿö]ãäü[ŸYûNãäü[Ÿ‹⁄^ôNãäü[ŸŸõ€ùãäü[Ÿ€Ÿ€Œãäü[Ÿÿ€X[éãäü[ŸŸõ€›\ó€Y[ùNãäü[ŸŸõ€›\éãäü[ŸŸ]Z[ãäü[Ÿ€\›‹YŸNãäü[Ÿÿåòéãäü[Ÿ€[ŸNãäü[ŸŸ€ôNãäü[Ÿÿÿ[òŸ[ãääIÇà
+K‹õ›\KLJBÇà\òY⁄[ô\äõ›X⁄\óÿ€€ùô\úÿ][€äBà\òY⁄[ô\äõY⁄›X⁄Ÿ]ÿ€€ùô\úÿ][€äBà\òY⁄[ô\äù\◊›X⁄Ÿ]ÿ€€ùô\úÿ][€äBà\òY⁄[ô\ä€X\ùÿ€€ùô\úÿ][€äBà\òY⁄[ô\ä€€ùô\úÿ][€äBà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àóº'ÂØ;Ó#»Ÿ]Ÿ€…äKŸ]€Ÿ€ JBà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀïì“P—KôXŸZ]ôW›õ⁄XŸWŸY]
+K‹õ›\KLJBà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀî’ÀôXŸZ]ôWŸ€ÿò[‹› JBà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀëÿ›[Y[ùîãôXŸZ]ôWŸ€ÿò[Ÿÿ›[Y[ù
+JBà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëô\W‹ôYô\ô[òŸWŸY]
+JBà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀïV	àôö[\úÀê””SPSëôXŸZ]ôWŸ^òW›^
+JBà\òY⁄[ô\äY\‹ÿYŸR[ô\äö[\úÀîôYŸ^
+àó∏ßcÿ[òŸ[	äKÿ[òŸ[
+JBà\òYŸ\úõ‹ó⁄[ô\ä\úõ‹ó⁄[ô\äBÇàŸŸŸ\ãö[ôõ ì^U›\êò^ò\àÿÿ[€‹öŸõ›»õ›\»ù[õö[ô»äBà\úù[ó‹€[ô 
+BÇÇöYà◊€ò[YW◊»OHó◊€XZ[ó◊»éÇàXZ[ä
+B
