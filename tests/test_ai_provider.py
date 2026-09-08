@@ -60,6 +60,19 @@ class AIProviderTests(unittest.TestCase):
         self.assertEqual(calls,[0,6,12])
         self.assertEqual([row['name'] for row in result['rows']],["P0","P6","P12"])
 
+    def test_text_rich_later_pdf_pages_are_not_duplicated_as_images(self):
+        import tempfile
+        from pathlib import Path
+        import fitz
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'supplier.pdf'
+            document=fitz.open()
+            for text in ('Booking header '+('A'*200),'Fare table '+('B'*200),''):
+                page=document.new_page()
+                if text: page.insert_textbox(fitz.Rect(50,50,545,790),text,fontsize=8)
+            document.save(path); document.close()
+            self.assertEqual(ai_provider._pdf_visual_indexes(path),[0,2])
+
 
 if __name__ == "__main__":
     unittest.main()

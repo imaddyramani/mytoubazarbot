@@ -429,8 +429,9 @@ def generate_hotel_voucher(data, output_path, logo_path=None, fare=None, page_si
 
         cost_rows=[]
         if room_rate is not None:
+            rate_label='Hotel Rate / Night' if hotel_cost.get('rate_scope')=='hotel' else 'Room Rate / Night'
             cost_rows.append(
-                '<tr><td><strong>Room Rate / Night</strong></td>'
+                f'<tr><td><strong>{rate_label}</strong></td>'
                 f'<td>{_money(room_rate)}</td><td>{room_count}</td><td>{night_count}</td>'
                 f'<td style="text-align:right"><b>{_money(room_total)}</b></td></tr>'
             )

@@ -150,6 +150,28 @@ def _max_vision_pages():
         return 24
 
 
+def _pdf_visual_indexes(path):
+    """Keep visual evidence small without dropping the complete selectable text.
+
+    The first page is retained for artwork/header fields. Later pages are rendered
+    only when they contain little selectable text (scans). Text-rich pages are
+    already present in full in the user prompt and do not need a costly duplicate
+    image pass.
+    """
+    try:
+        import fitz
+        with fitz.open(str(path)) as document:
+            indexes=[]
+            for index,page in enumerate(document):
+                text=page.get_text('text') or ''
+                density=len(re.sub(r'\s+','',text))
+                if index==0 or density<120:
+                    indexes.append(index)
+            return indexes
+    except Exception:
+        return []
+
+
 def _vision_unit_count(image_paths):
     total=0
     for raw_path in image_paths or []:
@@ -157,12 +179,7 @@ def _vision_unit_count(image_paths):
         if not path.is_file():
             continue
         if path.suffix.lower()=='.pdf':
-            try:
-                import fitz
-                with fitz.open(str(path)) as document:
-                    total += len(document)
-            except Exception:
-                continue
+            total += len(_pdf_visual_indexes(path))
         else:
             total += 1
     return min(total,_max_vision_pages())
@@ -181,8 +198,10 @@ def _vision_parts(image_paths, offset=0, limit=None):
             if path.suffix.lower()=='.pdf':
                 import fitz
                 from PIL import Image
+                selected=set(_pdf_visual_indexes(path))
                 with fitz.open(str(path)) as document:
-                    for page in document:
+                    for page_index,page in enumerate(document):
+                        if page_index not in selected: continue
                         if unit_index>=_max_vision_pages() or len(parts)>=limit: break
                         current=unit_index; unit_index += 1
                         if current<offset: continue
@@ -325,6 +344,8 @@ def _request(provider, system_prompt, user_text, schema, max_tokens, vision=Fals
         "max_tokens": max(512, min(int(max_tokens), 12000)),
         "response_format": {"type": "json_object"},
     }
+    if provider=='xkiro':
+        payload['reasoning_effort']=os.getenv('AI_REASONING_EFFORT','none').strip().lower() or 'none'
     with httpx.Client(timeout=_timeout()) as client:
         response = client.post(
             f"{base_url}/chat/completions",

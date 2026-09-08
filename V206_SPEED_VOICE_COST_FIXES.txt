@@ -1,8 +1,13 @@
-MyTourBazar V205 — Qwen-First Complete Supplier Workflow
+MyTourBazar V206 — Speed, Voice and Add Cost Reliability
 
 - Free Qwen through xKiro is the primary supplier-document extraction and structuring model.
 - Complete selectable supplier text is retained; PDF/image pages are sent in low-memory visual batches.
+- Text-rich pages are not resent as duplicate images; Qwen reasoning is disabled for faster structured extraction.
 - Tour, Air, Bus and Hotel use local rules only for source validation, calculations and outage fallback.
+- Multilingual Whisper is cached during the Docker build so voice notes do not download a model at runtime.
+- Voice instructions work for AI Assistant, current Tour drafts, saved-document edits and Add Cost.
+- Hotel costing accepts booking-wide nightly or per-room/night rates and derives nights from stay dates.
+- Air, Bus and Hotel Add Cost share one persistent, tested input and printing path.
 - The private assistant can classify requests, plan workflows and answer bot questions.
 - Smart edits use schema-limited patch operations and preserve unrelated booking fields.
 - Northflank startup logs show the active provider and model without exposing keys.

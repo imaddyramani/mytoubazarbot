@@ -8,6 +8,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV OMP_THREAD_LIMIT=1
 ENV OMP_NUM_THREADS=1
 ENV MALLOC_ARENA_MAX=2
+ENV LOCAL_WHISPER_MODEL=tiny
+ENV WHISPER_CACHE_DIR=/app/.cache/whisper
 
 # System libraries required by WeasyPrint/Pango + common PDF/image/font operations.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -40,6 +42,11 @@ COPY requirements.txt /app/requirements.txt
 
 RUN python -m pip install --root-user-action=ignore --no-cache-dir --upgrade pip && \
     python -m pip install --root-user-action=ignore --no-cache-dir -r /app/requirements.txt
+
+# Cache the multilingual voice model during image build. Telegram voice notes then
+# work immediately without a large first-request download or Northflank timeout.
+RUN mkdir -p /app/.cache/whisper && \
+    python -c "from faster_whisper import WhisperModel; WhisperModel('tiny', device='cpu', compute_type='int8', download_root='/app/.cache/whisper')"
 
 COPY . /app
 

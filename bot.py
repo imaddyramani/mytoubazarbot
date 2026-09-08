@@ -1009,6 +1009,7 @@ def _parse_hotel_cost_input(value, supplier_total=0, data=None):
 
     existing=(data or {}).get('customer_hotel_cost') or {}
 
+    rate_scope='room'
     if markup_word and markup_amount is not None:
         if per_room_night:
             if nights<=0:
@@ -1036,6 +1037,16 @@ def _parse_hotel_cost_input(value, supplier_total=0, data=None):
             r'([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*)?room(?:\s*(?:per|/)\s*night)?\b',
             r'([0-9]+(?:\.[0-9]+)?)\s*(?:room\s*/\s*night)\b',
         ])
+        # A plain nightly amount means the complete hotel booking per night. It
+        # is multiplied by nights only; an explicit "per room" rate continues
+        # to multiply by rooms as before.
+        if room_rate is None:
+            room_rate=amount([
+                r'([0-9]+(?:\.[0-9]+)?)\s*(?:/|per|for)\s*night\b',
+                r'\b(?:for|per)\s*(?:each\s*)?night\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
+                r'\bnight(?:ly)?\s*(?:rate|cost|amount|price)?\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
+            ])
+            if room_rate is not None: rate_scope='hotel'
         eb_rate=amount([
             r'\b(?:eb|extra\s*(?:bed|mattress))(?:\s*(?:rate|cost|price))?\b[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
             r'([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*)?(?:eb|extra\s*(?:bed|mattress))(?:\s*(?:per|/)\s*night)?\b',
@@ -1067,15 +1078,16 @@ def _parse_hotel_cost_input(value, supplier_total=0, data=None):
     if eb_rate is not None and extra_beds<=0:
         extra_beds=1
 
-    room_total=(float(room_rate or 0)*rooms*nights)
+    billed_rooms=1 if rate_scope=='hotel' else rooms
+    room_total=(float(room_rate or 0)*billed_rooms*nights)
     eb_total=(float(eb_rate or 0)*extra_beds*nights)
     total=room_total+eb_total
     return {
         'per_room':room_rate,'eb':eb_rate,
         'room_rate_per_night':room_rate,'eb_rate_per_night':eb_rate,
-        'rooms':rooms,'nights':nights,'extra_beds':extra_beds,
+        'rooms':billed_rooms,'source_rooms':rooms,'nights':nights,'extra_beds':extra_beds,
         'room_total':room_total,'eb_total':eb_total,'total':total,
-        'currency':'INR','mode':'calculated'
+        'currency':'INR','mode':'calculated','rate_scope':rate_scope
     }
 
 
@@ -1086,15 +1098,68 @@ def _hotel_cost_confirmation(cost):
         return f"✅ *Hotel cost understood:* Final Total Hotel Cost → *INR {total:,.0f}*"
     rooms=int(c.get('rooms') or 1); nights=int(c.get('nights') or 0)
     room_rate=float(c.get('room_rate_per_night') or 0); room_total=float(c.get('room_total') or 0)
+    rate_label='Hotel / Night' if c.get('rate_scope')=='hotel' else 'Room'
     lines=[
         "✅ *Hotel cost understood:*",
-        f"Room: INR {room_rate:,.0f} × {rooms} room(s) × {nights} night(s) = *INR {room_total:,.0f}*",
+        (f"{rate_label}: INR {room_rate:,.0f} × {nights} night(s) = *INR {room_total:,.0f}*"
+         if c.get('rate_scope')=='hotel' else
+         f"{rate_label}: INR {room_rate:,.0f} × {rooms} room(s) × {nights} night(s) = *INR {room_total:,.0f}*"),
     ]
     if float(c.get('eb_rate_per_night') or 0)>0:
         eb_rate=float(c.get('eb_rate_per_night') or 0); eb_count=int(c.get('extra_beds') or 0); eb_total=float(c.get('eb_total') or 0)
         lines.append(f"Extra Bed: INR {eb_rate:,.0f} × {eb_count} EB × {nights} night(s) = *INR {eb_total:,.0f}*")
     lines.append(f"*Total Hotel Cost: INR {total:,.0f}*")
     return "\\n".join(lines)
+
+
+async def _apply_pending_fare_input(message, context, kind, instruction):
+    """Apply one Air/Bus/Hotel Add Cost reply from either text or voice."""
+    if kind not in ('flight','bus','hotel'):
+        return False
+    _cancel_auto_print(context)
+    data_key=f'pending_{kind}_data'
+    if not context.user_data.get(data_key):
+        context.user_data.pop('pending_fare_kind',None)
+        await message.reply_text(
+            f'❌ The {kind.title()} cost session expired. Open {kind.title()} Print and send the supplier file again.',
+            reply_markup=main_keyboard(),
+        )
+        return True
+    supplier_total=float(context.user_data.get('pending_fare_supplier_total',0) or 0)
+    try:
+        if kind=='hotel':
+            hdata=copy.deepcopy(context.user_data.get('pending_hotel_data') or {})
+            hotel_cost=_parse_hotel_cost_input(instruction,supplier_total,hdata)
+            hdata['customer_hotel_cost']=hotel_cost
+            context.user_data['pending_hotel_data']=hdata
+            fare=float(hotel_cost.get('total') or 0) or None
+        else:
+            source_data=context.user_data.get(data_key) or {}
+            include_infants=_fare_include_infants(instruction)
+            pax_count=_fare_pax_count(source_data,include_infants=include_infants)
+            fare=_parse_markup_input(instruction,supplier_total,pax_count)
+    except ValueError as exc:
+        context.user_data['pending_fare_kind']=kind
+        hint=('`3500 per night`, `room 4200 and EB 1200 per night`, or `total 25000`'
+              if kind=='hotel' else '`7615 pp`, `+403 pp`, or `68535 total`')
+        await message.reply_text(f'❌ {exc}\n\nExamples: {hint}',parse_mode='Markdown')
+        return True
+
+    context.user_data.pop('pending_fare_kind',None)
+    context.user_data[f'pending_{kind}_fare']=fare
+    if kind in ('flight','bus'):
+        await message.reply_text(_fare_cost_confirmation(instruction,supplier_total,fare,pax_count),parse_mode='Markdown')
+    else:
+        await message.reply_text(_hotel_cost_confirmation(hotel_cost),parse_mode='Markdown')
+    try:
+        await ask_footer_choice(message,context,kind)
+    except Exception as exc:
+        logger.exception('PDF generation from Add Cost failed')
+        await message.reply_text(
+            f'❌ PDF generation failed.\n\nReason: `{str(exc)[:800]}`',
+            parse_mode='Markdown',reply_markup=main_keyboard(),
+        )
+    return True
 
 
 
@@ -1843,72 +1908,9 @@ async def reply_reference_edit(update: Update, context: ContextTypes.DEFAULT_TYP
     # reply_to_message. Handle the pending fare before looking for an MTB reference.
     pending_kind = context.user_data.get("pending_fare_kind")
     if pending_kind in ("flight", "bus", "hotel"):
-        _cancel_auto_print(context)
         instruction = (msg.text or "").strip()
         if instruction:
-            supplier_total = float(context.user_data.get("pending_fare_supplier_total", 0) or 0)
-            try:
-                if pending_kind == "hotel":
-                    hdata = copy.deepcopy(context.user_data.get("pending_hotel_data") or {})
-                    hotel_cost = _parse_hotel_cost_input(instruction, supplier_total, hdata)
-                    hdata["customer_hotel_cost"] = hotel_cost
-                    context.user_data["pending_hotel_data"] = hdata
-                    fare = float(hotel_cost.get("total") or 0) or None
-                else:
-                    source_data = (
-                        context.user_data.get("pending_flight_data")
-                        if pending_kind == "flight"
-                        else context.user_data.get("pending_bus_data")
-                    )
-                    include_infants = _fare_include_infants(instruction)
-                    pax_count = _fare_pax_count(
-                        source_data or {},
-                        include_infants=include_infants,
-                    )
-                    fare = _parse_markup_input(
-                        instruction,
-                        supplier_total,
-                        pax_count,
-                    )
-            except ValueError as exc:
-                await msg.reply_text(
-                    f"❌ {exc}\n\n"
-                    + (
-                        "Examples: `3500 per room per night`, `EB 1200 per night`, `total 25000`."
-                        if pending_kind == "hotel"
-                        else "Examples: `7615 pp` (selling PP), `+403 pp` (markup PP), `68535 total`."
-                    ),
-                    parse_mode="Markdown",
-                )
-                return True
-
-            context.user_data.pop("pending_fare_kind", None)
-            context.user_data[f"pending_{pending_kind}_fare"] = fare
-
-            if pending_kind in ("flight", "bus"):
-                await msg.reply_text(
-                    _fare_cost_confirmation(
-                        instruction,
-                        supplier_total,
-                        fare,
-                        pax_count,
-                    ),
-                    parse_mode="Markdown",
-                )
-            elif pending_kind == "hotel":
-                await msg.reply_text(
-                    _hotel_cost_confirmation(hotel_cost),
-                    parse_mode="Markdown",
-                )
-
-            try:
-                await ask_footer_choice(msg, context, pending_kind)
-            except Exception as exc:
-                logger.exception("PDF generation from fare reply failed")
-                await msg.reply_text(
-                    f"❌ PDF generation failed.\n\nReason: `{str(exc)[:800]}`",
-                    parse_mode="Markdown", reply_markup=main_keyboard()
-                )
+            await _apply_pending_fare_input(msg,context,pending_kind,instruction)
             raise ApplicationHandlerStop
 
     # Smart Make Changes button: once a reference is selected, the next natural-language
@@ -2352,7 +2354,7 @@ async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE)
     draft_ids={int(x) for x in (context.user_data.get('tour_draft_message_ids') or []) if str(x).isdigit()}
     reply_is_draft=bool(replied and getattr(replied,'message_id',None) in draft_ids and context.user_data.get('itinerary'))
 
-    if reply_is_draft:
+    if reply_is_draft or context.user_data.get('editing_current_itinerary'):
         tg_file=await context.bot.get_file(msg.voice.file_id)
         path=TEMP_DIR/f"voice_draft_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.ogg"
         status=await msg.reply_text('🎙️ *Listening to your draft changes...*', parse_mode='Markdown')
@@ -2373,6 +2375,27 @@ async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as exc:
             logger.exception('Voice draft reply edit failed')
             await safe_status_edit(status,msg,f'⚠️ Voice draft edit could not be completed. Resend it or type the same change.\n\nReason: {str(exc)[:500]}')
+        finally:
+            try: path.unlink(missing_ok=True)
+            except Exception: pass
+        return
+
+    # Add Cost accepts voice exactly like typed input for Air, Bus and Hotel.
+    pending_kind=context.user_data.get('pending_fare_kind')
+    if pending_kind in ('flight','bus','hotel'):
+        tg_file=await context.bot.get_file(msg.voice.file_id)
+        path=TEMP_DIR/f"voice_cost_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S_%f}.ogg"
+        status=await msg.reply_text('🎙️ *Listening to your costing...*',parse_mode='Markdown')
+        try:
+            await tg_file.download_to_drive(path)
+            transcript=await asyncio.to_thread(
+                transcribe_voice_note,path,AI_API_KEY,AI_MODEL,msg.voice.mime_type or 'audio/ogg')
+            await safe_status_edit(status,msg,'✅ *Voice costing understood.*',parse_mode='Markdown')
+            await msg.reply_text('🎙️ *I understood:*\n'+transcript,parse_mode='Markdown')
+            await _apply_pending_fare_input(msg,context,pending_kind,transcript)
+        except Exception as exc:
+            logger.exception('Voice Add Cost failed')
+            await safe_status_edit(status,msg,f'⚠️ Voice costing could not be completed.\n\nReason: {str(exc)[:500]}')
         finally:
             try: path.unlink(missing_ok=True)
             except Exception: pass
@@ -2439,7 +2462,8 @@ async def receive_voice_edit(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # V168: when AI Assistant is active, a normal voice note is a free-form
     # create/edit request. No prefix and no separate voice button is required.
     if context.user_data.get("smart_mode"):
-        return await smart_voice(update, context)
+        await smart_voice(update, context)
+        raise ApplicationHandlerStop
 
     await msg.reply_text('🎙️ Voice editing is ready after you tap *Modify & Regenerate* on a generated PDF, or press *🤖 AI Assistant / New Request* and speak naturally.', parse_mode='Markdown', reply_markup=main_keyboard())
     return
@@ -7865,39 +7889,8 @@ async def receive_extra_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # saved-reference Modify & Regenerate path as a direct customer selling rate.
 
     if context.user_data.get("pending_fare_kind"):
-        _cancel_auto_print(context)
-        kind=context.user_data.pop("pending_fare_kind")
-        supplier_total=float(context.user_data.get("pending_fare_supplier_total", 0) or 0)
-        try:
-            if kind=='hotel':
-                hdata=copy.deepcopy(context.user_data.get('pending_hotel_data') or {})
-                hotel_cost=_parse_hotel_cost_input(text,supplier_total,hdata)
-                hdata['customer_hotel_cost']=hotel_cost
-                context.user_data['pending_hotel_data']=hdata
-                fare=float(hotel_cost.get('total') or 0) or None
-            else:
-                source_data=context.user_data.get('pending_flight_data') if kind=='flight' else context.user_data.get('pending_bus_data')
-                include_infants=_fare_include_infants(text)
-                pax_count=_fare_pax_count(source_data or {}, include_infants=include_infants)
-                fare=_parse_markup_input(text, supplier_total, pax_count)
-        except ValueError as exc:
-            context.user_data['pending_fare_kind']=kind
-            hint='3500 per room per night, EB 1200 per night, or total 25000' if kind=='hotel' else '+800 per person, markup 1200 total, or 15000 total'
-            await update.message.reply_text(f'❌ {exc}\n\nExample: `{hint}`',parse_mode='Markdown')
-            return
-        context.user_data[f'pending_{kind}_fare']=fare
-        if kind in ('flight','bus'):
-            await update.message.reply_text(
-                _fare_cost_confirmation(text,supplier_total,fare,pax_count),
-                parse_mode='Markdown'
-            )
-        elif kind=='hotel':
-            await update.message.reply_text(_hotel_cost_confirmation(hotel_cost),parse_mode='Markdown')
-        try:
-            await ask_footer_choice(update.message, context, kind)
-        except Exception as exc:
-            logger.exception('PDF generation from markup input failed')
-            await update.message.reply_text(f'❌ PDF generation failed.\n\nReason: `{str(exc)[:800]}`', parse_mode='Markdown', reply_markup=main_keyboard())
+        kind=context.user_data.get("pending_fare_kind")
+        await _apply_pending_fare_input(update.message,context,kind,text)
         return
 
 

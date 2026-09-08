@@ -204,7 +204,7 @@ def chat(text, api_key=None, model=None):
     low=str(text or '').lower()
     remote=complete_json(ASSISTANT_CONTEXT,str(text or ''),CHAT_SCHEMA,purpose='assistant reply',max_tokens=1200)
     if remote and str(remote.get('answer') or '').strip(): return str(remote['answer']).strip()
-    if 'air' in low or 'flight' in low: return 'Use ✈️ Air Print and send the supplier PDF, screenshot or text. I will extract it locally, then show Add Cost and print options.'
+    if 'air' in low or 'flight' in low: return 'Use ✈️ Air Print and send the supplier PDF, screenshot or text. I will structure it with Qwen, then show Add Cost and print options.'
     if 'bus' in low: return 'Use 🚌 Bus Print and send the supplier ticket. I will extract passenger, seat, PNR, boarding, drop and fare locally.'
     if 'hotel' in low: return 'Use 🏨 Hotel Print and send the confirmation. I will extract guest, property, dates, rooms, meal plan and cost locally.'
     if 'tour' in low or 'itinerary' in low: return 'Use 🗺️ Tour Guide for supplier material, or write destination, duration, guests, hotel category, meals, vehicle and sightseeing for a new local day plan.'
