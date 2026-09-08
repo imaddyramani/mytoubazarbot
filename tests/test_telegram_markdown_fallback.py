@@ -3,10 +3,22 @@ from unittest.mock import AsyncMock
 
 from telegram.error import BadRequest
 
-from bot import _reply_markdown_with_plain_fallback
+from bot import _reply_markdown_with_plain_fallback,reply_text_chunked
 
 
 class TelegramMarkdownFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_short_chunked_tour_draft_also_falls_back(self):
+        sent=object()
+        message=type('Message',(),{})()
+        message.reply_text=AsyncMock(side_effect=[
+            BadRequest("Can't parse entities: can't find end of the entity starting at byte offset 184"),
+            sent,
+        ])
+        result=await reply_text_chunked(message,'*Tour* Hotel_Name [supplier',parse_mode='Markdown')
+        self.assertEqual(result,[sent])
+        self.assertEqual(message.reply_text.await_count,2)
+        self.assertEqual(message.reply_text.await_args_list[1].kwargs,{})
+
     async def test_entity_error_retries_same_text_without_parse_mode(self):
         sent=object()
         message=type('Message',(),{})()

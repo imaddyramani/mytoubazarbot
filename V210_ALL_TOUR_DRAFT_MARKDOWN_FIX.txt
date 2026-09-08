@@ -1,0 +1,5 @@
+MyTourBazar Bot V210
+
+- Applies the Telegram entity-error plain-text retry to the shared chunk sender.
+- Protects both the classic Tour draft and the newer staged Tour V2 draft route.
+- xKiro/local extraction behavior is unchanged.

@@ -6230,7 +6230,7 @@ async def reply_text_chunked(message, text, **kwargs):
     text = str(text or "")
     limit = 3800
     if len(text) <= limit:
-        return [await message.reply_text(text, **kwargs)]
+        return [await _reply_markdown_with_plain_fallback(message,text,**kwargs)]
     parts = []
     current = ""
     for line in text.splitlines(True):
@@ -6255,7 +6255,7 @@ async def reply_text_chunked(message, text, **kwargs):
         # Send long chunks as plain text rather than fail the entire operation.
         if len(parts) > 1:
             kw.pop("parse_mode", None)
-        sent.append(await message.reply_text(part, **kw))
+        sent.append(await _reply_markdown_with_plain_fallback(message,part,**kw))
     return sent
 
 
