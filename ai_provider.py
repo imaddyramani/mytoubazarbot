@@ -240,7 +240,7 @@ def _row_identity(row):
     if not isinstance(row,dict): return ''
     for keys in (
         ('ticket_number',),('flight_number','dep_date','dep_time'),('day',),
-        ('hotel_name','dates'),('name','seat'),('name',),('label','amount'),
+        ('hotel_name','dates'),('seat',),('name',),('label','amount'),
         ('description','total'),('reservation_id',),
     ):
         values=[str(row.get(key) or '').strip().lower() for key in keys]

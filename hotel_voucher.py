@@ -7,6 +7,7 @@ from html import escape
 from pdf_render import write_pdf
 
 from ai_provider import complete_json
+from identity_guard import best_source_name
 from print_settings import apply_css_settings
 from performance_utils import extract_pdf_text, collect_local_document_text, collect_complete_supplier_text, extract_pdf_visual_text
 from hotel_location import google_maps_url, resolve_hotel_location
@@ -322,6 +323,7 @@ def extract_hotel_voucher(file_parts, source_text, api_key, model):
                 if not float(data.get(key) or 0) and float(value or 0): data[key]=value
             elif not str(data.get(key) or '').strip() and str(value or '').strip(): data[key]=value
         data['_ai_primary_used']=True
+    data['guest_name']=best_source_name(data.get('guest_name'),local.get('guest_name'),text)
     # Mixed supplier PDFs often store the property header/address as artwork even
     # though the booking table itself is selectable text. OCR only the most likely
     # one or two pages, and only when identity/location fields are actually absent.

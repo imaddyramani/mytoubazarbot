@@ -1,0 +1,8 @@
+MyTourBazar Bot V208
+
+- Added a shared source-aware identity guard for Air, Bus, Hotel and Tour.
+- Full supplier-supported names override shortened AI names.
+- Passenger rows omitted by an AI response are restored from local supplier parsing.
+- Passenger rows match by ticket number or seat before array position.
+- Surname-first airline name formats are recognized without changing printed order.
+- Multi-page JSON merging uses seat identity so partial name variants do not create duplicates.

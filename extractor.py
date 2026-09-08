@@ -3,6 +3,7 @@ import logging
 import re
 from pathlib import Path
 from ai_provider import complete_json
+from identity_guard import best_source_name
 from local_tour_planner import attractive_title, infer_destination
 
 LOGGER = logging.getLogger('mytourbazar.extractor')
@@ -678,9 +679,10 @@ def _local_tour_result(text,source_days):
     return _ensure_generated_inclusion_exclusion_lists(result)
 
 
-def _merge_local_fallback_into_ai_package(remote, local):
+def _merge_local_fallback_into_ai_package(remote, local, source_text=''):
     """Keep Qwen's structured itinerary and backfill only genuinely blank facts."""
     result=dict(remote or {}); local=local or {}
+    result['client_name']=best_source_name(result.get('client_name'),local.get('client_name'),source_text)
     for key,value in local.items():
         if key in ('days','hotels','inclusions','exclusions','transit','package_costs'):
             continue
@@ -718,5 +720,5 @@ def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
     )
     local=_local_tour_result(source_text,source_days)
     if remote:
-        return _merge_local_fallback_into_ai_package(remote,local)
+        return _merge_local_fallback_into_ai_package(remote,local,source_text)
     return local

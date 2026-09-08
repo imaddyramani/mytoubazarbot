@@ -5,6 +5,7 @@ from html import escape
 from pdf_render import write_pdf
 
 from ai_provider import complete_json
+from identity_guard import reconcile_people
 from print_settings import apply_css_settings
 from performance_utils import extract_pdf_text, collect_local_document_text, collect_complete_supplier_text
 
@@ -166,6 +167,10 @@ def extract_bus_ticket(file_parts, source_text, api_key, model):
                 if not float(data.get(key) or 0) and float(value or 0): data[key]=value
             elif not str(data.get(key) or '').strip() and str(value or '').strip(): data[key]=value
         data['_ai_primary_used']=True
+    data['passengers']=reconcile_people(
+        data.get('passengers'),local.get('passengers'),text,
+        ('title','seat','type','dob','boarding'),
+    )
     return data
 
 def distribute_fare(updated_total, original_base, original_tax):

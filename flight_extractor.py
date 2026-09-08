@@ -5,6 +5,7 @@ import copy
 from pathlib import Path
 from ai_provider import complete_json
 from performance_utils import collect_local_document_text, collect_complete_supplier_text
+from identity_guard import reconcile_people
 
 _layout_cache = ContextVar('air_layout_cache', default=None)
 
@@ -2261,6 +2262,10 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     )
     local=_local_first_air_extract(raw_source_text,original_paths)
     data=_merge_local_fallback_into_ai(remote,local) if remote else local
+    data['passengers']=reconcile_people(
+        data.get('passengers'),local.get('passengers'),raw_source_text,
+        ('title','ticket_number','type','dob','baggage','special_ancillary'),
+    )
     used_ai=bool(remote)
     data=_recover_source_only_fields(data,raw_source_text)
     data=_normalize_flight_segments(data)
