@@ -915,13 +915,12 @@ def _record_caption(reference, prefix, extra=""):
 # ------------------------------------------------------------
 # Adaptive print/edit controls
 # ------------------------------------------------------------
-PAGE_SIZE_OPTIONS = ("A5", "A4", "Letter", "Legal", "A3")
+PAGE_SIZE_OPTIONS = ("A4", "Legal")
 
 def _normalize_page_size(value):
     raw = re.sub(r"[^a-z0-9]", "", str(value or "").lower())
     aliases = {
-        "a5":"A5", "a4":"A4", "a3":"A3",
-        "letter":"Letter", "usletter":"Letter",
+        "a4":"A4",
         "legal":"Legal", "uslegal":"Legal",
         "auto":"auto", "automatic":"auto",
     }
@@ -1648,8 +1647,8 @@ def _generate_adaptive_ticket(kind, data, fare, output_path, logo_path=None, req
 
     ``auto`` now means the normal A4 layout.  If the content is longer, the
     renderer is allowed to flow naturally onto page 2+ so typography and
-    spacing remain professional.  A5/A4/Letter/Legal/A3 can still be selected
-    explicitly through the reply controls.
+    spacing remain professional. A4 and Legal can still be selected explicitly
+    through the reply controls.
     """
     size = _normalize_page_size(requested_size) or "auto"
     candidate = "A4" if size == "auto" else size
@@ -2868,8 +2867,10 @@ def tour_output_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📱 WhatsApp • Basic", callback_data="tour_output:whatsapp:basic"),
          InlineKeyboardButton("📱 WhatsApp • Detailed", callback_data="tour_output:whatsapp:detailed")],
-        [InlineKeyboardButton("📄 PDF • Basic", callback_data="tour_output:pdf:basic"),
-         InlineKeyboardButton("📄 PDF • Detailed", callback_data="tour_output:pdf:detailed")],
+        [InlineKeyboardButton("🧾 Basic Quotation", callback_data="tour_output:pdf:basic:quotation"),
+         InlineKeyboardButton("🎫 Basic Voucher", callback_data="tour_output:pdf:basic:voucher")],
+        [InlineKeyboardButton("🧾 Detailed Quotation", callback_data="tour_output:pdf:detailed:quotation"),
+         InlineKeyboardButton("🎫 Detailed Voucher", callback_data="tour_output:pdf:detailed:voucher")],
         [InlineKeyboardButton("✏️ Smart Edit Draft", callback_data="draft_edit")],
         [InlineKeyboardButton("❌ Cancel & Start New", callback_data="cancel")],
     ])
@@ -4761,8 +4762,10 @@ def _tour_v2_output_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📱 Basic WhatsApp", callback_data="tour_output:whatsapp:basic"),
          InlineKeyboardButton("📱 Detailed WhatsApp", callback_data="tour_output:whatsapp:detailed")],
-        [InlineKeyboardButton("📄 Basic PDF", callback_data="tour_output:pdf:basic"),
-         InlineKeyboardButton("📄 Detailed PDF", callback_data="tour_output:pdf:detailed")],
+        [InlineKeyboardButton("🧾 Basic Quotation", callback_data="tour_output:pdf:basic:quotation"),
+         InlineKeyboardButton("🎫 Basic Voucher", callback_data="tour_output:pdf:basic:voucher")],
+        [InlineKeyboardButton("🧾 Detailed Quotation", callback_data="tour_output:pdf:detailed:quotation"),
+         InlineKeyboardButton("🎫 Detailed Voucher", callback_data="tour_output:pdf:detailed:voucher")],
         [InlineKeyboardButton("❌ Cancel & Start New", callback_data="cancel")],
     ])
 
@@ -4814,7 +4817,7 @@ async def _tour_v2_ask_connection(message, context):
 async def _tour_v2_show_outputs(message, context):
     context.user_data["tour_v2_phase"]="choose_output"
     await message.reply_text("✅ Draft is ready. Choose what you want to generate:", reply_markup=ReplyKeyboardRemove())
-    await message.reply_text("Choose Basic WhatsApp, Detailed WhatsApp, Basic PDF or Detailed PDF.", reply_markup=_tour_v2_output_keyboard())
+    await message.reply_text("Choose WhatsApp, Basic Quotation/Voucher or Detailed Quotation/Voucher.", reply_markup=_tour_v2_output_keyboard())
 
 
 async def _tour_v2_after_initial_extract(message, context, data):
@@ -6388,8 +6391,10 @@ def draft_review_keyboard():
         [InlineKeyboardButton('🛠️ Modify & Regenerate', callback_data='draft_edit')],
         [InlineKeyboardButton('📱 Basic WhatsApp', callback_data='tour_output:whatsapp:basic'),
          InlineKeyboardButton('📱 Detailed WhatsApp', callback_data='tour_output:whatsapp:detailed')],
-        [InlineKeyboardButton('📄 Basic PDF', callback_data='tour_output:pdf:basic'),
-         InlineKeyboardButton('📄 Detailed PDF', callback_data='tour_output:pdf:detailed')],
+        [InlineKeyboardButton('🧾 Basic Quotation', callback_data='tour_output:pdf:basic:quotation'),
+         InlineKeyboardButton('🎫 Basic Voucher', callback_data='tour_output:pdf:basic:voucher')],
+        [InlineKeyboardButton('🧾 Detailed Quotation', callback_data='tour_output:pdf:detailed:quotation'),
+         InlineKeyboardButton('🎫 Detailed Voucher', callback_data='tour_output:pdf:detailed:voucher')],
         [InlineKeyboardButton('✅ Done', callback_data='draft_done')],
     ])
 
@@ -6697,7 +6702,7 @@ def modify_last_page_keyboard(reference):
 
 def modify_size_keyboard(reference):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton('A4', callback_data=f'mod_size:{reference}:A4'), InlineKeyboardButton('Letter', callback_data=f'mod_size:{reference}:Letter'), InlineKeyboardButton('Legal', callback_data=f'mod_size:{reference}:Legal')],
+        [InlineKeyboardButton('A4', callback_data=f'mod_size:{reference}:A4'), InlineKeyboardButton('Legal', callback_data=f'mod_size:{reference}:Legal')],
         [InlineKeyboardButton('⬅️ Back', callback_data=f'modify:{reference}')],
     ])
 
@@ -6771,7 +6776,7 @@ async def auto_fit_saved_ticket(query, context, reference):
     """Auto-size any generated MyTourBazar document while preserving its saved settings.
 
     For Tour/Auto Creation this also preserves the selected last-page asset and footer mode.
-    The best candidate uses the fewest pages, then the largest readable font, then A4/Letter/Legal.
+    The best candidate uses the fewest pages, then the largest readable font, then A4/Legal.
     """
     record = load_record(reference)
     if not record:
@@ -6792,9 +6797,9 @@ async def auto_fit_saved_ticket(query, context, reference):
     clean = bool(record.get('agency_removed', False))
     last_page = record.get('terms_choice') or get_tour_last_page()
 
-    await safe_callback_edit(query, '⚡ *Auto Size is checking A4, Letter and Legal...*', parse_mode='Markdown')
+    await safe_callback_edit(query, '⚡ *Auto Size is checking A4 and Legal...*', parse_mode='Markdown')
 
-    sizes = ['A4', 'Letter', 'Legal']
+    sizes = ['A4', 'Legal']
     current = float(record.get('text_scale') or load_settings().get('text_scale', 1.0))
     current = max(0.70, min(1.35, current))
     scales = [round(current * x, 2) for x in (1.00, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70)]
@@ -7165,7 +7170,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
         context.user_data.pop('editing_current_itinerary', None)
         await safe_callback_edit(
             query,
-            '✅ *Draft confirmed.*\n\nChoose the output you want. For PDF, first choose Basic/Detailed and then Tour Quotation or Tour Voucher.',
+            '✅ *Draft confirmed.*\n\nChoose WhatsApp, Basic Quotation/Voucher or Detailed Quotation/Voucher directly.',
             parse_mode='Markdown', reply_markup=tour_output_keyboard()
         )
         return
@@ -7522,6 +7527,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
         parts = query.data.split(":")
         output = parts[1]
         detail = parts[2]
+        document_mode = parts[3] if len(parts) > 3 else None
         if _tour_v2_active(context):
             data=copy.deepcopy(context.user_data.get("itinerary") or {})
             if not data:
@@ -7543,7 +7549,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
                     await query.message.reply_text("✅ WhatsApp itinerary generated. You can choose another format below.",reply_markup=_tour_v2_output_keyboard())
                     return
                 if output=="pdf":
-                    requested_mode = str(context.user_data.get("smart_requested_document_mode") or "").lower()
+                    requested_mode = document_mode or str(context.user_data.get("smart_requested_document_mode") or "").lower()
                     if requested_mode in ("quotation", "voucher"):
                         await safe_callback_edit(
                             query,
@@ -7562,7 +7568,6 @@ I will show the detailed Transit text I understood before regenerating the PDF."
                 logger.exception("Tour V2 output failed")
                 await query.message.reply_text(f"❌ Tour output failed: {str(exc)[:700]}",reply_markup=main_keyboard())
                 return
-        document_mode = parts[3] if len(parts) > 3 else None
         data = context.user_data.get("itinerary")
         if not data:
             await query.message.reply_text("No itinerary data is available. Please start the tour workflow again.", reply_markup=main_keyboard())

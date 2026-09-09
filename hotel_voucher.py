@@ -379,7 +379,8 @@ def generate_hotel_voucher(data, output_path, logo_path=None, fare=None, page_si
     maps_url = data.get('maps_url') or google_maps_url(data.get('hotel_name'),hotel_city,address)
     maps_html = f'<a href="{_esc(maps_url)}" class="map-link">📍 View on Google Maps</a>' if maps_url else "Not available"
 
-    terms = data.get("terms") or []
+    # Customer-facing hotel notes always use the approved agency spelling.
+    terms = [re.sub(r'(?i)\bmy\s*tour\s*baz(?:ar|aar)\b', 'MyTourBazar', str(item or '')) for item in (data.get("terms") or [])]
     terms_html = "".join(f"<li>{_esc(item)}</li>" for item in terms)
     if not terms_html:
         terms_html = "<li>Please present a valid government-approved photo ID at check-in.</li>"
