@@ -6577,11 +6577,11 @@ async def _prepare_tour_pdf_request(message, context, detail, mode):
     detail = 'detailed' if str(detail).lower() == 'detailed' else 'basic'
     mode = 'voucher' if str(mode).lower() == 'voucher' else 'quotation'
     if str(data.get('detail_level') or '').lower() != detail:
-        old_name = str(data.get('client_name') or '').strip()
         status = await message.reply_text(f'🤖 Preparing the {detail} day plan...')
-        data = await _run_ai_with_retry_status(message, lambda: asyncio.to_thread(enhance_package_itinerary, data, AI_API_KEY, AI_MODEL, detail), status=status)
-        data['client_name'] = old_name or str(data.get('client_name') or '').strip()
-        data['detail_level'] = detail
+        # The AI day-plan response is intentionally partial. Merge it over the
+        # authoritative supplier draft so hotels, guests, dates, activities,
+        # costs and inclusions never disappear during a Basic/Detailed change.
+        data = await _tour_variant_data(message, data, detail, status=status)
         if context.user_data.get('pending_b2b'):
             data = _apply_tour_document_mode_fields(data, mode, b2b=True)
         context.user_data['itinerary'] = data
@@ -7504,10 +7504,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
                 await query.message.reply_text('❌ No current Tour draft is available.',reply_markup=main_keyboard()); return
             if str(data.get('detail_level') or 'basic').lower()!=detail:
                 status=await query.message.reply_text(f'✨ Preparing the {detail} itinerary...')
-                old_name=str(data.get('client_name') or '')
-                data=await _run_ai_with_retry_status(query.message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail),status=status)
-                data['client_name']=old_name or str(data.get('client_name') or '')
-                data['detail_level']=detail
+                data=await _tour_variant_data(query.message,data,detail,status=status)
                 await safe_status_edit(status,query.message,f'✅ {detail.title()} day plan ready.')
             data['document_mode']=mode
             context.user_data['itinerary']=data
@@ -7536,10 +7533,7 @@ I will show the detailed Transit text I understood before regenerating the PDF."
             try:
                 if str(data.get("detail_level") or "basic").lower()!=detail:
                     status=await query.message.reply_text(f"✨ Preparing the {detail} itinerary...")
-                    old_name=str(data.get("client_name") or "")
-                    data=await _run_ai_with_retry_status(query.message,lambda: asyncio.to_thread(enhance_package_itinerary,data,AI_API_KEY,AI_MODEL,detail),status=status)
-                    data["client_name"]=old_name or str(data.get("client_name") or "")
-                    data["detail_level"]=detail
+                    data=await _tour_variant_data(query.message,data,detail,status=status)
                     await safe_status_edit(status,query.message,"✅ Itinerary detail level ready.")
                 data["show_cost"]=bool(data.get("show_cost") and data.get("package_costs"))
                 context.user_data["itinerary"]=data
