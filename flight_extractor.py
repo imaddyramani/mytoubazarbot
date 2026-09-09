@@ -2157,6 +2157,26 @@ def _local_air_needs_ai(data):
     return False
 
 
+def _require_verified_air_print_data(data):
+    """Never create a customer document from an empty failed extraction.
+
+    A missing fare or optional contact field is valid.  A document with neither
+    a traveller nor a usable flight sector is not: it is unsafe at an airport
+    and only hides the real supplier-reading failure.
+    """
+    rows=(data or {}).get('passengers') or []
+    sectors=(data or {}).get('segments') or []
+    valid_people=[row for row in rows if str((row or {}).get('name') or '').strip()]
+    valid_sectors=[row for row in sectors if all(str((row or {}).get(key) or '').strip()
+        for key in ('flight_number','dep_code','arr_code','dep_time','arr_time'))]
+    if not valid_people or not valid_sectors:
+        raise ValueError(
+            'Could not verify the passenger and flight sector from this supplier file. '
+            'Please resend the original PDF or a clear first-page screenshot; no blank ticket was created.'
+        )
+    return data
+
+
 def _merge_ai_into_local(local,ai):
     local=local or _local_blank_air_data(); ai=ai or {}
     for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary','special_ancillary_summary'):
@@ -2285,6 +2305,7 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
 
     # Missing optional fields remain blank. Remote repair never blocks Air Print.
     data=_apply_baggage_summary(data)
+    data=_require_verified_air_print_data(data)
     data=_apply_air_output_defaults(data,raw_source_text)
 
     clean=[]

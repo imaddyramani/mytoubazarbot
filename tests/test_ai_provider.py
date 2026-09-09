@@ -73,6 +73,27 @@ class AIProviderTests(unittest.TestCase):
             document.save(path); document.close()
             self.assertEqual(ai_provider._pdf_visual_indexes(path),[0,2])
 
+    @patch.dict(os.environ, {
+        "AI_PROVIDER":"xkiro","XKIRO_API_KEY":"test-key",
+        "AI_VISION_BATCH_PAGES":"6",
+    }, clear=False)
+    def test_vision_batches_are_capped_to_two_pages(self):
+        self.assertEqual(ai_provider._vision_batch_size(),2)
+
+    @patch.dict(os.environ, {
+        "AI_PROVIDER":"xkiro","XKIRO_API_KEY":"test-key",
+        "AI_VISION_BATCH_PAGES":"2",
+    }, clear=False)
+    def test_keeps_earlier_verified_vision_batch_when_later_page_fails(self):
+        schema={"type":"object","properties":{"rows":{"type":"array"}},"required":["rows"]}
+        def fake_request(provider,*args,**kwargs):
+            if kwargs.get('vision_offset') == 2:
+                raise ai_provider.AIProviderError('xkiro returned HTTP 500')
+            return ({"rows":[{"name":"booking page"}]},"qwen-test")
+        with patch("ai_provider._vision_unit_count",return_value=4), patch("ai_provider._request",side_effect=fake_request):
+            result=ai_provider.complete_json("system","source",schema,image_paths=["supplier.pdf"])
+        self.assertEqual(result,{"rows":[{"name":"booking page"}]})
+
 
 if __name__ == "__main__":
     unittest.main()

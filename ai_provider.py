@@ -138,9 +138,14 @@ def _provider_config(provider, vision=False):
 
 def _vision_batch_size():
     try:
-        return max(1,min(int(os.getenv("AI_VISION_BATCH_PAGES","6")),8))
+        # Image-only supplier PDFs can be surprisingly large.  Sending six full
+        # pages in one request has caused upstream HTTP 500 responses, after
+        # which an otherwise valid ticket used to fall through to empty local
+        # data.  Two pages retain the booking + baggage context while keeping
+        # each vision request within a dependable size.
+        return max(1,min(int(os.getenv("AI_VISION_BATCH_PAGES","2")),2))
     except ValueError:
-        return 6
+        return 2
 
 
 def _max_vision_pages():
@@ -392,12 +397,18 @@ def complete_json(system_prompt, user_text, schema, *, purpose="extraction", max
                     correction = str(exc)[:300]
                     errors.append(f"{provider}: {correction}")
                     LOGGER.warning("AI %s batch %s attempt %s failed via %s: %s",purpose,batch_index+1,attempt+1,provider,correction)
-                    if attempt == 0 and "validation" not in correction and "JSON" not in correction and "required" not in correction:
+                    # A transient 5xx/network error is worth one immediate retry.
+                    # Invalid JSON/schema responses instead receive the existing
+                    # correction retry on the next attempt.
+                    retryable=bool(re.search(r"(?:HTTP 5\d\d|timeout|temporar|connection|network)", correction, re.I))
+                    if attempt == 0 and not retryable and "validation" not in correction and "JSON" not in correction and "required" not in correction:
                         break
             if value is None:
                 failed=True; break
             combined=_merge_fragments(combined,value)
-        if not failed and combined is not None:
+        if combined is not None:
+            if failed:
+                LOGGER.warning("AI %s retained verified results from completed page batches after a later batch failed",purpose)
             LOGGER.info("AI %s completed via %s/%s in %s batch(es)",purpose,provider,model,len(offsets))
             return _validate(combined,deepcopy(schema))
     LOGGER.warning("AI %s unavailable; local result retained (%s)", purpose, "; ".join(errors[-4:]))
