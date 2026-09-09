@@ -2837,6 +2837,7 @@ def tour_output_keyboard():
         [InlineKeyboardButton("📄 PDF • Basic", callback_data="tour_output:pdf:basic"),
          InlineKeyboardButton("📄 PDF • Detailed", callback_data="tour_output:pdf:detailed")],
         [InlineKeyboardButton("✏️ Smart Edit Draft", callback_data="draft_edit")],
+        [InlineKeyboardButton("❌ Cancel & Start New", callback_data="cancel")],
     ])
 
 
@@ -4728,6 +4729,7 @@ def _tour_v2_output_keyboard():
          InlineKeyboardButton("📱 Detailed WhatsApp", callback_data="tour_output:whatsapp:detailed")],
         [InlineKeyboardButton("📄 Basic PDF", callback_data="tour_output:pdf:basic"),
          InlineKeyboardButton("📄 Detailed PDF", callback_data="tour_output:pdf:detailed")],
+        [InlineKeyboardButton("❌ Cancel & Start New", callback_data="cancel")],
     ])
 
 def _tour_v2_set_journey_type(rows, stage):
