@@ -32,7 +32,7 @@ class AIProviderTests(unittest.TestCase):
             return ({"answer": "ok"}, "test-model")
 
         schema={"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
-        with patch("ai_provider._request", side_effect=fake_request):
+        with patch("ai_provider._discover_xkiro_models",return_value=["qwen/test-vision"]), patch("ai_provider._request", side_effect=fake_request):
             result=ai_provider.complete_json("system", "source", schema)
         self.assertEqual(result, {"answer": "ok"})
         self.assertEqual(calls, ["xkiro", "groq"])
@@ -55,7 +55,7 @@ class AIProviderTests(unittest.TestCase):
         def fake_request(provider,*args,**kwargs):
             calls.append(kwargs.get('vision_offset'))
             return ({"rows":[{"name":f"P{kwargs.get('vision_offset')}"}]},"qwen-test")
-        with patch("ai_provider._vision_unit_count",return_value=13), patch("ai_provider._request",side_effect=fake_request):
+        with patch("ai_provider._discover_xkiro_models",return_value=["qwen/test-vision"]), patch("ai_provider._vision_unit_count",return_value=13), patch("ai_provider._request",side_effect=fake_request):
             result=ai_provider.complete_json("system","complete text",schema,image_paths=["supplier.pdf"])
         self.assertEqual(calls,[0,6,12])
         self.assertEqual([row['name'] for row in result['rows']],["P0","P6","P12"])
@@ -90,7 +90,7 @@ class AIProviderTests(unittest.TestCase):
             if kwargs.get('vision_offset') == 2:
                 raise ai_provider.AIProviderError('xkiro returned HTTP 500')
             return ({"rows":[{"name":"booking page"}]},"qwen-test")
-        with patch("ai_provider._vision_unit_count",return_value=4), patch("ai_provider._request",side_effect=fake_request):
+        with patch("ai_provider._discover_xkiro_models",return_value=["qwen/test-vision"]), patch("ai_provider._vision_unit_count",return_value=4), patch("ai_provider._request",side_effect=fake_request):
             result=ai_provider.complete_json("system","source",schema,image_paths=["supplier.pdf"])
         self.assertEqual(result,{"rows":[{"name":"booking page"}]})
 

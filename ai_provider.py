@@ -33,8 +33,8 @@ _TEXT_MODEL_PREFERENCE = (
     "openai/gpt-5.3-codex-spark",
 )
 _VISION_MODEL_PREFERENCE = (
-    "qwen/qwen3.5-plus:free",
     "qwen/qwen3.5-omni-plus:free",
+    "qwen/qwen3.5-plus:free",
     "qwen/qwen3-vl-plus:free",
     "minimax/minimax-m3:free",
 )
@@ -90,10 +90,17 @@ def _provider_order():
     return []
 
 
-def _discover_xkiro_model(vision=False):
+def _discover_xkiro_models(vision=False):
+    """Return a small live, free-model fallback list for xKiro.
+
+    Vision availability changes at the gateway.  Keeping this list live means an
+    image-only supplier PDF can move to another Qwen/vision-capable model after
+    a provider-side failure without sending the same document to a different AI
+    company or requiring another API key.
+    """
     configured = os.getenv("XKIRO_VISION_MODEL" if vision else "XKIRO_TEXT_MODEL", "").strip()
     if configured:
-        return configured
+        return [configured]
     cache_key = "vision" if vision else "text"
     with _MODEL_LOCK:
         if _MODEL_CACHE.get(cache_key):
@@ -110,15 +117,28 @@ def _discover_xkiro_model(vision=False):
             if vision and not capabilities.get("vision"):
                 continue
             choices.append(str(item.get("id") or ""))
+        # Keep automatic supplier-document extraction within the Qwen/MiniMax
+        # choices already approved for this bot. An owner can still explicitly
+        # force any xKiro vision model with XKIRO_VISION_MODEL.
+        preferred_choices=[item for item in choices if item.startswith(('qwen/','minimax/'))]
+        if preferred_choices:
+            choices=preferred_choices
         preferred = _VISION_MODEL_PREFERENCE if vision else _TEXT_MODEL_PREFERENCE
         model = next((item for item in preferred if item in choices), "")
         if not model and choices:
             model = choices[0]
         if not model:
             raise AIProviderError("xKiro currently exposes no suitable free model")
-        _MODEL_CACHE[cache_key] = model
-        LOGGER.info("Selected xKiro %s model: %s", cache_key, model)
-        return model
+        ordered=[model] + [item for item in choices if item != model]
+        # Do not turn a single failed document into an expensive long retry
+        # sequence. Three live candidates are enough for resilient extraction.
+        _MODEL_CACHE[cache_key] = ordered[:3]
+        LOGGER.info("Selected xKiro %s models: %s", cache_key, ", ".join(_MODEL_CACHE[cache_key]))
+        return _MODEL_CACHE[cache_key]
+
+
+def _discover_xkiro_model(vision=False):
+    return _discover_xkiro_models(vision)[0]
 
 
 def _provider_config(provider, vision=False):
@@ -328,8 +348,9 @@ def _validate(value, schema):
     return value
 
 
-def _request(provider, system_prompt, user_text, schema, max_tokens, vision=False, correction="", image_paths=None, vision_offset=0, vision_limit=None):
+def _request(provider, system_prompt, user_text, schema, max_tokens, vision=False, correction="", image_paths=None, vision_offset=0, vision_limit=None, model_override=None):
     base_url, key, model = _provider_config(provider, vision)
+    model=str(model_override or model)
     schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
     user_content=str(user_text or "")[:_max_input_chars()]
     if vision:
@@ -367,49 +388,54 @@ def _request(provider, system_prompt, user_text, schema, max_tokens, vision=Fals
     return _validate(_json_from_content(content), schema), model
 
 
-def complete_json(system_prompt, user_text, schema, *, purpose="extraction", max_tokens=5000, image_paths=None):
+def complete_json(system_prompt, user_text, schema, *, purpose="extraction", max_tokens=5000, image_paths=None, max_vision_pages=None):
     """Return validated JSON, or ``None`` so the caller can keep local output."""
     if not enabled():
         return None
     errors = []
     vision=bool(image_paths)
     visual_count=_vision_unit_count(image_paths) if vision else 0
+    if max_vision_pages is not None:
+        visual_count=min(visual_count,max(1,int(max_vision_pages)))
     batch_size=_vision_batch_size()
     offsets=list(range(0,visual_count,batch_size)) or [0]
     for provider in _provider_order():
-        combined=None; failed=False; model=''
-        for batch_index,offset in enumerate(offsets):
-            correction = ""; value=None
-            batch_text=str(user_text or '') if batch_index==0 else (
-                f"Continue the same {purpose}. These are additional supplier pages "
-                f"{offset+1}-{min(offset+batch_size,visual_count)}. Extract only facts visible on these pages; "
-                "return blank/zero values for facts not present on this batch."
-            )
-            for attempt in range(2):
-                try:
-                    value, model = _request(
-                        provider, system_prompt, batch_text, deepcopy(schema), max_tokens,
-                        vision=vision, correction=correction, image_paths=image_paths,
-                        vision_offset=offset,vision_limit=batch_size,
-                    )
-                    break
-                except (AIProviderError, httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-                    correction = str(exc)[:300]
-                    errors.append(f"{provider}: {correction}")
-                    LOGGER.warning("AI %s batch %s attempt %s failed via %s: %s",purpose,batch_index+1,attempt+1,provider,correction)
-                    # A transient 5xx/network error is worth one immediate retry.
-                    # Invalid JSON/schema responses instead receive the existing
-                    # correction retry on the next attempt.
-                    retryable=bool(re.search(r"(?:HTTP 5\d\d|timeout|temporar|connection|network)", correction, re.I))
-                    if attempt == 0 and not retryable and "validation" not in correction and "JSON" not in correction and "required" not in correction:
+        try:
+            model_candidates=_discover_xkiro_models(vision) if provider == 'xkiro' else [None]
+        except (AIProviderError, httpx.HTTPError, ValueError) as exc:
+            errors.append(f"{provider}: {str(exc)[:300]}")
+            continue
+        for model_override in model_candidates:
+            combined=None; failed=False; model=''
+            for batch_index,offset in enumerate(offsets):
+                correction = ""; value=None
+                batch_text=str(user_text or '') if batch_index==0 else (
+                    f"Continue the same {purpose}. These are additional supplier pages "
+                    f"{offset+1}-{min(offset+batch_size,visual_count)}. Extract only facts visible on these pages; "
+                    "return blank/zero values for facts not present on this batch."
+                )
+                for attempt in range(2):
+                    try:
+                        value, model = _request(
+                            provider, system_prompt, batch_text, deepcopy(schema), max_tokens,
+                            vision=vision, correction=correction, image_paths=image_paths,
+                            vision_offset=offset,vision_limit=batch_size,model_override=model_override,
+                        )
                         break
-            if value is None:
-                failed=True; break
-            combined=_merge_fragments(combined,value)
-        if combined is not None:
-            if failed:
-                LOGGER.warning("AI %s retained verified results from completed page batches after a later batch failed",purpose)
-            LOGGER.info("AI %s completed via %s/%s in %s batch(es)",purpose,provider,model,len(offsets))
-            return _validate(combined,deepcopy(schema))
+                    except (AIProviderError, httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                        correction = str(exc)[:300]
+                        errors.append(f"{provider}/{model_override or 'default'}: {correction}")
+                        LOGGER.warning("AI %s batch %s attempt %s failed via %s/%s: %s",purpose,batch_index+1,attempt+1,provider,model_override or 'default',correction)
+                        retryable=bool(re.search(r"(?:HTTP 5\d\d|timeout|temporar|connection|network)", correction, re.I))
+                        if attempt == 0 and not retryable and "validation" not in correction and "JSON" not in correction and "required" not in correction:
+                            break
+                if value is None:
+                    failed=True; break
+                combined=_merge_fragments(combined,value)
+            if combined is not None:
+                if failed:
+                    LOGGER.warning("AI %s retained verified results from completed page batches after a later batch failed",purpose)
+                LOGGER.info("AI %s completed via %s/%s in %s batch(es)",purpose,provider,model,len(offsets))
+                return _validate(combined,deepcopy(schema))
     LOGGER.warning("AI %s unavailable; local result retained (%s)", purpose, "; ".join(errors[-4:]))
     return None

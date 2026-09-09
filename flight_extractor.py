@@ -2278,7 +2278,11 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     original_paths=[Path(item.get('path') or '') for item in (file_parts or []) if item.get('path')]
     remote=complete_json(
         AIR_LIGHT_PROMPT,raw_source_text,SCHEMA,
-        purpose='air primary extraction',max_tokens=7500,image_paths=original_paths,
+        # The first two pages of supplier air itineraries normally contain the
+        # booking, passenger, flight and baggage evidence.  Do not make clients
+        # wait while terms/conditions pages are sent to vision. Manual fare entry
+        # remains available when a later invoice page is needed.
+        purpose='air primary extraction',max_tokens=7500,image_paths=original_paths,max_vision_pages=2,
     )
     local=_local_first_air_extract(raw_source_text,original_paths)
     data=_merge_local_fallback_into_ai(remote,local) if remote else local

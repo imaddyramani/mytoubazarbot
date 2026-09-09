@@ -492,6 +492,29 @@ async def safe_status_edit(status_message, chat_message, text, **kwargs):
     return status_message
 
 
+async def _printer_animation(status_message, source_message, finished):
+    """A lightweight in-chat printer animation while a customer PDF is rendered.
+
+    Telegram does not expose a universal animated printer sticker. Editing one
+    bot-owned status message is reliable on every client and avoids adding a
+    large GIF upload before every Air/Bus/Hotel print.
+    """
+    frames=(
+        '🖨️ *Printing your PDF…*\n\n┌─────────┐\n│         │\n└─────────┘\n   📄',
+        '🖨️ *Printing your PDF…*\n\n┌─────────┐\n│   📄    │\n└─────────┘',
+        '🖨️ *Printing your PDF…*\n\n┌─────────┐\n│  📄📄   │\n└─────────┘',
+        '🖨️ *Finalising your PDF…*\n\n┌─────────┐\n│  ✅📄   │\n└─────────┘',
+    )
+    index=0
+    while not finished.is_set():
+        await safe_status_edit(status_message,source_message,frames[index % len(frames)],parse_mode='Markdown')
+        index += 1
+        try:
+            await asyncio.wait_for(finished.wait(),timeout=1.1)
+        except asyncio.TimeoutError:
+            pass
+
+
 def _safe_filename_part(value, fallback="Document"):
     value = str(value or "").strip()
     value = value.replace("/", "-").replace("\\", "-")
@@ -2797,8 +2820,19 @@ async def ask_footer_choice(message, context, kind):
     footer_mode = _default_footer_mode(kind)
     context.user_data.setdefault('pending_page_size', 'auto')
     context.user_data.setdefault('pending_logo_enabled', True)
-    await message.reply_text(f'⏳ Generating {kind.title()} PDF with {footer_mode} footer...')
-    await _print_ticket_final(message, context, kind, footer_mode=footer_mode, clean=False)
+    status=await message.reply_text('🖨️ *Preparing your PDF…*',parse_mode='Markdown')
+    finished=asyncio.Event()
+    animation=asyncio.create_task(_printer_animation(status,message,finished))
+    try:
+        await _print_ticket_final(message, context, kind, footer_mode=footer_mode, clean=False)
+        await safe_status_edit(status,message,'✅ *PDF printed and sent.*',parse_mode='Markdown')
+    finally:
+        finished.set()
+        animation.cancel()
+        try:
+            await animation
+        except asyncio.CancelledError:
+            pass
 
 
 def confirmation_keyboard():
