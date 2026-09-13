@@ -2342,7 +2342,11 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     local=_local_first_air_extract(raw_source_text,original_paths)
     # A screenshot/image-only ticket may not yield enough selectable text for the
     # large schema. Make one smaller visual pass before rejecting the document.
-    if original_paths and (not remote or not _local_air_core_complete(remote)):
+    visual_name_gap=bool(original_paths and remote and any(
+        len(re.findall(r"[A-Za-z][A-Za-z'\-]+", str(row.get('name') or ''))) < 2
+        for row in (remote.get('passengers') or []) if isinstance(row,dict)
+    ))
+    if original_paths and (not remote or not _local_air_core_complete(remote) or visual_name_gap):
         recovered=complete_json(
             AIR_VISUAL_RECOVERY_PROMPT, raw_source_text, AIR_VISUAL_RECOVERY_SCHEMA,
             purpose='air visual recovery', max_tokens=4500,
