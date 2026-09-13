@@ -2364,10 +2364,15 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         len(re.findall(r"[A-Za-z][A-Za-z'\-]+", str(row.get('name') or ''))) < 2
         for row in (remote.get('passengers') or []) if isinstance(row,dict)
     ))
+    image_only_input=bool(original_paths and any(
+        path.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'}
+        for path in original_paths
+    ))
+    name_recovery_needed=bool(original_paths and (visual_name_gap or image_only_input))
     # Direct screenshots intentionally skip OCR on the fast path. If the vision
     # response contains only a first name, run the bounded local scan reader once
     # and use its passenger row as an independent source-of-truth check.
-    if visual_name_gap:
+    if name_recovery_needed:
         visual_text=[]
         for path in original_paths:
             if path.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'} and path.is_file():
@@ -2378,8 +2383,11 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
                 if text: visual_text.append(text)
         if visual_text:
             visual_rows=_local_passengers_from_text('\n'.join(visual_text),'')
-            remote=_restore_longer_passenger_names(remote,visual_rows)
-    if visual_name_gap:
+            if remote:
+                remote=_restore_longer_passenger_names(remote,visual_rows)
+            elif visual_rows:
+                local['passengers']=visual_rows
+    if name_recovery_needed:
         name_recovery=complete_json(
             AIR_NAME_RECOVERY_PROMPT, raw_source_text, AIR_NAME_RECOVERY_SCHEMA,
             purpose='air passenger-name visual recovery', max_tokens=1800,
