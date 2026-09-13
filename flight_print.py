@@ -642,10 +642,15 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
         baggage_value=_text(p.get("baggage")) or baggage_summary
         ancillary_value=_text(p.get("special_ancillary")) or ancillary_summary
         baggage_html=_baggage_html(baggage_value,p)
+        display_name=_display_person_name(p)
+        # Keep long, correct names visible without allowing the table to clip or
+        # collapse them. Short names retain the normal print size.
+        name_len=len(re.sub(r'\s+',' ',display_name).strip())
+        name_size=11.3 if name_len <= 22 else 10.6 if name_len <= 30 else 9.8 if name_len <= 40 else 9.1
 
         row=(
             f'<tr><td class="pax-index">{i+1}</td>'
-            f'<td class="pax-name"><strong>{_esc(_display_person_name(p))}</strong></td>'
+            f'<td class="pax-name" style="font-size:{name_size:.1f}pt!important"><strong>{_esc(display_name)}</strong></td>'
             + (f'<td class="pax-pnr">{_esc(ticket_value)}</td>' if show_ticket_col else '') +
             f'<td class="pax-type">{_esc(p.get("type") or "Adult")}</td>'
             f'<td class="pax-dob">{_esc(p.get("dob"))}</td>'

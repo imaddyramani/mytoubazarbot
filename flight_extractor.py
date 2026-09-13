@@ -2327,6 +2327,14 @@ AIR_VISUAL_RECOVERY_SCHEMA={"type":"object","properties":{
 
 AIR_VISUAL_RECOVERY_PROMPT="""Read the attached airline ticket image/PDF visually and transcribe only the core booking rows. Return every passenger's COMPLETE name (including surnames), the printed booking/reference ID, airline and GDS PNR, every flight sector, both endpoint airport names, terminals, dates and times, and the complete checked/cabin baggage allowance. Do not invent missing values; use empty strings. Ignore barcodes, legal text and marketing. Return JSON only."""
 
+AIR_NAME_RECOVERY_SCHEMA={"type":"object","properties":{
+    "passengers":{"type":"array","items":{"type":"object","properties":{
+        "name":{"type":"string"},"title":{"type":"string"},"type":{"type":"string"}
+    },"required":["name","title","type"]}}
+},"required":["passengers"]}
+
+AIR_NAME_RECOVERY_PROMPT="""Inspect the passenger-name table on the attached airline ticket image/PDF. Return EVERY passenger row in order. Transcribe the COMPLETE name exactly as printed, including all first, middle and surname words even when the surname wraps onto the next line or appears in a second table cell. Do not shorten names to the first word. Keep title in title and the name without title in name. Ignore email, PNR, ticket number, baggage and all other columns. Return JSON only."""
+
 @_layout_session
 def extract_flight_ticket(file_parts, source_text, api_key, model):
     """Qwen-first Air Print with deterministic validation and local outage fallback."""
@@ -2346,6 +2354,23 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         len(re.findall(r"[A-Za-z][A-Za-z'\-]+", str(row.get('name') or ''))) < 2
         for row in (remote.get('passengers') or []) if isinstance(row,dict)
     ))
+    if visual_name_gap:
+        name_recovery=complete_json(
+            AIR_NAME_RECOVERY_PROMPT, raw_source_text, AIR_NAME_RECOVERY_SCHEMA,
+            purpose='air passenger-name visual recovery', max_tokens=1800,
+            image_paths=original_paths, max_vision_pages=4,
+        )
+        if name_recovery and name_recovery.get('passengers'):
+            recovered_rows=name_recovery.get('passengers') or []
+            for i,row in enumerate(remote.get('passengers') or []):
+                if i >= len(recovered_rows):
+                    break
+                recovered_name=str((recovered_rows[i] or {}).get('name') or '').strip()
+                current_name=str(row.get('name') or '').strip()
+                if len(recovered_name) > len(current_name):
+                    row['name']=recovered_name
+                    if not str(row.get('title') or '').strip():
+                        row['title']=(recovered_rows[i] or {}).get('title') or ''
     if original_paths and (not remote or not _local_air_core_complete(remote) or visual_name_gap):
         recovered=complete_json(
             AIR_VISUAL_RECOVERY_PROMPT, raw_source_text, AIR_VISUAL_RECOVERY_SCHEMA,
