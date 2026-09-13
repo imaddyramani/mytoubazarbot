@@ -190,7 +190,15 @@ def _pdf_visual_indexes(path):
             for index,page in enumerate(document):
                 text=page.get_text('text') or ''
                 density=len(re.sub(r'\s+','',text))
-                if index==0 or density<120:
+                # A scanned ticket can sit below a selectable-text header or
+                # footer. Text density alone does not mean its booking is text.
+                page_area=max(1.0,page.rect.width*page.rect.height)
+                has_large_image=any(
+                    max(0,info['bbox'][2]-info['bbox'][0]) *
+                    max(0,info['bbox'][3]-info['bbox'][1]) / page_area >= .20
+                    for info in page.get_image_info()
+                )
+                if index==0 or density<120 or has_large_image:
                     indexes.append(index)
             return indexes
     except Exception:
@@ -230,14 +238,14 @@ def _vision_parts(image_paths, offset=0, limit=None):
                         if unit_index>=_max_vision_pages() or len(parts)>=limit: break
                         current=unit_index; unit_index += 1
                         if current<offset: continue
-                        zoom=min(1.4,1400/max(page.rect.width,page.rect.height))
+                        zoom=min(2.5,2000/max(page.rect.width,page.rect.height))
                         pix=page.get_pixmap(matrix=fitz.Matrix(zoom,zoom),colorspace=fitz.csRGB,alpha=False)
                         image=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
                         del pix
                         try:
-                            image.thumbnail((1400,1400))
+                            image.thumbnail((2000,2000))
                             buffer=BytesIO()
-                            image.save(buffer,format='JPEG',quality=76,optimize=True)
+                            image.save(buffer,format='JPEG',quality=88,optimize=True)
                             encoded=base64.b64encode(buffer.getvalue()).decode('ascii')
                             parts.append({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+encoded}})
                         finally:
@@ -249,9 +257,9 @@ def _vision_parts(image_paths, offset=0, limit=None):
                     with Image.open(path) as original:
                         image=ImageOps.exif_transpose(original).convert('RGB').copy()
                     try:
-                        image.thumbnail((1400,1400))
+                        image.thumbnail((2000,2000))
                         buffer=BytesIO()
-                        image.save(buffer,format='JPEG',quality=76,optimize=True)
+                        image.save(buffer,format='JPEG',quality=88,optimize=True)
                         encoded=base64.b64encode(buffer.getvalue()).decode('ascii')
                         parts.append({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+encoded}})
                     finally:
@@ -432,6 +440,10 @@ def complete_json(system_prompt, user_text, schema, *, purpose="extraction", max
                 if value is None:
                     failed=True; break
                 combined=_merge_fragments(combined,value)
+            if failed and vision:
+                # A partial image batch can omit passengers or a connection.
+                # Try the next configured candidate, never call it complete.
+                continue
             if combined is not None:
                 if failed:
                     LOGGER.warning("AI %s retained verified results from completed page batches after a later batch failed",purpose)

@@ -395,7 +395,13 @@ def _normalized_baggage_entries(value, person=None):
 
         # Preserve multiple DISTINCT source allowances if genuinely present, but
         # never print duplicated tokens.
-        allowance=" + ".join(tokens)
+        weights=[re.sub(r'kg$', ' kg', token) for token in tokens if token.endswith('kg')]
+        pieces=[token for token in tokens if re.fullmatch(r'\d+(?:\.\d+)?pcs?', token)]
+        if len(weights)==1 and len(pieces)==1:
+            count=re.sub(r'pcs?$', '', pieces[0])
+            allowance=f"{weights[0]} ({count} {'piece' if count=='1' else 'pieces'})"
+        else:
+            allowance=" + ".join(re.sub(r'kg$', ' kg', token) for token in tokens)
         key=(kind,pax_type.lower(),allowance.lower())
         if key in seen:
             continue
