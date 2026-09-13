@@ -2027,6 +2027,126 @@ def _local_baggage_summary(raw):
     return ''
 
 
+def _local_passengers_from_pdf_geometry(original_paths, baggage_summary=''):
+    """Recover complete passenger rows from selectable supplier PDF geometry.
+
+    A number of airline PDFs place a wrapped surname on the next visual line,
+    while PyMuPDF's reading order inserts the ticket number or email continuation
+    between those lines.  Text-only parsing then sees ``Mr Ashish`` and loses
+    ``Krishnani``.  The passenger table has stable columns, so use the printed
+    ``Type`` cell as the row anchor and collect only text in the name column.
+    This is source transcription, not OCR or name generation.
+    """
+    spans=[]
+    for raw_path in original_paths or []:
+        path=Path(raw_path)
+        if path.suffix.lower() != '.pdf' or not path.is_file():
+            continue
+        try:
+            spans.extend(_pdf_layout_lines(path))
+        except Exception:
+            continue
+    if not spans:
+        return []
+
+    grouped={}
+    for span in spans:
+        grouped.setdefault(span.get('page'), []).append(span)
+    rows=[]; seen=set()
+    type_re=re.compile(r'(?i)^(?:adult|child|infant|adt|chd|cnn|inf)\.?$')
+    title_re=re.compile(r'(?i)^(mr|mrs|ms|miss|master|mstr|dr|prof)\.?$')
+    header_re=re.compile(r'(?i)^passenger(?:\s+(?:name|information|details))?$')
+    type_header_re=re.compile(r'(?i)^type$')
+    reject_re=re.compile(r'(?i)\b(?:frequent|flyer|email|ticket|number|pnr|booking|baggage|fare|payment|amount)\b')
+
+    for page, page_spans in grouped.items():
+        passenger_headers=[x for x in page_spans if header_re.fullmatch(str(x.get('text') or '').strip())]
+        type_headers=[x for x in page_spans if type_header_re.fullmatch(str(x.get('text') or '').strip())]
+        if not passenger_headers or not type_headers:
+            continue
+        for passenger_header in passenger_headers:
+            phx, phy=_line_center(passenger_header)
+            candidates=[x for x in type_headers
+                        if abs(_line_center(x)[1]-phy)<=24 and _line_center(x)[0]>phx]
+            if not candidates:
+                continue
+            type_header=min(candidates,key=lambda x:abs(_line_center(x)[1]-phy))
+            type_x, type_y=_line_center(type_header)
+            table_start=max(float(passenger_header.get('y1') or 0),float(type_header.get('y1') or 0))+3
+            # Type values are the safest row anchors. Keep the x window tight so
+            # the Adult label in a baggage allowance cannot become a passenger row.
+            anchors=[]
+            for span in page_spans:
+                text=re.sub(r'\s+',' ',str(span.get('text') or '')).strip()
+                cx,cy=_line_center(span)
+                if cy<table_start or cy>table_start+330 or abs(cx-type_x)>58:
+                    continue
+                if type_re.fullmatch(text):
+                    if not any(abs(_line_center(x)[1]-cy)<3 for x in anchors):
+                        anchors.append(span)
+            anchors.sort(key=lambda x:_line_center(x)[1])
+            if not anchors:
+                continue
+
+            for anchor_index, anchor in enumerate(anchors):
+                _, anchor_y=_line_center(anchor)
+                next_y=_line_center(anchors[anchor_index+1])[1] if anchor_index+1<len(anchors) else anchor_y+32
+                row_top=anchor_y-5
+                row_bottom=max(anchor_y+22,min(next_y-3,anchor_y+42))
+                fragments=[]
+                for span in page_spans:
+                    text=re.sub(r'\s+',' ',str(span.get('text') or '')).strip()
+                    cx,cy=_line_center(span)
+                    if not text or not (phx-45<=cx<=type_x-16) or not (row_top<=cy<=row_bottom):
+                        continue
+                    if text in {'---','–','—','-'} or reject_re.search(text):
+                        continue
+                    # Do not reject all-uppercase names (for example ASHISH).
+                    # Only booking-style IDs and numeric row artefacts are
+                    # invalid inside the name column.
+                    if re.fullmatch(r'(?i)(?:MTBF\d+|\d+)',text):
+                        continue
+                    # Keep title tokens and actual alphabetic name fragments only.
+                    if not title_re.fullmatch(text) and not re.search(r'[A-Za-z]{2}',text):
+                        continue
+                    fragments.append(span)
+                fragments.sort(key=lambda x:(_line_center(x)[1],float(x.get('x0') or 0)))
+                raw_name=re.sub(r'\s+',' ',' '.join(str(x.get('text') or '') for x in fragments)).strip(' ,;:/|-')
+                if not raw_name:
+                    continue
+                title=''
+                tm=re.match(r'(?i)^\s*(Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof)\.?\s+',raw_name)
+                if tm:
+                    title=tm.group(1).title()+'.'
+                    raw_name=raw_name[tm.end():].strip(' ,;:/|-')
+                raw_name=re.sub(r'\s+',' ',raw_name).strip(' ,;:/|-')
+                if len(raw_name)<3 or reject_re.search(raw_name) or not re.search(r'[A-Za-z]{2}',raw_name):
+                    continue
+                key=re.sub(r'\W+','',raw_name).lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                ptype=anchor.get('text','').strip().rstrip('.').title()
+                if ptype.lower() in {'adt'}: ptype='Adult'
+                elif ptype.lower() in {'chd','cnn'}: ptype='Child'
+                elif ptype.lower() in {'inf'}: ptype='Infant'
+                rows.append({
+                    'name':raw_name,
+                    'full_name':raw_name,
+                    'title':title,
+                    'ticket_number':'',
+                    'type':ptype,
+                    'dob':'',
+                    'baggage':baggage_summary,
+                    'special_ancillary':'',
+                })
+            # One passenger table is enough; avoid interpreting another nearby
+            # ``Passenger`` heading (for example in a legal-information page).
+            if rows:
+                break
+    return rows
+
+
 def _local_passengers_from_text(raw,baggage_summary=''):
     lines=[]
     for value in str(raw or '').splitlines():
@@ -2060,14 +2180,22 @@ def _local_passengers_from_text(raw,baggage_summary=''):
                     name=re.split(r'(?i)\s+(?:'+stop_pat+r'|\d{10,})\b',name)[0].strip(' ,-')
                     # Selectable PDF tables sometimes wrap the surname onto the next text
                     # line. Join one clean name-only continuation before accepting the row.
-                    if line_no+1<len(lines):
-                        nxt=lines[line_no+1]
+                    # PDF text order can place a ticket number or a wrapped email
+                    # line between the first name and surname. Look ahead only a
+                    # few lines and accept the first clean alphabetic continuation;
+                    # never cross a new labelled section or another passenger row.
+                    for lookahead in range(1,4):
+                        if line_no+lookahead>=len(lines):
+                            break
+                        nxt=lines[line_no+lookahead]
+                        if re.search(r'(?i)\b(?:passenger|frequent|flyer|type|email|ticket|payment|fare|flight|airport|booking|status|operator)\b',nxt):
+                            continue
                         cm=re.match(r"^([A-Za-z][A-Za-z'\-]{1,35})\b",nxt,re.I)
                         continuation=cm.group(1) if cm else ''
                         looks_like_pnr=(continuation.isupper() and 5<=len(continuation)<=9) or continuation.lower() in _PNR_LABEL_WORDS
-                        if (continuation and not looks_like_pnr
-                                and not re.search(r'(?i)\b(?:flight|airport|booking|fare|total|status|operator)\b',nxt)):
+                        if continuation and not looks_like_pnr:
                             name=(name+' '+continuation).strip()
+                            break
                 else:
                     m=row_pat.search(line)
                     if m:
@@ -2143,6 +2271,12 @@ def _local_first_air_extract(raw_text,original_paths):
     data['status']=_local_label_value(raw,[r'Status'],24)
     data['baggage_summary']=_local_baggage_summary(raw)
     data['passengers']=_local_passengers_from_text(raw,data['baggage_summary'])
+    # Prefer the PDF's table geometry when available.  It preserves surnames
+    # that are visually wrapped but separated by email/ticket columns in text
+    # reading order (for example ``Mr Ashish`` + ``Krishnani``).
+    geometry_passengers=_local_passengers_from_pdf_geometry(original_paths,data['baggage_summary'])
+    if geometry_passengers:
+        data['passengers']=geometry_passengers
     data['segments']=_local_segments_from_pdf_geometry(original_paths) or _local_segments_from_text(raw)
     data=_recover_source_only_fields(data,raw)
     data=_normalize_flight_segments(data)
@@ -2350,6 +2484,10 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     """Qwen-first Air Print with deterministic validation and local outage fallback."""
     raw_source_text=collect_complete_supplier_text(file_parts,source_text)
     original_paths=[Path(item.get('path') or '') for item in (file_parts or []) if item.get('path')]
+    image_only_input=bool(original_paths and any(
+        path.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'}
+        for path in original_paths
+    ))
     remote=complete_json(
         AIR_LIGHT_PROMPT,
         raw_source_text,SCHEMA,
@@ -2357,25 +2495,45 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         # pages containing connecting flights, passengers or allowances.
         purpose='air primary extraction',max_tokens=7500,image_paths=original_paths,
     )
-    local=_local_first_air_extract(raw_source_text,original_paths)
+    # Direct screenshots have no selectable text.  Read each image once with the
+    # existing bounded RapidOCR worker so a provider timeout/unsupported vision
+    # model still leaves a usable deterministic fallback.  The OCR text is kept
+    # out of the AI prompt; it is only a local source-of-truth aid.
+    local_source_text=raw_source_text
+    image_ocr_text=[]
+    if image_only_input:
+        for path in original_paths:
+            if path.suffix.lower() not in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'} or not path.is_file():
+                continue
+            try:
+                value=extract_image_text(path,max_chars=50000)
+            except Exception as exc:
+                value=''
+                # OCR is a fallback only; never turn a missing OCR runtime into
+                # the misleading "no supplier data" error when vision succeeds.
+                import logging
+                logging.getLogger('mytourbazar.flight_extractor').warning(
+                    'Direct flight screenshot OCR fallback unavailable: %s',type(exc).__name__)
+            if value:
+                image_ocr_text.append(value)
+        if image_ocr_text:
+            local_source_text=(raw_source_text+'\n\n--- LOCAL SCREENSHOT TEXT ---\n'+'\n\n'.join(image_ocr_text)).strip()
+    local=_local_first_air_extract(local_source_text,original_paths)
     # A screenshot/image-only ticket may not yield enough selectable text for the
     # large schema. Make one smaller visual pass before rejecting the document.
     visual_name_gap=bool(original_paths and remote and any(
         len(re.findall(r"[A-Za-z][A-Za-z'\-]+", str(row.get('name') or ''))) < 2
         for row in (remote.get('passengers') or []) if isinstance(row,dict)
     ))
-    image_only_input=bool(original_paths and any(
-        path.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'}
-        for path in original_paths
-    ))
     name_recovery_needed=bool(original_paths and (visual_name_gap or image_only_input))
     # Direct screenshots intentionally skip OCR on the fast path. If the vision
     # response contains only a first name, run the bounded local scan reader once
     # and use its passenger row as an independent source-of-truth check.
     if name_recovery_needed:
-        visual_text=[]
+        visual_text=list(image_ocr_text)
         for path in original_paths:
-            if path.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'} and path.is_file():
+            if (not image_ocr_text and path.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'}
+                    and path.is_file()):
                 try:
                     text=extract_image_text(path,max_chars=30000)
                 except Exception:
@@ -2436,7 +2594,9 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     data=_final_endpoint_safety_gate(data)
     # Final source-truth pass: endpoint repair must never leave an AI-truncated
     # passenger name in the customer document.
-    source_passengers=_local_passengers_from_text(raw_source_text,data.get('baggage_summary'))
+    source_passengers=_local_passengers_from_pdf_geometry(original_paths,data.get('baggage_summary'))
+    if not source_passengers:
+        source_passengers=_local_passengers_from_text(local_source_text,data.get('baggage_summary'))
     data=_restore_longer_passenger_names(data,source_passengers)
     data=_sanitize_passenger_names(data)
 

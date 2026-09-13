@@ -42,6 +42,14 @@ from performance_utils import prepare_supplier_for_ai, parse_transit_files_local
 from voice_edit import transcribe_voice_note
 from ai_provider import configuration_summary
 
+# Telegram can deliver a screenshot either as a PHOTO or as a DOCUMENT.  The
+# latter is common when the user sends the original image/file, so every source
+# workflow must route supported image documents into the same extraction path.
+_IMAGE_DOCUMENT_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
+
+def _is_supplier_image_document(filename, mime_type=""):
+    return str(mime_type or "").lower().startswith("image/") or str(filename or "").lower().endswith(_IMAGE_DOCUMENT_SUFFIXES)
+
 # V55: LOCAL FOOTER SOURCE
 # The footer can ONLY come from this bot's own assets folder.
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3182,12 +3190,14 @@ async def bus_ticket_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def bus_ticket_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return ConversationHandler.END
-    doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or 'bus.pdf'
-    if not (name.lower().endswith('.pdf') or mime=='application/pdf'):
+    doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or ('bus.jpg' if mime.startswith('image/') else 'bus.pdf')
+    is_pdf=name.lower().endswith('.pdf') or mime=='application/pdf'
+    if not (is_pdf or _is_supplier_image_document(name,mime)):
         await update.message.reply_text('Please send the bus confirmation as PDF, screenshot, or text.', reply_markup=bus_ticket_keyboard()); return BUS_TICKET_INPUT
     f=await context.bot.get_file(doc.file_id); safe=''.join(c if c.isalnum() or c in '._-' else '_' for c in name); path=TEMP_DIR/f"bus_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe}"; await f.download_to_drive(path)
     context.user_data.setdefault('bus_ticket_files',[]).append(str(path))
-    msg=await _source_ack_message(update, context, '📄 Bus booking PDF received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=bus_ticket_keyboard())
+    label='PDF' if is_pdf else 'screenshot'
+    msg=await _source_ack_message(update, context, f'📄 Bus booking {label} received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=bus_ticket_keyboard())
     _schedule_source_auto_process(update, context, 'bus', lambda: process_bus_ticket(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
     return BUS_TICKET_INPUT
 
@@ -3312,12 +3322,14 @@ async def flight_ticket_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def flight_ticket_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return ConversationHandler.END
-    doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or 'flight.pdf'
-    if not (name.lower().endswith('.pdf') or mime=='application/pdf'):
+    doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or ('flight.jpg' if mime.startswith('image/') else 'flight.pdf')
+    is_pdf=name.lower().endswith('.pdf') or mime=='application/pdf'
+    if not (is_pdf or _is_supplier_image_document(name,mime)):
         await update.message.reply_text('Please send the flight confirmation as PDF, screenshot, or text.', reply_markup=flight_ticket_keyboard()); return FLIGHT_TICKET_INPUT
     f=await context.bot.get_file(doc.file_id); safe=''.join(c if c.isalnum() or c in '._-' else '_' for c in name); path=TEMP_DIR/f"flight_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe}"; await f.download_to_drive(path)
     context.user_data.setdefault('flight_ticket_files',[]).append(str(path))
-    msg=await _source_ack_message(update, context, '📄 Flight PDF received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=flight_ticket_keyboard())
+    label='PDF' if is_pdf else 'screenshot'
+    msg=await _source_ack_message(update, context, f'📄 Flight {label} received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.', reply_markup=flight_ticket_keyboard())
     _schedule_source_auto_process(update, context, 'flight', lambda: process_flight_ticket(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
     return FLIGHT_TICKET_INPUT
 
@@ -3438,7 +3450,8 @@ async def hotel_voucher_document(update: Update, context: ContextTypes.DEFAULT_T
     doc=update.message.document
     filename_lower=(doc.file_name or "").lower()
     mime=(doc.mime_type or "").lower()
-    if not (filename_lower.endswith(".pdf") or mime == "application/pdf"):
+    is_pdf=filename_lower.endswith(".pdf") or mime == "application/pdf"
+    if not (is_pdf or _is_supplier_image_document(filename_lower,mime)):
         await update.message.reply_text("Please send the hotel confirmation as a PDF, screenshot, or text.", reply_markup=voucher_keyboard())
         return HOTEL_VOUCHER_INPUT
     try:
@@ -3447,7 +3460,8 @@ async def hotel_voucher_document(update: Update, context: ContextTypes.DEFAULT_T
         path=TEMP_DIR / f"voucher_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe_name}"
         await tg_file.download_to_drive(path)
         context.user_data.setdefault("voucher_files", []).append(str(path))
-        msg=await _source_ack_message(update, context, "📄 Hotel PDF received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.", reply_markup=voucher_keyboard())
+        label='PDF' if is_pdf else 'screenshot'
+        msg=await _source_ack_message(update, context, f"📄 Hotel {label} received. Send another page/source within 5 seconds if needed; otherwise I will process automatically.", reply_markup=voucher_keyboard())
         _schedule_source_auto_process(update, context, 'hotel', lambda: process_hotel_voucher(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
         return HOTEL_VOUCHER_INPUT
     except Exception as exc:
@@ -4127,8 +4141,9 @@ async def smart_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def smart_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return ConversationHandler.END
-    doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or 'supplier.pdf'
-    if not (name.lower().endswith('.pdf') or mime=='application/pdf'):
+    doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or ('supplier.jpg' if mime.startswith('image/') else 'supplier.pdf')
+    is_pdf=name.lower().endswith('.pdf') or mime=='application/pdf'
+    if not (is_pdf or _is_supplier_image_document(name,mime)):
         await update.message.reply_text('Please send a PDF, screenshot, or text.',reply_markup=smart_source_keyboard()); return SMART_INPUT
     tg_file=await context.bot.get_file(doc.file_id)
     safe=''.join(c if c.isalnum() or c in '._-' else '_' for c in name)
@@ -4142,7 +4157,8 @@ async def smart_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ack=f'📄 Auto Creation source received ({n}). Send another file/text/voice within 5 seconds if needed; otherwise I will combine the batch automatically.'
         kb=auto_creation_keyboard(); workflow='auto_creation'
     else:
-        ack=('📄 Supplier file received. Send another page/source within 5 seconds if needed; otherwise I will identify and process it automatically.'
+        prefix='📄 Supplier file received' if is_pdf else '📸 Supplier screenshot received'
+        ack=(prefix+'. Send another page/source within 5 seconds if needed; otherwise I will identify and process it automatically.'
              if direct else '📄 Supplier file received.\n\nSend another source to reset the timer, or tap ⚡ Process Now.')
         kb=direct_drop_keyboard() if direct else smart_source_keyboard(); workflow='direct_smart' if direct else 'smart'
     msg=await _source_ack_message(update, context, ack, reply_markup=kb)
@@ -4227,14 +4243,15 @@ async def receive_tour_source_without_guest(update: Update, context: ContextType
             await tg_file.download_to_drive(path); context.user_data['media_files'].append(str(path))
             await _source_ack_message(update, context, '📸 Supplier screenshot received. Extracting it now…')
         else:
-            doc=update.message.document; name=doc.file_name or 'supplier.pdf'; mime=(doc.mime_type or '').lower()
-            if not (name.lower().endswith('.pdf') or mime=='application/pdf'):
+            doc=update.message.document; mime=(doc.mime_type or '').lower(); name=doc.file_name or ('supplier.jpg' if mime.startswith('image/') else 'supplier.pdf')
+            if not (name.lower().endswith('.pdf') or mime=='application/pdf' or _is_supplier_image_document(name,mime)):
                 await update.message.reply_text('Please send a PDF, screenshot, or supplier text.')
                 return WAITING_GUEST_NAME
             tg_file=await context.bot.get_file(doc.file_id); safe=''.join(c if c.isalnum() or c in '._-' else '_' for c in name)
             path=TEMP_DIR/f"tour_{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe}"
             await tg_file.download_to_drive(path); context.user_data['media_files'].append(str(path))
-            await _source_ack_message(update, context, '📄 Supplier PDF received. Extracting it now…')
+            label='PDF' if name.lower().endswith('.pdf') or mime=='application/pdf' else 'screenshot'
+            await _source_ack_message(update, context, f'📄 Supplier {label} received. Extracting it now…')
         await process_sources(update, context)
         return ConversationHandler.END
     except Exception as exc:
@@ -4390,7 +4407,8 @@ async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filename_lower = (doc.file_name or "").lower()
     mime = (doc.mime_type or "").lower()
 
-    if not (filename_lower.endswith(".pdf") or mime == "application/pdf"):
+    is_pdf=filename_lower.endswith(".pdf") or mime == "application/pdf"
+    if not (is_pdf or _is_supplier_image_document(filename_lower,mime)):
         await update.message.reply_text("Please send a PDF, image, or paste the itinerary text.")
         return WAITING_SOURCE
 
@@ -4400,7 +4418,8 @@ async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path = TEMP_DIR / f"{update.effective_user.id}_{datetime.now():%Y%m%d_%H%M%S}_{safe_name}"
         await tg_file.download_to_drive(path)
         context.user_data.setdefault("media_files", []).append(str(path))
-        msg=await _source_ack_message(update, context, "📄 Supplier PDF received. Send more material if needed, or tap *✅ Done*.", reply_markup=source_keyboard())
+        label='PDF' if is_pdf else 'screenshot'
+        msg=await _source_ack_message(update, context, f"📄 Supplier {label} received. Send more material if needed, or tap *✅ Done*.", reply_markup=source_keyboard())
         _schedule_source_auto_process(update, context, 'tour', lambda: process_sources(_SyntheticUpdate(_BotMessageProxy(context.bot, update.effective_chat.id), update.effective_user.id), context), prompt_message=msg)
         return WAITING_SOURCE
     except Exception as exc:
@@ -8174,7 +8193,7 @@ def main():
         states={
             HOTEL_VOUCHER_INPUT: [
                 MessageHandler(filters.PHOTO, hotel_voucher_photo),
-                MessageHandler(filters.Document.PDF, hotel_voucher_document),
+                MessageHandler(filters.Document.ALL, hotel_voucher_document),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, hotel_voucher_text),
             ]
         },
@@ -8185,7 +8204,7 @@ def main():
     flight_ticket_conversation = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^✈️ Air Print$"), flight_ticket_start)],
         states={
-            FLIGHT_TICKET_INPUT:[MessageHandler(filters.PHOTO,flight_ticket_photo),MessageHandler(filters.Document.PDF,flight_ticket_document),MessageHandler(filters.TEXT & ~filters.COMMAND,flight_ticket_text)],
+            FLIGHT_TICKET_INPUT:[MessageHandler(filters.PHOTO,flight_ticket_photo),MessageHandler(filters.Document.ALL,flight_ticket_document),MessageHandler(filters.TEXT & ~filters.COMMAND,flight_ticket_text)],
             FLIGHT_FARE_INPUT:[MessageHandler(filters.TEXT & ~filters.COMMAND,flight_ticket_fare)],
         },
         fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(r"^❌ Cancel$"),cancel)],allow_reentry=True)
@@ -8193,7 +8212,7 @@ def main():
     bus_ticket_conversation = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🚌 Bus Print$"), bus_ticket_start)],
         states={
-            BUS_TICKET_INPUT:[MessageHandler(filters.PHOTO,bus_ticket_photo),MessageHandler(filters.Document.PDF,bus_ticket_document),MessageHandler(filters.TEXT & ~filters.COMMAND,bus_ticket_text)],
+            BUS_TICKET_INPUT:[MessageHandler(filters.PHOTO,bus_ticket_photo),MessageHandler(filters.Document.ALL,bus_ticket_document),MessageHandler(filters.TEXT & ~filters.COMMAND,bus_ticket_text)],
             BUS_FARE_INPUT:[MessageHandler(filters.TEXT & ~filters.COMMAND,bus_ticket_fare)]
         },
         fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(r"^❌ Cancel$"),cancel)],allow_reentry=True)
@@ -8206,12 +8225,12 @@ def main():
         states={
             SMART_INPUT: [
                 MessageHandler(filters.PHOTO, smart_photo),
-                MessageHandler(filters.Document.PDF, smart_document),
+                MessageHandler(filters.Document.ALL, smart_document),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, smart_text),
             ],
             WAITING_GUEST_NAME: [
                 MessageHandler(filters.PHOTO, receive_tour_source_without_guest),
-                MessageHandler(filters.Document.PDF, receive_tour_source_without_guest),
+                MessageHandler(filters.Document.ALL, receive_tour_source_without_guest),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_guest_name),
             ],
         },
@@ -8230,7 +8249,7 @@ def main():
             ],
             WAITING_SOURCE: [
                 MessageHandler(filters.PHOTO, receive_photo),
-                MessageHandler(filters.Document.PDF, receive_document),
+                MessageHandler(filters.Document.ALL, receive_document),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
             ],
         },
