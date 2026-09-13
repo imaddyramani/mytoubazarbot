@@ -35,6 +35,18 @@ AIRLINE_SUPPORT_NUMBERS = {
     "ix": "080-67638380",
     "spicejet": "0124-7101600",
     "sg": "0124-7101600",
+    "akasa air": "9606112131",
+    "qp": "9606112131",
+    # Vistara is now operated under Air India; retain the legacy code for
+    # older supplier tickets so the customer still receives a help contact.
+    "vistara": "0124-2641407",
+    "uk": "0124-2641407",
+    "emirates": "+91 22 4123 6000",
+    "ek": "+91 22 4123 6000",
+    "qatar airways": "+91 11 4166 1234",
+    "qr": "+91 11 4166 1234",
+    "etihad": "1800 123 3901",
+    "ey": "1800 123 3901",
 }
 
 
