@@ -124,7 +124,12 @@ def _discover_xkiro_models(vision=False):
             is_preferred_ministral = "ministral-14b-2512" in model_id.lower()
             if item.get("access_tier") != "free" and not is_preferred_ministral:
                 continue
-            if vision and not capabilities.get("vision"):
+            # Some xKiro catalog responses omit capability metadata for
+            # Ministral even though the deployed model accepts image_url
+            # content. Keep this explicitly preferred model available for the
+            # screenshot path; the request/validation fallback still handles
+            # an endpoint that rejects it.
+            if vision and not capabilities.get("vision") and not is_preferred_ministral:
                 continue
             choices.append(model_id)
         # Keep automatic supplier-document extraction within the approved
