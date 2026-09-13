@@ -17,6 +17,7 @@ HOTEL_VOUCHER_SCHEMA = {
     "type": "object",
     "properties": {
         "reservation_id": {"type": "string"},
+        "booking_date": {"type": "string"},
         "guest_name": {"type": "string"},
         "mobile": {"type": "string"},
         "hotel_name": {"type": "string"},
@@ -290,6 +291,7 @@ def _extract_hotel_local(text):
     if taxes>0: costs.append({'description':'Taxes and Fees','quantity':1,'rate':taxes,'nights':1,'total':taxes})
     return {
         'reservation_id':_hotel_local_value(raw,[r'(?:Reservation|Confirmation|Booking)\s*(?:ID|Number|No\.?|Reference)']),
+        'booking_date':_hotel_local_value(raw,[r'Booking\s*Date',r'Booked\s*On',r'Issued\s*On']),
         'guest_name':_hotel_local_value(raw,[r'(?:Lead\s*)?Guest\s*Name',r'Guest(?=\s*:)',r'Booked\s*For']),
         'mobile':_hotel_local_value(raw,[r'(?:Guest|Customer|Contact)\s*(?:Mobile|Phone)',r'Mobile\s*(?:No\.?|Number)?']),
         'hotel_name':hotel_name,
@@ -324,6 +326,8 @@ def extract_hotel_voucher(file_parts, source_text, api_key, model):
             elif not str(data.get(key) or '').strip() and str(value or '').strip(): data[key]=value
         data['_ai_primary_used']=True
     data['guest_name']=best_source_name(data.get('guest_name'),local.get('guest_name'),text)
+    if not str(data.get('booking_date') or '').strip():
+        data['booking_date']=datetime.now().strftime('%d %B %Y')
     # Mixed supplier PDFs often store the property header/address as artwork even
     # though the booking table itself is selectable text. OCR only the most likely
     # one or two pages, and only when identity/location fields are actually absent.
@@ -386,6 +390,7 @@ def generate_hotel_voucher(data, output_path, logo_path=None, fare=None, page_si
         terms_html = "<li>Please present a valid government-approved photo ID at check-in.</li>"
 
     reservation = data.get("reservation_id") or "—"
+    booking_date = data.get('booking_date') or datetime.now().strftime('%d %B %Y')
     nights = _derive_nights(data.get('check_in'),data.get('check_out'),data.get('nights')) or "—"
     data['nights']=nights
     components=data.get("cost_components") or []
@@ -507,7 +512,7 @@ ul {{ margin:4px 0; padding-left:18px; font-size:11px; }} li {{ margin-bottom:5p
 
 .mtb-contact-footer{{bottom:-10mm}}
 </style></head><body class="{density_class}">
-<div class="header"><div>{logo_html}</div><div class="reservation-id-wrapper"><div class="reservation-id-label">Reservation ID</div><div class="reservation-id">{_esc(reservation)}</div></div></div>
+<div class="header"><div>{logo_html}</div><div class="reservation-id-wrapper"><div class="reservation-id-label">Reservation ID</div><div class="reservation-id">{_esc(reservation)}</div><div style="font-size:10px;color:#555">Booked on: {_esc(booking_date)}</div></div></div>
 <div class="title">Hotel Confirmation Voucher</div>
 <div class="grid">
 <div class="section"><div class="section-title">Guest Details</div><table class="info-table">

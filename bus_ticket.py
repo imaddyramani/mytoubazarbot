@@ -1,4 +1,5 @@
 import json, base64
+from datetime import datetime
 from pathlib import Path
 import re
 from html import escape
@@ -171,6 +172,8 @@ def extract_bus_ticket(file_parts, source_text, api_key, model):
         data.get('passengers'),local.get('passengers'),text,
         ('title','seat','type','dob','boarding'),
     )
+    if not str(data.get('booking_date') or '').strip():
+        data['booking_date']=datetime.now().strftime('%d %B %Y')
     return data
 
 def distribute_fare(updated_total, original_base, original_tax):

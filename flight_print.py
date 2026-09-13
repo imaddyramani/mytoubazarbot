@@ -397,7 +397,11 @@ def _normalized_baggage_entries(value, person=None):
         # never print duplicated tokens.
         weights=[re.sub(r'kg$', ' kg', token) for token in tokens if token.endswith('kg')]
         pieces=[token for token in tokens if re.fullmatch(r'\d+(?:\.\d+)?pcs?', token)]
-        if len(weights)==1 and len(pieces)==1:
+        if len(weights)==1 and not pieces:
+            # Air supplier tickets often print only the weight (e.g. 15kgs).
+            # The customer-facing print always states the mandatory default piece.
+            allowance=f"{weights[0]} (1 piece)"
+        elif len(weights)==1 and len(pieces)==1:
             count=re.sub(r'pcs?$', '', pieces[0])
             allowance=f"{weights[0]} ({count} {'piece' if count=='1' else 'pieces'})"
         else:
@@ -716,12 +720,17 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
 
     # Standard MyTourBazar Air Print notes are always appended, even when a
     # supplier supplies its own general instructions.
+    airline_name=_text(data.get('airline'))
+    if not airline_name and segs:
+        airline_name=_text(segs[0].get('flight') or segs[0].get('airline') or segs[0].get('carrier'))
     standard_air_notes=[
         'Unless specifically mentioned otherwise on the ticket, the standard check-in baggage allowance is considered as one piece per passenger, subject to the airline\'s baggage policy.',
         'For last-minute cancellations, amendments or urgent schedule-related assistance, please contact the respective airline\'s customer-care / toll-free number directly.',
         'Cancellation, amendment, seat, baggage and other airline service charges are governed by the respective airline\'s current policy.',
         'Please refer to the original airline ticket / e-ticket for the latest flight timings, terminal information and operational updates before travel.'
     ]
+    if airline_name:
+        standard_air_notes.insert(2, f'Airline customer support: please contact {airline_name} customer support using the phone number or contact details printed on the original ticket.')
     existing_norm={re.sub(r'\s+',' ',str(x or '')).strip().lower() for x in terms}
     for note in standard_air_notes:
         norm=re.sub(r'\s+',' ',note).strip().lower()

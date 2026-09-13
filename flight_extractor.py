@@ -509,7 +509,7 @@ def _explicit_booking_date_from_text(raw_text):
         return ''
     patterns = (
         r'(?i)\b(?:booking\s*date|booked\s*(?:on|date)|date\s*of\s*booking|issued\s*(?:on|date)|ticketed\s*(?:on|date))\s*[:\-]?\s*'
-        r'([0-3]?\d[\s./-]+(?:[A-Za-z]{3,9}|\d{1,2})[\s./-]+\d{2,4})',
+        r'([0-3]?\d[\s.,/-]+(?:[A-Za-z]{3,9}|\d{1,2})[\s.,/-]+\d{2,4})',
         r'(?i)\b(?:booking\s*date|booked\s*(?:on|date)|date\s*of\s*booking|issued\s*(?:on|date)|ticketed\s*(?:on|date))\s*[:\-]?\s*'
         r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
     )
@@ -732,9 +732,9 @@ def _apply_air_output_defaults(data,raw_source_text=''):
     data['_source_chargeable_passenger_count']=source_chargeable
     if not str(data.get('gds_pnr') or '').strip() and str(data.get('airline_pnr') or '').strip():
         data['gds_pnr']=data['airline_pnr']
-    # MyTourBazar Trip ID is always a five-digit print reference. A supplier PNR
-    # accidentally extracted into booking_id is promoted above, never printed here.
-    if not re.fullmatch(r'\d{5}',str(data.get('booking_id') or '').strip()):
+    # Keep an explicitly labelled supplier booking/reference ID as the Trip ID.
+    # Only create our five-digit fallback when the supplier did not print one.
+    if not str(data.get('booking_id') or '').strip():
         first_seg=(data.get('segments') or [{}])[0]
         first_pax=(data.get('passengers') or [{}])[0]
         seed='|'.join([
@@ -787,8 +787,17 @@ def _sanitize_air_identifiers(data):
     booking_raw=str(data.get('booking_id') or '').strip()
     data['airline_pnr']=airline
     data['gds_pnr']=gds
-    if not re.fullmatch(r'\d{5}',booking_raw):
+    # Booking IDs may be numeric or alphanumeric and are not limited to five
+    # characters.  Keep the value only when it came from a booking/reference
+    # field and is not simply an airline/GDS PNR.
+    compact_booking=re.sub(r'[^A-Za-z0-9-]','',booking_raw).upper()
+    forbidden={x for x in (airline,gds) if x}
+    if (not compact_booking or compact_booking in forbidden
+            or compact_booking.lower() in {'number','id','booking','reference','ref','unknown','na'}
+            or len(compact_booking)>40):
         data['booking_id']=''
+    else:
+        data['booking_id']=compact_booking
     return data
 
 
@@ -2042,9 +2051,9 @@ def _local_passengers_from_text(raw,baggage_summary=''):
                     name=re.split(r'(?i)\s+(?:'+stop_pat+r'|\d{10,})\b',name)[0].strip(' ,-')
                     # Selectable PDF tables sometimes wrap the surname onto the next text
                     # line. Join one clean name-only continuation before accepting the row.
-                    if not re.search(r'(?i)\b(?:'+stop_pat+r')\b',line[m.end():]) and line_no+1<len(lines):
+                    if line_no+1<len(lines):
                         nxt=lines[line_no+1]
-                        cm=re.match(r"^([A-Za-z][A-Za-z'\-]{1,35})(?=\s+(?:"+stop_pat+r")\b|$)",nxt,re.I)
+                        cm=re.match(r"^([A-Za-z][A-Za-z'\-]{1,35})\b",nxt,re.I)
                         continuation=cm.group(1) if cm else ''
                         looks_like_pnr=(continuation.isupper() and 5<=len(continuation)<=9) or continuation.lower() in _PNR_LABEL_WORDS
                         if (continuation and not looks_like_pnr
@@ -2078,6 +2087,29 @@ def _local_passengers_from_text(raw,baggage_summary=''):
     return passengers
 
 
+def _restore_longer_passenger_names(data, local_passengers):
+    """Prefer a longer, source-derived name when an AI row was truncated."""
+    rows=list((data or {}).get('passengers') or [])
+    source=list(local_passengers or [])
+    for i,row in enumerate(rows):
+        current=re.sub(r'\s+',' ',str(row.get('name') or '')).strip()
+        candidates=[]
+        for item in source:
+            name=re.sub(r'\s+',' ',str(item.get('name') or '')).strip()
+            if not name: continue
+            if current and (current.lower() in name.lower() or name.lower() in current.lower()):
+                candidates.append(item)
+        if not candidates and i < len(source):
+            candidates=[source[i]]
+        if candidates:
+            best=max(candidates,key=lambda item: len(str(item.get('name') or '')))
+            if len(str(best.get('name') or '')) > len(current):
+                row['name']=best.get('name')
+                if not str(row.get('title') or '').strip(): row['title']=best.get('title') or ''
+    data['passengers']=rows
+    return data
+
+
 def _local_first_air_extract(raw_text,original_paths):
     data=_local_blank_air_data(); raw=str(raw_text or '')
     data['booking_date']=_explicit_booking_date_from_text(raw)
@@ -2088,7 +2120,12 @@ def _local_first_air_extract(raw_text,original_paths):
         for m in re.finditer(r'(?i)\bPNR\s*[:#\-]?\s*([A-Z0-9]{5,9})\b',raw):
             if 'gds' not in raw[max(0,m.start()-12):m.start()].lower():
                 data['airline_pnr']=m.group(1); break
-    data['booking_id']=_local_label_value(raw,[r'Booking\s*(?:ID|Id|Reference|Ref)',r'Trip\s*ID',r'Reservation\s*(?:ID|Ref)'])
+    data['booking_id']=_local_label_value(raw,[
+        r'Booking\s*(?:ID|Number|No\.?|Reference|Ref(?:erence)?\s*No\.?)',
+        r'Reservation\s*(?:ID|Number|No\.?|Reference|Ref(?:erence)?\s*No\.?)',
+        r'Confirmation\s*(?:ID|Number|No\.?|Reference|Ref(?:erence)?\s*No\.?)',
+        r'Trip\s*ID'
+    ])
     data=_sanitize_air_identifiers(data)
     data['status']=_local_label_value(raw,[r'Status'],24)
     data['baggage_summary']=_local_baggage_summary(raw)
@@ -2271,6 +2308,21 @@ BAGGAGE IS MANDATORY WHEN PRINTED:
 
 Return every flight sector separately; never merge connections. Preserve PNR/ticket numbers, flight number, departure/arrival date/time/IATA/airport/terminal, duration/stops only when printed, and supplier payment rows/total. Ignore terms/marketing. Return JSON only."""
 
+AIR_VISUAL_RECOVERY_SCHEMA={"type":"object","properties":{
+    "booking_id":{"type":"string"},"airline_pnr":{"type":"string"},"gds_pnr":{"type":"string"},
+    "status":{"type":"string"},"booking_date":{"type":"string"},
+    "passengers":{"type":"array","items":{"type":"object","properties":{
+        "name":{"type":"string"},"title":{"type":"string"},"type":{"type":"string"},"ticket_number":{"type":"string"},"baggage":{"type":"string"}
+    },"required":["name","title","type","ticket_number","baggage"]}},
+    "segments":{"type":"array","items":{"type":"object","properties":{
+        "flight_number":{"type":"string"},"dep_code":{"type":"string"},"arr_code":{"type":"string"},
+        "dep_time":{"type":"string"},"arr_time":{"type":"string"},"dep_date":{"type":"string"},"arr_date":{"type":"string"},
+        "dep_airport":{"type":"string"},"arr_airport":{"type":"string"},"dep_terminal":{"type":"string"},"arr_terminal":{"type":"string"}
+    },"required":["flight_number","dep_code","arr_code","dep_time","arr_time","dep_date","arr_date","dep_airport","arr_airport","dep_terminal","arr_terminal"]}}
+},"required":["booking_id","airline_pnr","gds_pnr","status","booking_date","passengers","segments"]}
+
+AIR_VISUAL_RECOVERY_PROMPT="""Read the attached airline ticket image/PDF visually and transcribe only the core booking rows. Return every passenger's COMPLETE name (including surnames), the printed booking/reference ID, airline and GDS PNR, every flight sector, both endpoint airport names, terminals, dates and times, and the complete checked/cabin baggage allowance. Do not invent missing values; use empty strings. Ignore barcodes, legal text and marketing. Return JSON only."""
+
 @_layout_session
 def extract_flight_ticket(file_parts, source_text, api_key, model):
     """Qwen-first Air Print with deterministic validation and local outage fallback."""
@@ -2284,11 +2336,22 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         purpose='air primary extraction',max_tokens=7500,image_paths=original_paths,
     )
     local=_local_first_air_extract(raw_source_text,original_paths)
+    # A screenshot/image-only ticket may not yield enough selectable text for the
+    # large schema. Make one smaller visual pass before rejecting the document.
+    if original_paths and (not remote or not _local_air_core_complete(remote)):
+        recovered=complete_json(
+            AIR_VISUAL_RECOVERY_PROMPT, raw_source_text, AIR_VISUAL_RECOVERY_SCHEMA,
+            purpose='air visual recovery', max_tokens=4500,
+            image_paths=original_paths, max_vision_pages=4,
+        )
+        if recovered:
+            remote = _merge_local_fallback_into_ai(recovered, remote or local)
     data=_merge_local_fallback_into_ai(remote,local) if remote else local
     data['passengers']=reconcile_people(
         data.get('passengers'),local.get('passengers'),raw_source_text,
         ('title','ticket_number','type','dob','baggage','special_ancillary'),
     )
+    data=_restore_longer_passenger_names(data,local.get('passengers'))
     used_ai=bool(remote)
     data=_recover_source_only_fields(data,raw_source_text)
     data=_normalize_flight_segments(data)
@@ -2310,6 +2373,8 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     data=_apply_baggage_summary(data)
     data=_require_verified_air_print_data(data)
     data=_apply_air_output_defaults(data,raw_source_text)
+    if not str(data.get('booking_date') or '').strip():
+        data['booking_date']=__import__('datetime').datetime.now().strftime('%d %B %Y')
 
     clean=[]
     for row in (data.get('payment_items') or []):
