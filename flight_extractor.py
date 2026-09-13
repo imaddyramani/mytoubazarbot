@@ -23,7 +23,7 @@ def _layout_session(func):
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 SCHEMA={"type":"object","properties":{
  "booking_id":{"type":"string"},"booking_date":{"type":"string"},"airline_pnr":{"type":"string"},"gds_pnr":{"type":"string"},
- "status":{"type":"string"},"mobile":{"type":"string"},"baggage_summary":{"type":"string"},"special_ancillary_summary":{"type":"string"},
+ "status":{"type":"string"},"mobile":{"type":"string"},"airline_customer_support":{"type":"string"},"baggage_summary":{"type":"string"},"special_ancillary_summary":{"type":"string"},
  "segments":{"type":"array","items":{"type":"object","properties":{
   "flight":{"type":"string"},"flight_number":{"type":"string"},"aircraft":{"type":"string"},"cabin":{"type":"string"},"fare_type":{"type":"string"},
   "dep_time":{"type":"string"},"dep_city":{"type":"string"},"dep_code":{"type":"string"},"dep_date":{"type":"string"},"dep_airport":{"type":"string"},"dep_terminal":{"type":"string"},
@@ -1637,7 +1637,7 @@ def _recover_source_only_fields(data, raw_text):
     for pax in data.get('passengers') or []:
         for key in ('name','title','ticket_number','type','dob','baggage','special_ancillary'):
             pax[key]=_clean_source_value(pax.get(key))
-    for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary','special_ancillary_summary'):
+    for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','airline_customer_support','baggage_summary','special_ancillary_summary'):
         data[key]=_clean_source_value(data.get(key))
 
     # STRICT TOP-LEVEL SOURCE TRUTH:
@@ -1748,7 +1748,7 @@ _LOCAL_IATA_EXCLUDE={
 
 def _local_blank_air_data():
     return {
-        'booking_id':'','booking_date':'','airline_pnr':'','gds_pnr':'','status':'','mobile':'',
+        'booking_id':'','booking_date':'','airline_pnr':'','gds_pnr':'','status':'','mobile':'','airline_customer_support':'',
         'baggage_summary':'','special_ancillary_summary':'','segments':[],'passengers':[],
         'base_fare':0.0,'taxes':0.0,'gross_total':0.0,'payment_items':[],
     }
@@ -2126,6 +2126,10 @@ def _local_first_air_extract(raw_text,original_paths):
         r'Confirmation\s*(?:ID|Number|No\.?|Reference|Ref(?:erence)?\s*No\.?)',
         r'Trip\s*ID'
     ])
+    data['airline_customer_support']=_local_label_value(raw,[
+        r'(?:Airline|Carrier)\s*(?:Customer\s*)?(?:Care|Support|Helpline|Toll[- ]?Free)',
+        r'(?:Customer\s*)?(?:Care|Support|Helpline|Toll[- ]?Free)\s*(?:No\.?|Number)?'
+    ],40)
     data=_sanitize_air_identifiers(data)
     data['status']=_local_label_value(raw,[r'Status'],24)
     data['baggage_summary']=_local_baggage_summary(raw)
@@ -2216,7 +2220,7 @@ def _require_verified_air_print_data(data):
 
 def _merge_ai_into_local(local,ai):
     local=local or _local_blank_air_data(); ai=ai or {}
-    for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary','special_ancillary_summary'):
+    for key in ('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','airline_customer_support','baggage_summary','special_ancillary_summary'):
         if not str(local.get(key) or '').strip() and str(ai.get(key) or '').strip():
             local[key]=ai.get(key)
     # AI is the verification pass for semantic rows.  Start from its complete rows
@@ -2262,7 +2266,7 @@ def _merge_ai_into_local(local,ai):
 def _merge_local_fallback_into_ai(ai, local):
     """Use Qwen rows/scalars as primary and backfill only its blank values."""
     data=dict(ai or {}); local=local or _local_blank_air_data()
-    scalar_keys=('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','baggage_summary','special_ancillary_summary')
+    scalar_keys=('booking_id','booking_date','airline_pnr','gds_pnr','status','mobile','airline_customer_support','baggage_summary','special_ancillary_summary')
     for key in scalar_keys:
         if not str(data.get(key) or '').strip() and str(local.get(key) or '').strip(): data[key]=local[key]
     for array_key,fields in (
@@ -2306,11 +2310,11 @@ BAGGAGE IS MANDATORY WHEN PRINTED:
 - Preserve both check-in and cabin/hand baggage, with kg/piece counts and passenger type when supplied.
 - Put the complete common allowance in baggage_summary and passenger-specific allowance in passengers[].baggage.
 
-Return every flight sector separately; never merge connections. Preserve PNR/ticket numbers, flight number, departure/arrival date/time/IATA/airport/terminal, duration/stops only when printed, and supplier payment rows/total. Ignore terms/marketing. Return JSON only."""
+Return every flight sector separately; never merge connections. Preserve PNR/ticket numbers, flight number, departure/arrival date/time/IATA/airport/terminal, duration/stops only when printed, and supplier payment rows/total. If an airline customer-care/toll-free number is printed, copy it; otherwise provide the official airline support number only when confidently known. Ignore terms/marketing. Return JSON only."""
 
 AIR_VISUAL_RECOVERY_SCHEMA={"type":"object","properties":{
     "booking_id":{"type":"string"},"airline_pnr":{"type":"string"},"gds_pnr":{"type":"string"},
-    "status":{"type":"string"},"booking_date":{"type":"string"},
+    "status":{"type":"string"},"booking_date":{"type":"string"},"airline_customer_support":{"type":"string"},
     "passengers":{"type":"array","items":{"type":"object","properties":{
         "name":{"type":"string"},"title":{"type":"string"},"type":{"type":"string"},"ticket_number":{"type":"string"},"baggage":{"type":"string"}
     },"required":["name","title","type","ticket_number","baggage"]}},

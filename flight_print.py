@@ -718,6 +718,13 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
     else:
         terms=list(terms)
 
+    # Remove the two generic lines that previously made the notes repetitive.
+    terms=[x for x in terms if not re.search(
+        r'(?i)(?:refer to the original airline ticket.*latest flight timings|'
+        r'airline customer support.*using the phone number or contact details printed)',
+        str(x or '')
+    )]
+
     # Standard MyTourBazar Air Print notes are always appended, even when a
     # supplier supplies its own general instructions.
     airline_name=_text(data.get('airline'))
@@ -725,12 +732,11 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
         airline_name=_text(segs[0].get('flight') or segs[0].get('airline') or segs[0].get('carrier'))
     standard_air_notes=[
         'Unless specifically mentioned otherwise on the ticket, the standard check-in baggage allowance is considered as one piece per passenger, subject to the airline\'s baggage policy.',
-        'For last-minute cancellations, amendments or urgent schedule-related assistance, please contact the respective airline\'s customer-care / toll-free number directly.',
         'Cancellation, amendment, seat, baggage and other airline service charges are governed by the respective airline\'s current policy.',
-        'Please refer to the original airline ticket / e-ticket for the latest flight timings, terminal information and operational updates before travel.'
     ]
-    if airline_name:
-        standard_air_notes.insert(2, f'Airline customer support: please contact {airline_name} customer support using the phone number or contact details printed on the original ticket.')
+    support=_text(data.get('airline_customer_support'))
+    if airline_name and support:
+        standard_air_notes.insert(1, f'For direct help, contact {airline_name} customer support: {support}.')
     existing_norm={re.sub(r'\s+',' ',str(x or '')).strip().lower() for x in terms}
     for note in standard_air_notes:
         norm=re.sub(r'\s+',' ',note).strip().lower()
