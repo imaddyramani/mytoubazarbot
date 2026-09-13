@@ -2372,6 +2372,11 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     except Exception:
         pass
     data=_final_endpoint_safety_gate(data)
+    # Final source-truth pass: endpoint repair must never leave an AI-truncated
+    # passenger name in the customer document.
+    source_passengers=_local_passengers_from_text(raw_source_text,data.get('baggage_summary'))
+    data=_restore_longer_passenger_names(data,source_passengers)
+    data=_sanitize_passenger_names(data)
 
     # Missing optional fields remain blank. Remote repair never blocks Air Print.
     data=_apply_baggage_summary(data)
