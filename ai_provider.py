@@ -1,7 +1,7 @@
 """Fail-safe OpenAI-compatible document client for xKiro and optional GROQ.
 
-Supplier workflows may use Qwen as their primary structuring engine.  Callers
-must still retain a deterministic fallback when ``complete_json`` returns
+Supplier workflows prefer Ministral 3 14B when xKiro exposes it, while callers
+still retain a deterministic fallback when ``complete_json`` returns
 ``None`` so a provider outage never freezes printing.
 """
 from __future__ import annotations
@@ -26,6 +26,8 @@ _MODEL_CACHE = {}
 _MODEL_LOCK = threading.Lock()
 
 _TEXT_MODEL_PREFERENCE = (
+    "ministral-14b-2512",
+    "mistralai/ministral-14b-2512",
     "qwen/qwen3.5-plus:free",
     "qwen/qwen3.5-flash:free",
     "deepseek/deepseek-v4-flash",
@@ -33,9 +35,12 @@ _TEXT_MODEL_PREFERENCE = (
     "openai/gpt-5.3-codex-spark",
 )
 _VISION_MODEL_PREFERENCE = (
+    "ministral-14b-2512",
+    "mistralai/ministral-14b-2512",
+    "ministral-14b-latest",
+    "qwen/qwen3-vl-plus:free",
     "qwen/qwen3.5-omni-plus:free",
     "qwen/qwen3.5-plus:free",
-    "qwen/qwen3-vl-plus:free",
     "minimax/minimax-m3:free",
 )
 
@@ -56,8 +61,8 @@ def configuration_summary():
     provider=os.getenv("AI_PROVIDER","local").strip().lower() or "local"
     if provider in {"local","off","disabled","none"}:
         return "AI provider: local-only"
-    text_model=os.getenv("XKIRO_TEXT_MODEL","").strip() or "qwen/qwen3.5-plus:free (auto-preferred)"
-    vision_model=os.getenv("XKIRO_VISION_MODEL","").strip() or "qwen/qwen3.5-plus:free (auto-preferred)"
+    text_model=os.getenv("XKIRO_TEXT_MODEL","").strip() or "ministral-14b-2512 (auto-preferred)"
+    vision_model=os.getenv("XKIRO_VISION_MODEL","").strip() or "ministral-14b-2512 (auto-preferred)"
     fallback=os.getenv("AI_FALLBACK_PROVIDER","none").strip().lower() or "none"
     key_state="configured" if os.getenv("XKIRO_API_KEY","").strip() else "missing key"
     return f"AI provider: {provider} ({key_state}); text={text_model}; vision={vision_model}; fallback={fallback}"
@@ -112,15 +117,23 @@ def _discover_xkiro_models(vision=False):
         choices = []
         for item in catalog:
             capabilities = item.get("capabilities") or {}
-            if item.get("access_tier") != "free":
+            model_id = str(item.get("id") or "")
+            # Ministral is the explicitly selected extraction model. xKiro may
+            # mark it as paid/shared, so do not hide it behind the free-only
+            # filter used for automatic fallback models.
+            is_preferred_ministral = "ministral-14b-2512" in model_id.lower()
+            if item.get("access_tier") != "free" and not is_preferred_ministral:
                 continue
             if vision and not capabilities.get("vision"):
                 continue
-            choices.append(str(item.get("id") or ""))
-        # Keep automatic supplier-document extraction within the Qwen/MiniMax
-        # choices already approved for this bot. An owner can still explicitly
-        # force any xKiro vision model with XKIRO_VISION_MODEL.
-        preferred_choices=[item for item in choices if item.startswith(('qwen/','minimax/'))]
+            choices.append(model_id)
+        # Keep automatic supplier-document extraction within the approved
+        # Qwen/MiniMax/Ministral choices. An owner can still explicitly force
+        # any xKiro vision model with XKIRO_VISION_MODEL.
+        preferred_choices=[item for item in choices if (
+            item.startswith(('qwen/','minimax/','mistral/','mistralai/'))
+            or 'ministral' in item.lower()
+        )]
         if preferred_choices:
             choices=preferred_choices
         preferred = _VISION_MODEL_PREFERENCE if vision else _TEXT_MODEL_PREFERENCE
