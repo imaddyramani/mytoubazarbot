@@ -4,7 +4,12 @@ from functools import wraps
 import copy
 from pathlib import Path
 from ai_provider import complete_json
-from performance_utils import collect_local_document_text, collect_complete_supplier_text, extract_image_text
+from performance_utils import (
+    collect_local_document_text,
+    collect_complete_supplier_text,
+    extract_image_text,
+    extract_pdf_visual_text,
+)
 from identity_guard import reconcile_people
 
 _layout_cache = ContextVar('air_layout_cache', default=None)
@@ -2519,6 +2524,29 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         if image_ocr_text:
             local_source_text=(raw_source_text+'\n\n--- LOCAL SCREENSHOT TEXT ---\n'+'\n\n'.join(image_ocr_text)).strip()
     local=_local_first_air_extract(local_source_text,original_paths)
+    # Some supplier PDFs are scans wrapped in a PDF container.  They have no
+    # selectable text, so the normal local parser sees no passenger/sector even
+    # though the ticket is perfectly readable.  If the visual AI pass failed or
+    # returned an incomplete core, OCR only the most relevant PDF pages once and
+    # feed that text through the same deterministic parser.  This is bounded and
+    # remains a fallback; it does not slow successful text/vision extraction.
+    if (not remote or not _local_air_core_complete(remote) or not _local_air_core_complete(local)):
+        pdf_visual_text=[]
+        for path in original_paths:
+            if path.suffix.lower() != '.pdf' or not path.is_file():
+                continue
+            try:
+                value=extract_pdf_visual_text(path,max_pages=3,max_chars=50000)
+            except Exception as exc:
+                value=''
+                import logging
+                logging.getLogger('mytourbazar.flight_extractor').warning(
+                    'Flight PDF visual fallback unavailable: %s',type(exc).__name__)
+            if value:
+                pdf_visual_text.append(value)
+        if pdf_visual_text:
+            local_source_text=(local_source_text+'\n\n--- LOCAL PDF VISUAL TEXT ---\n'+'\n\n'.join(pdf_visual_text)).strip()
+            local=_local_first_air_extract(local_source_text,original_paths)
     # A screenshot/image-only ticket may not yield enough selectable text for the
     # large schema. Make one smaller visual pass before rejecting the document.
     visual_name_gap=bool(original_paths and remote and any(
