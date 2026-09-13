@@ -59,7 +59,7 @@ def _esc(v):
 
 def _display_person_name(person):
     person=person or {}
-    name=_text(person.get("name"))
+    name=_text(person.get("full_name")) or _text(person.get("name"))
     title=_text(person.get("title"))
     title_re=re.compile(r"^((?:Mr|Mrs|Ms|Miss|Master|Mstr|Dr|Prof|Child|Infant)\.?)(?:\s+)", re.I)
     m=title_re.match(name)

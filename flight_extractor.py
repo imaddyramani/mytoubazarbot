@@ -4,7 +4,7 @@ from functools import wraps
 import copy
 from pathlib import Path
 from ai_provider import complete_json
-from performance_utils import collect_local_document_text, collect_complete_supplier_text
+from performance_utils import collect_local_document_text, collect_complete_supplier_text, extract_image_text
 from identity_guard import reconcile_people
 
 _layout_cache = ContextVar('air_layout_cache', default=None)
@@ -30,7 +30,7 @@ SCHEMA={"type":"object","properties":{
   "arr_time":{"type":"string"},"arr_city":{"type":"string"},"arr_code":{"type":"string"},"arr_date":{"type":"string"},"arr_airport":{"type":"string"},"arr_terminal":{"type":"string"},
   "duration":{"type":"string"},"stops":{"type":"string"},"layover":{"type":"string"}
  },"required":["flight","flight_number","aircraft","cabin","fare_type","dep_time","dep_city","dep_code","dep_date","dep_airport","dep_terminal","arr_time","arr_city","arr_code","arr_date","arr_airport","arr_terminal","duration","stops","layover"]}},
- "passengers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"title":{"type":"string"},"ticket_number":{"type":"string"},"type":{"type":"string"},"dob":{"type":"string"},"baggage":{"type":"string"},"special_ancillary":{"type":"string"}},"required":["name","title","ticket_number","type","dob","baggage","special_ancillary"]}},
+ "passengers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"full_name":{"type":"string"},"first_name":{"type":"string"},"middle_name":{"type":"string"},"last_name":{"type":"string"},"surname":{"type":"string"},"title":{"type":"string"},"ticket_number":{"type":"string"},"type":{"type":"string"},"dob":{"type":"string"},"baggage":{"type":"string"},"special_ancillary":{"type":"string"}},"required":["name","title","ticket_number","type","dob","baggage","special_ancillary"]}},
  "base_fare":{"type":"number"},"taxes":{"type":"number"},
  "gross_total":{"type":"number"},
  "payment_items":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"amount":{"type":"number"}},"required":["label","amount"]}}
@@ -682,6 +682,15 @@ def _sanitize_passenger_names(data):
     }
     for pax in (data or {}).get('passengers') or []:
         row=dict(pax or {})
+        # Some vision models split the visible table into first/middle/last
+        # fields. Reassemble those components before any validation.
+        if not str(row.get('full_name') or '').strip():
+            parts=[row.get(k) for k in ('first_name','middle_name','last_name','surname')]
+            combined=' '.join(str(x).strip() for x in parts if str(x or '').strip())
+            if combined:
+                row['full_name']=combined
+        if str(row.get('full_name') or '').strip() and len(str(row.get('full_name')).split()) > len(str(row.get('name') or '').split()):
+            row['name']=row['full_name']
         name=re.sub(r'\s+',' ',str(row.get('name') or '')).strip(' ,;:/-|')
         name=re.sub(r'(?i)^(?:mr|mrs|ms|miss|master|mstr|dr|prof)\.?\s+','',name).strip()
         low=name.lower()
@@ -2304,6 +2313,7 @@ PASSENGERS ARE A STRICT TRANSCRIPTION TASK:
 - Never shorten a name, drop its last word, merge two passengers, or turn nearby words such as For/Adult/Passenger into a name.
 - Preserve separate infant and child rows and their actual complete names.
 - Put title only in title and the remaining complete name only in name.
+- If the supplier separates name columns, also copy first_name/middle_name/last_name and set full_name to the complete joined name.
 
 BAGGAGE IS MANDATORY WHEN PRINTED:
 - Search passenger rows, fare-family details and baggage/allowance sections.
@@ -2330,7 +2340,7 @@ AIR_VISUAL_RECOVERY_PROMPT="""Read the attached airline ticket image/PDF visuall
 AIR_NAME_RECOVERY_SCHEMA={"type":"object","properties":{
     "passengers":{"type":"array","items":{"type":"object","properties":{
         "name":{"type":"string"},"title":{"type":"string"},"type":{"type":"string"}
-    },"required":["name","title","type"]}}
+    },"required":["name"]}}
 },"required":["passengers"]}
 
 AIR_NAME_RECOVERY_PROMPT="""Inspect the passenger-name table on the attached airline ticket image/PDF. Return EVERY passenger row in order. Transcribe the COMPLETE name exactly as printed, including all first, middle and surname words even when the surname wraps onto the next line or appears in a second table cell. Do not shorten names to the first word. Keep title in title and the name without title in name. Ignore email, PNR, ticket number, baggage and all other columns. Return JSON only."""
@@ -2354,6 +2364,21 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         len(re.findall(r"[A-Za-z][A-Za-z'\-]+", str(row.get('name') or ''))) < 2
         for row in (remote.get('passengers') or []) if isinstance(row,dict)
     ))
+    # Direct screenshots intentionally skip OCR on the fast path. If the vision
+    # response contains only a first name, run the bounded local scan reader once
+    # and use its passenger row as an independent source-of-truth check.
+    if visual_name_gap:
+        visual_text=[]
+        for path in original_paths:
+            if path.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'} and path.is_file():
+                try:
+                    text=extract_image_text(path,max_chars=30000)
+                except Exception:
+                    text=''
+                if text: visual_text.append(text)
+        if visual_text:
+            visual_rows=_local_passengers_from_text('\n'.join(visual_text),'')
+            remote=_restore_longer_passenger_names(remote,visual_rows)
     if visual_name_gap:
         name_recovery=complete_json(
             AIR_NAME_RECOVERY_PROMPT, raw_source_text, AIR_NAME_RECOVERY_SCHEMA,
