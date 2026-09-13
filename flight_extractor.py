@@ -2497,8 +2497,12 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         AIR_LIGHT_PROMPT,
         raw_source_text,SCHEMA,
         # Keep small vision batches, but do not silently discard later scanned
-        # pages containing connecting flights, passengers or allowances.
+        # pages containing connecting flights, passengers or allowances.  Most
+        # supplier tickets put booking/sector on page 1 and baggage on page 2;
+        # capping the first visual pass prevents long terms pages from creating
+        # a multi-minute retry loop.
         purpose='air primary extraction',max_tokens=7500,image_paths=original_paths,
+        max_vision_pages=4,
     )
     # Direct screenshots have no selectable text.  Read each image once with the
     # existing bounded RapidOCR worker so a provider timeout/unsupported vision
@@ -2553,7 +2557,15 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         len(re.findall(r"[A-Za-z][A-Za-z'\-]+", str(row.get('name') or ''))) < 2
         for row in (remote.get('passengers') or []) if isinstance(row,dict)
     ))
-    name_recovery_needed=bool(original_paths and (visual_name_gap or image_only_input))
+    # A local OCR row is already source-derived. Do not spend another vision
+    # request on name recovery when it already contains a longer complete name.
+    local_name_is_longer=bool(remote and any(
+        i < len(local.get('passengers') or []) and
+        len(re.sub(r'\s+',' ',str((local.get('passengers') or [])[i].get('name') or '')).strip()) >
+        len(re.sub(r'\s+',' ',str((row or {}).get('name') or '')).strip())
+        for i,row in enumerate(remote.get('passengers') or []) if isinstance(row,dict)
+    ))
+    name_recovery_needed=bool(original_paths and visual_name_gap and not local_name_is_longer)
     # Direct screenshots intentionally skip OCR on the fast path. If the vision
     # response contains only a first name, run the bounded local scan reader once
     # and use its passenger row as an independent source-of-truth check.
@@ -2590,7 +2602,11 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
                     row['name']=recovered_name
                     if not str(row.get('title') or '').strip():
                         row['title']=(recovered_rows[i] or {}).get('title') or ''
-    if original_paths and (not remote or not _local_air_core_complete(remote) or visual_name_gap):
+    # OCR/source recovery is preferred once it has a complete core. This avoids
+    # repeating a failed/slow vision request after the local fallback already
+    # recovered the ticket safely.
+    if original_paths and (not _local_air_core_complete(local)) and (
+            not remote or not _local_air_core_complete(remote) or visual_name_gap):
         recovered=complete_json(
             AIR_VISUAL_RECOVERY_PROMPT, raw_source_text, AIR_VISUAL_RECOVERY_SCHEMA,
             purpose='air visual recovery', max_tokens=4500,

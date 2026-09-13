@@ -431,7 +431,14 @@ def complete_json(system_prompt, user_text, schema, *, purpose="extraction", max
         except (AIProviderError, httpx.HTTPError, ValueError) as exc:
             errors.append(f"{provider}: {str(exc)[:300]}")
             continue
-        for model_override in model_candidates:
+        # Air visual extraction has a deterministic OCR/source fallback. Keep
+        # its remote path bounded to one selected model; trying three models
+        # with two retries per page is what made long scanned tickets appear
+        # frozen in Telegram. Other workflows retain the normal resilient list.
+        candidate_iter = model_candidates[:1] if (
+            vision and str(purpose).lower().startswith('air ')
+        ) else model_candidates
+        for model_override in candidate_iter:
             combined=None; failed=False; model=''
             for batch_index,offset in enumerate(offsets):
                 correction = ""; value=None
@@ -440,7 +447,8 @@ def complete_json(system_prompt, user_text, schema, *, purpose="extraction", max
                     f"{offset+1}-{min(offset+batch_size,visual_count)}. Extract only facts visible on these pages; "
                     "return blank/zero values for facts not present on this batch."
                 )
-                for attempt in range(2):
+                attempts = 1 if (vision and str(purpose).lower().startswith('air ')) else 2
+                for attempt in range(attempts):
                     try:
                         value, model = _request(
                             provider, system_prompt, batch_text, deepcopy(schema), max_tokens,
