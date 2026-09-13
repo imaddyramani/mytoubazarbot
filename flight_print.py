@@ -24,6 +24,19 @@ AIRLINE_CODE_MAP = {
     "SV": "saudia", "RJ": "royal_jordanian", "AIH": "airindia",
 }
 
+# Public airline customer-care contacts used only when the supplier ticket does
+# not contain a support number. Keep this separate from passenger contact data.
+AIRLINE_SUPPORT_NUMBERS = {
+    "indigo": "0124-6173838 / 0124-4973838",
+    "6e": "0124-6173838 / 0124-4973838",
+    "air india": "0124-2641407",
+    "ai": "0124-2641407",
+    "air india express": "080-67638380",
+    "ix": "080-67638380",
+    "spicejet": "0124-7101600",
+    "sg": "0124-7101600",
+}
+
 
 def _text(v):
     value=str(v).strip() if v is not None and str(v).strip() else ""
@@ -735,6 +748,15 @@ def generate_flight_ticket(data, updated_total, output_path, logo_path=None, pag
         'Cancellation, amendment, seat, baggage and other airline service charges are governed by the respective airline\'s current policy.',
     ]
     support=_text(data.get('airline_customer_support'))
+    if not support:
+        support_key=re.sub(r'[^a-z0-9 ]+',' ',airline_name.lower()).strip()
+        support = AIRLINE_SUPPORT_NUMBERS.get(support_key, '')
+        if not support:
+            support = next((number for key,number in AIRLINE_SUPPORT_NUMBERS.items()
+                            if len(key) > 2 and key in support_key), '')
+        if not support and segs:
+            flight_code=re.match(r'([A-Z0-9]{2,3})',_text(segs[0].get('flight_number')).upper())
+            support=AIRLINE_SUPPORT_NUMBERS.get(flight_code.group(1).lower(), '') if flight_code else ''
     if airline_name and support:
         standard_air_notes.insert(1, f'For direct help, contact {airline_name} customer support: {support}.')
     existing_norm={re.sub(r'\s+',' ',str(x or '')).strip().lower() for x in terms}
