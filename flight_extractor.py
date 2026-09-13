@@ -2276,15 +2276,9 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     """Qwen-first Air Print with deterministic validation and local outage fallback."""
     raw_source_text=collect_complete_supplier_text(file_parts,source_text)
     original_paths=[Path(item.get('path') or '') for item in (file_parts or []) if item.get('path')]
-    air_schema=copy.deepcopy(SCHEMA)
-    air_schema['properties']['endpoint_rows']=copy.deepcopy(ENDPOINT_ROW_SCHEMA['properties']['segments'])
-    air_schema['required'].append('endpoint_rows')
     remote=complete_json(
-        AIR_LIGHT_PROMPT + '\nAlso return endpoint_rows: copy every full departure/arrival airport cell, including continuation lines. '
-        'Match rows by flight number, IATA codes and times. For a terminal, copy a verbatim same-cell snippet '
-        'into dep_terminal_evidence or arr_terminal_evidence. Never infer a terminal from airport knowledge. '
-        'Read departure and arrival independently; leave absent terminal/evidence blank.',
-        raw_source_text,air_schema,
+        AIR_LIGHT_PROMPT,
+        raw_source_text,SCHEMA,
         # Keep small vision batches, but do not silently discard later scanned
         # pages containing connecting flights, passengers or allowances.
         purpose='air primary extraction',max_tokens=7500,image_paths=original_paths,
@@ -2310,8 +2304,6 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
         data=_recover_airport_names_from_pdf_geometry(data,original_paths)
     except Exception:
         pass
-    if remote and remote.get('endpoint_rows'):
-        data=_apply_verified_endpoint_rows(data,{'segments':remote['endpoint_rows']})
     data=_final_endpoint_safety_gate(data)
 
     # Missing optional fields remain blank. Remote repair never blocks Air Print.
