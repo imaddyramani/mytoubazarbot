@@ -81,6 +81,31 @@ def extract_image_text(path, max_chars=30000):
     return text
 
 
+def collect_image_fallback_text(file_parts, source_text='', max_chars=120000):
+    """Read image attachments locally only for a provider-outage fallback.
+
+    The normal path sends original images to the vision model.  If that request
+    is unavailable, local parsers must receive the actual screenshot text rather
+    than the ``IMAGE ATTACHMENT`` marker emitted by
+    :func:`collect_complete_supplier_text`.  OCR is bounded and disposable, so a
+    bad/huge screenshot cannot hold the Telegram worker indefinitely.
+    """
+    chunks=[str(source_text or '').strip()]
+    for item in file_parts or []:
+        path=Path(item.get('path') or '')
+        if not path.is_file() or path.suffix.lower()=='.pdf':
+            continue
+        try:
+            value=extract_image_text(path,max_chars=min(50000,max_chars))
+        except Exception:
+            value=''
+        if value:
+            chunks.append(f'--- LOCAL SCREENSHOT TEXT: {path.name} ---\n{value}')
+        if len('\n\n'.join(chunks))>=max_chars:
+            break
+    return '\n\n'.join(chunks).strip()[:max_chars]
+
+
 def extract_supplier_pdf_text(path, max_chars=60000, max_ocr_pages=8):
     """Read selectable text quickly and OCR only a bounded number of scan pages."""
     key=_cache_key(path,'pdf',max_chars)

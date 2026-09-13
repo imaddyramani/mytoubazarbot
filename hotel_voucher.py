@@ -9,7 +9,7 @@ from pdf_render import write_pdf
 from ai_provider import complete_json
 from identity_guard import best_source_name
 from print_settings import apply_css_settings
-from performance_utils import extract_pdf_text, collect_local_document_text, collect_complete_supplier_text, extract_pdf_visual_text
+from performance_utils import extract_pdf_text, collect_local_document_text, collect_complete_supplier_text, extract_pdf_visual_text, collect_image_fallback_text
 from hotel_location import google_maps_url, resolve_hotel_location
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
@@ -315,6 +315,8 @@ def extract_hotel_voucher(file_parts, source_text, api_key, model):
         purpose='hotel primary extraction',max_tokens=5000,
         image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
     )
+    if remote is None and any(Path(item.get('path') or '').suffix.lower() != '.pdf' for item in (file_parts or [])):
+        text=collect_image_fallback_text(file_parts,text)
     local=_extract_hotel_local(text)
     data=dict(remote or local)
     if remote:

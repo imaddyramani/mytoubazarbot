@@ -8,7 +8,7 @@ from pdf_render import write_pdf
 from ai_provider import complete_json
 from identity_guard import reconcile_people
 from print_settings import apply_css_settings
-from performance_utils import extract_pdf_text, collect_local_document_text, collect_complete_supplier_text
+from performance_utils import extract_pdf_text, collect_local_document_text, collect_complete_supplier_text, collect_image_fallback_text
 
 MYTOURBAZAR_LOGO_URL = "https://share.google/UUxbVDVNxkIgplZio"
 SCHEMA={"type":"object","properties":{
@@ -158,6 +158,8 @@ def extract_bus_ticket(file_parts, source_text, api_key, model):
         PROMPT,text,SCHEMA,purpose='bus primary extraction',max_tokens=5000,
         image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
     )
+    if remote is None and any(Path(item.get('path') or '').suffix.lower() != '.pdf' for item in (file_parts or [])):
+        text=collect_image_fallback_text(file_parts,text)
     local=_extract_bus_local(text)
     data=dict(remote or local)
     if remote:
