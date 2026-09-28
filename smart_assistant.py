@@ -60,7 +60,7 @@ def classify(parts, text, api_key=None, model=None, allow_remote=True):
         scores['flight'] += 3 * bool(re.search(r'flight|air|e.?ticket|pnr',file_hint))
         scores['bus'] += 3 * bool(re.search(r'bus|coach|travels',file_hint))
         scores['hotel'] += 3 * bool(re.search(r'hotel|voucher|reservation|property',file_hint))
-        scores['package'] += 3 * bool(re.search(r'tour|package|itinerary|quotation|holiday|kerala|kashmir|goa',file_hint))
+        scores['package'] += 3 * bool(re.search(r'tour|package|itinerary|quotation|holiday|kerala|kashmir|goa|cab|taxi|transfer',file_hint))
     kind=max(scores,key=scores.get) if max(scores.values(),default=0)>0 else 'unknown'
     confidence=min(.99,.55+.07*scores[kind]) if kind!='unknown' else 0.0
     result={'kind':kind,'confidence':confidence,'reason':f'Local document markers matched {kind}.' if kind!='unknown' else 'No reliable booking markers were found.','reference':'','instruction':str(text or '')}
