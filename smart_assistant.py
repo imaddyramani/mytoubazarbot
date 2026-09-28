@@ -40,8 +40,12 @@ def _source_text(parts, text):
 def classify(parts, text, api_key=None, model=None, allow_remote=True):
     combined=_source_text(parts,text); low=combined.lower()
     tour_hits=sum(x in low for x in ('day 1','day 2','inclusions','exclusions','package cost','sightseeing','cwb','cnb'))
+    cab_hits=sum(x in low for x in ('vehicle','cab','taxi','driver','pickup','pick up','drop point','drop-off','transfer'))
     scores={
-        'package':tour_hits+(4 if re.search(r'(?im)^\s*day\s*[12]\b',combined) else 0),
+        # Cab/transfer supplier sheets do not always say "tour" or contain
+        # day headings. Route them into the package/tour source extractor so
+        # vehicle, pickup, drop, guest and costing facts are retained.
+        'package':tour_hits+(4 if re.search(r'(?im)^\s*day\s*[12]\b',combined) else 0)+(cab_hits if cab_hits >= 2 else 0),
         'flight':sum(x in low for x in ('airline','flight no','flight number','e-ticket','airport','gds pnr','baggage')),
         'bus':sum(x in low for x in ('bus operator','boarding point','dropping point','seat no','coach','bus pnr')),
         'hotel':sum(x in low for x in ('check-in','check in','check-out','check out','room type','hotel confirmation','number of nights')),
