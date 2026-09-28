@@ -906,7 +906,7 @@ def _merge_local_fallback_into_ai_package(remote, local, source_text=''):
 
 
 def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
-    from performance_utils import collect_complete_supplier_text, collect_image_fallback_text
+    from performance_utils import collect_complete_supplier_text, collect_local_document_text, collect_image_fallback_text
     source_text=collect_complete_supplier_text(file_parts,source_text)
     source_days,_=_source_days(source_text)
     if not source_days:
@@ -922,8 +922,12 @@ def extract_itinerary_from_parts(file_parts, source_text, api_key, model):
     # If vision is unavailable, give the deterministic Tour parser the OCR text
     # from screenshots instead of only the attachment marker.  Keep this off the
     # successful AI path so normal image extraction stays fast.
-    if remote is None and any(Path(item.get('path') or '').suffix.lower() != '.pdf' for item in (file_parts or [])):
-        source_text=collect_image_fallback_text(file_parts,source_text)
+    if remote is None or not (remote.get('days') or remote.get('hotels') or remote.get('inclusions')):
+        try:
+            source_text=collect_local_document_text(file_parts,source_text,max_chars=180000)
+        except Exception:
+            if any(Path(item.get('path') or '').suffix.lower() != '.pdf' for item in (file_parts or [])):
+                source_text=collect_image_fallback_text(file_parts,source_text)
         source_days,_=_source_days(source_text)
         if not source_days:
             matches=list(re.finditer(r'(?im)^\s*(\d{1,2})[.)]\s+([^\n]+)',source_text))
