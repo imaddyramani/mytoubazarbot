@@ -315,8 +315,12 @@ def extract_hotel_voucher(file_parts, source_text, api_key, model):
         purpose='hotel primary extraction',max_tokens=5000,
         image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
     )
-    if remote is None and any(Path(item.get('path') or '').suffix.lower() != '.pdf' for item in (file_parts or [])):
-        text=collect_image_fallback_text(file_parts,text)
+    if remote is None or not (remote.get('hotel_name') and remote.get('check_in') and remote.get('check_out')):
+        try:
+            text=collect_local_document_text(file_parts,source_text,max_chars=100000)
+        except Exception:
+            if any(Path(item.get('path') or '').suffix.lower() != '.pdf' for item in (file_parts or [])):
+                text=collect_image_fallback_text(file_parts,text)
     local=_extract_hotel_local(text)
     data=dict(remote or local)
     if remote:
