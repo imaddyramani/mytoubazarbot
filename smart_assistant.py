@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 from ai_provider import complete_json
 from local_tour_planner import attractive_title, build_days, enhance_days, infer_destination, requested_days
@@ -50,6 +51,16 @@ def classify(parts, text, api_key=None, model=None, allow_remote=True):
         'bus':sum(x in low for x in ('bus operator','boarding point','dropping point','seat no','coach','bus pnr')),
         'hotel':sum(x in low for x in ('check-in','check in','check-out','check out','room type','hotel confirmation','number of nights')),
     }
+    # When a scan has no readable text and the vision provider is unavailable,
+    # use the original filename as a deterministic routing hint. This prevents
+    # the generic Smart workflow from ending with "unknown" before the service
+    # extractor gets a chance to run its own bounded OCR fallback.
+    file_hint=' '.join(Path(str(item.get('path') or '')).name.lower() for item in (parts or []))
+    if file_hint:
+        scores['flight'] += 3 * bool(re.search(r'flight|air|e.?ticket|pnr',file_hint))
+        scores['bus'] += 3 * bool(re.search(r'bus|coach|travels',file_hint))
+        scores['hotel'] += 3 * bool(re.search(r'hotel|voucher|reservation|property',file_hint))
+        scores['package'] += 3 * bool(re.search(r'tour|package|itinerary|quotation|holiday|kerala|kashmir|goa',file_hint))
     kind=max(scores,key=scores.get) if max(scores.values(),default=0)>0 else 'unknown'
     confidence=min(.99,.55+.07*scores[kind]) if kind!='unknown' else 0.0
     result={'kind':kind,'confidence':confidence,'reason':f'Local document markers matched {kind}.' if kind!='unknown' else 'No reliable booking markers were found.','reference':'','instruction':str(text or '')}
