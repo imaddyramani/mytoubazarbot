@@ -158,8 +158,14 @@ def extract_bus_ticket(file_parts, source_text, api_key, model):
         PROMPT,text,SCHEMA,purpose='bus primary extraction',max_tokens=5000,
         image_paths=[item.get('path') for item in (file_parts or []) if item.get('path')],
     )
-    if remote is None and any(Path(item.get('path') or '').suffix.lower() != '.pdf' for item in (file_parts or [])):
-        text=collect_image_fallback_text(file_parts,text)
+    # Remote AI is optional. If it is unavailable or incomplete, give the local
+    # parser the actual selectable/OCR text instead of PDF page markers.
+    if remote is None or not (remote.get('passengers') and remote.get('dep_city') and remote.get('arr_city')):
+        try:
+            text=collect_local_document_text(file_parts,source_text,max_chars=100000)
+        except Exception:
+            if any(Path(item.get('path') or '').suffix.lower() != '.pdf' for item in (file_parts or [])):
+                text=collect_image_fallback_text(file_parts,text)
     local=_extract_bus_local(text)
     data=dict(remote or local)
     if remote:
