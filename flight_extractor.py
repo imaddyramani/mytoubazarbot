@@ -2486,142 +2486,59 @@ AIR_NAME_RECOVERY_PROMPT="""Inspect the passenger-name table on the attached air
 
 @_layout_session
 def extract_flight_ticket(file_parts, source_text, api_key, model):
-    """Qwen-first Air Print with deterministic validation and local outage fallback."""
-    raw_source_text=collect_complete_supplier_text(file_parts,source_text)
+    """Local-first Air Print: spend AI tokens only when source validation finds gaps."""
+    import logging
+
     original_paths=[Path(item.get('path') or '') for item in (file_parts or []) if item.get('path')]
-    image_only_input=bool(original_paths and any(
-        path.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'}
-        for path in original_paths
-    ))
-    remote=complete_json(
-        AIR_LIGHT_PROMPT,
-        raw_source_text,SCHEMA,
-        # Keep small vision batches, but do not silently discard later scanned
-        # pages containing connecting flights, passengers or allowances.  Most
-        # supplier tickets put booking/sector on page 1 and baggage on page 2;
-        # capping the first visual pass prevents long terms pages from creating
-        # a multi-minute retry loop.
-        purpose='air primary extraction',max_tokens=7500,image_paths=original_paths,
-        max_vision_pages=4,
-    )
-    # Direct screenshots have no selectable text.  Read each image once with the
-    # existing bounded RapidOCR worker so a provider timeout/unsupported vision
-    # model still leaves a usable deterministic fallback.  The OCR text is kept
-    # out of the AI prompt; it is only a local source-of-truth aid.
-    local_source_text=raw_source_text
-    image_ocr_text=[]
-    if image_only_input:
-        for path in original_paths:
-            if path.suffix.lower() not in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'} or not path.is_file():
-                continue
-            try:
-                value=extract_image_text(path,max_chars=50000)
-            except Exception as exc:
-                value=''
-                # OCR is a fallback only; never turn a missing OCR runtime into
-                # the misleading "no supplier data" error when vision succeeds.
-                import logging
-                logging.getLogger('mytourbazar.flight_extractor').warning(
-                    'Direct flight screenshot OCR fallback unavailable: %s',type(exc).__name__)
-            if value:
-                image_ocr_text.append(value)
-        if image_ocr_text:
-            local_source_text=(raw_source_text+'\n\n--- LOCAL SCREENSHOT TEXT ---\n'+'\n\n'.join(image_ocr_text)).strip()
+
+    # First pass: selectable PDF text/layout plus bounded local OCR only for
+    # image-only pages. Normal text PDFs do not invoke OCR.
+    try:
+        local_source_text=collect_local_document_text(
+            file_parts,source_text,max_chars=100000
+        )
+    except Exception as exc:
+        logging.getLogger('mytourbazar.flight_extractor').warning(
+            'Local air document reading incomplete; trying visual AI fallback: %s',
+            type(exc).__name__,
+        )
+        local_source_text=str(source_text or '')
+
     local=_local_first_air_extract(local_source_text,original_paths)
-    # Some supplier PDFs are scans wrapped in a PDF container.  They have no
-    # selectable text, so the normal local parser sees no passenger/sector even
-    # though the ticket is perfectly readable.  If the visual AI pass failed or
-    # returned an incomplete core, OCR only the most relevant PDF pages once and
-    # feed that text through the same deterministic parser.  This is bounded and
-    # remains a fallback; it does not slow successful text/vision extraction.
-    if (not remote or not _local_air_core_complete(remote) or not _local_air_core_complete(local)):
-        pdf_visual_text=[]
-        for path in original_paths:
-            if path.suffix.lower() != '.pdf' or not path.is_file():
-                continue
-            try:
-                value=extract_pdf_visual_text(path,max_pages=3,max_chars=50000)
-            except Exception as exc:
-                value=''
-                import logging
-                logging.getLogger('mytourbazar.flight_extractor').warning(
-                    'Flight PDF visual fallback unavailable: %s',type(exc).__name__)
-            if value:
-                pdf_visual_text.append(value)
-        if pdf_visual_text:
-            local_source_text=(local_source_text+'\n\n--- LOCAL PDF VISUAL TEXT ---\n'+'\n\n'.join(pdf_visual_text)).strip()
-            local=_local_first_air_extract(local_source_text,original_paths)
-    # A screenshot/image-only ticket may not yield enough selectable text for the
-    # large schema. Make one smaller visual pass before rejecting the document.
-    visual_name_gap=bool(original_paths and remote and any(
-        len(re.findall(r"[A-Za-z][A-Za-z'\-]+", str(row.get('name') or ''))) < 2
-        for row in (remote.get('passengers') or []) if isinstance(row,dict)
-    ))
-    # A local OCR row is already source-derived. Do not spend another vision
-    # request on name recovery when it already contains a longer complete name.
-    local_name_is_longer=bool(remote and any(
-        i < len(local.get('passengers') or []) and
-        len(re.sub(r'\s+',' ',str((local.get('passengers') or [])[i].get('name') or '')).strip()) >
-        len(re.sub(r'\s+',' ',str((row or {}).get('name') or '')).strip())
-        for i,row in enumerate(remote.get('passengers') or []) if isinstance(row,dict)
-    ))
-    name_recovery_needed=bool(original_paths and visual_name_gap and not local_name_is_longer)
-    # Direct screenshots intentionally skip OCR on the fast path. If the vision
-    # response contains only a first name, run the bounded local scan reader once
-    # and use its passenger row as an independent source-of-truth check.
-    if name_recovery_needed:
-        visual_text=list(image_ocr_text)
-        for path in original_paths:
-            if (not image_ocr_text and path.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'}
-                    and path.is_file()):
-                try:
-                    text=extract_image_text(path,max_chars=30000)
-                except Exception:
-                    text=''
-                if text: visual_text.append(text)
-        if visual_text:
-            visual_rows=_local_passengers_from_text('\n'.join(visual_text),'')
-            if remote:
-                remote=_restore_longer_passenger_names(remote,visual_rows)
-            elif visual_rows:
-                local['passengers']=visual_rows
-    if name_recovery_needed:
-        name_recovery=complete_json(
-            AIR_NAME_RECOVERY_PROMPT, raw_source_text, AIR_NAME_RECOVERY_SCHEMA,
-            purpose='air passenger-name visual recovery', max_tokens=1800,
-            image_paths=original_paths, max_vision_pages=4,
+
+    # A complete, validated local result must never make a remote request.
+    # Only build the full supplier prompt / attach original files when a real
+    # extraction gap remains.
+    remote=None
+    if _local_air_needs_ai(local):
+        raw_source_text=collect_complete_supplier_text(
+            file_parts,source_text,max_chars=1000000
         )
-        if name_recovery and name_recovery.get('passengers'):
-            recovered_rows=name_recovery.get('passengers') or []
-            for i,row in enumerate(remote.get('passengers') or []):
-                if i >= len(recovered_rows):
-                    break
-                recovered_name=str((recovered_rows[i] or {}).get('name') or '').strip()
-                current_name=str(row.get('name') or '').strip()
-                if len(recovered_name) > len(current_name):
-                    row['name']=recovered_name
-                    if not str(row.get('title') or '').strip():
-                        row['title']=(recovered_rows[i] or {}).get('title') or ''
-    # OCR/source recovery is preferred once it has a complete core. This avoids
-    # repeating a failed/slow vision request after the local fallback already
-    # recovered the ticket safely.
-    if original_paths and (not _local_air_core_complete(local)) and (
-            not remote or not _local_air_core_complete(remote) or visual_name_gap):
-        recovered=complete_json(
-            AIR_VISUAL_RECOVERY_PROMPT, raw_source_text, AIR_VISUAL_RECOVERY_SCHEMA,
-            purpose='air visual recovery', max_tokens=4500,
-            image_paths=original_paths, max_vision_pages=4,
+        remote=complete_json(
+            AIR_LIGHT_PROMPT,
+            raw_source_text,
+            SCHEMA,
+            purpose='air primary extraction',
+            max_tokens=7500,
+            image_paths=original_paths,
+            max_vision_pages=4,
         )
-        if recovered:
-            remote = _merge_local_fallback_into_ai(recovered, remote or local)
+
+    # AI is a single bounded verification pass, not a chain of name-recovery
+    # and visual-recovery calls. Local source rows are merged back below so
+    # omitted passengers / full middle names are not lost.
     data=_merge_local_fallback_into_ai(remote,local) if remote else local
     data['passengers']=reconcile_people(
-        data.get('passengers'),local.get('passengers'),raw_source_text,
+        data.get('passengers'),
+        local.get('passengers'),
+        local_source_text,
         ('title','ticket_number','type','dob','baggage','special_ancillary'),
     )
     data=_restore_longer_passenger_names(data,local.get('passengers'))
     used_ai=bool(remote)
-    data=_recover_source_only_fields(data,raw_source_text)
+
+    # Re-validate every field against selectable text and locally read scan text.
+    data=_recover_source_only_fields(data,local_source_text)
     data=_normalize_flight_segments(data)
     data=_sanitize_ticket_numbers(data)
     data=_sanitize_inferred_stops(data)
@@ -2636,18 +2553,21 @@ def extract_flight_ticket(file_parts, source_text, api_key, model):
     except Exception:
         pass
     data=_final_endpoint_safety_gate(data)
-    # Final source-truth pass: endpoint repair must never leave an AI-truncated
-    # passenger name in the customer document.
-    source_passengers=_local_passengers_from_pdf_geometry(original_paths,data.get('baggage_summary'))
+
+    # Final independent passenger-name recovery uses only local source evidence.
+    source_passengers=_local_passengers_from_pdf_geometry(
+        original_paths,data.get('baggage_summary')
+    )
     if not source_passengers:
-        source_passengers=_local_passengers_from_text(local_source_text,data.get('baggage_summary'))
+        source_passengers=_local_passengers_from_text(
+            local_source_text,data.get('baggage_summary')
+        )
     data=_restore_longer_passenger_names(data,source_passengers)
     data=_sanitize_passenger_names(data)
 
-    # Missing optional fields remain blank. Remote repair never blocks Air Print.
     data=_apply_baggage_summary(data)
     data=_require_verified_air_print_data(data)
-    data=_apply_air_output_defaults(data,raw_source_text)
+    data=_apply_air_output_defaults(data,local_source_text)
     if not str(data.get('booking_date') or '').strip():
         data['booking_date']=__import__('datetime').datetime.now().strftime('%d %B %Y')
 
